@@ -219,6 +219,7 @@ def run_model_roofline(
     seq_len: int = 256,
     hardware: str = "n150",
     plot_memory: bool = True,
+    detailed: bool = False,
 ):
     """Run transformer model roofline analysis (supports both GPT and Llama models).
 
@@ -510,6 +511,9 @@ def run_model_roofline(
             title=f"Memory Detail: {model_name} (B={batch_size}, S={seq_len})",
             stacked=False,
         )
+    
+    if detailed:
+        print(ctx.summary())
 
     print()
     print("=" * 70)
@@ -546,59 +550,6 @@ def list_models():
         print()
 
     print("-" * 70)
-
-
-def run_single_block_analysis():
-    """Detailed analysis of a single transformer block."""
-    from roofline import (
-        MockTensor,
-        MockGPTBlock,
-        RooflineContext,
-        WORMHOLE_N150,
-        BLACKHOLE_P100,
-        DataType,
-        TensorLabel,
-    )
-
-    print()
-    print("=" * 70)
-    print("SINGLE TRANSFORMER BLOCK ANALYSIS")
-    print("=" * 70)
-    print()
-
-    # Block configuration
-    embedding_dim = 768
-    num_heads = 12
-    batch_size = 4
-    seq_len = 1024
-
-    print(f"Configuration:")
-    print(f"  embedding_dim: {embedding_dim}")
-    print(f"  num_heads:     {num_heads}")
-    print(f"  batch_size:    {batch_size}")
-    print(f"  seq_len:       {seq_len}")
-    print()
-
-    # Create block
-    block = MockGPTBlock(embedding_dim, num_heads, dropout=0.1)
-
-    # Create context and input
-    ctx = RooflineContext(WORMHOLE_N150)
-    x = MockTensor(
-        (batch_size, 1, seq_len, embedding_dim),
-        dtype=DataType.BFLOAT16,
-        requires_grad=True,
-        label=TensorLabel.ACTIVATION,
-    )
-
-    # Forward pass
-    y = block(ctx, x)
-
-    # Backward pass
-    y.backward(ctx)
-
-    # Print detailed results
-    print(ctx.summary(block))
 
 
 def main():
@@ -692,11 +643,8 @@ Examples:
         seq_len=args.seq,
         hardware=args.hardware,
         plot_memory=not args.no_plot,
+        detailed=args.detailed
     )
-
-    if args.detailed:
-        run_single_block_analysis()
-
 
 if __name__ == "__main__":
     main()

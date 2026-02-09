@@ -436,7 +436,7 @@ def fused_attention_roofline(
         matmul_flops = 4 * B * Hq * M * d 
 
         # SFPU FLOPs: scale (S*S) + softmax (~(e+4)*S*S: exp (e), max (1), sub(1), sum(1), div(1)) = ~(e+5)*S*S per q head per batch
-        base_sfpu_flops = (flops_per_exp + 4) * B * Hq * M
+        base_sfpu_flops = (flops_per_exp + 5) * B * Hq * M
         rescale_sfpu_flops = (flops_per_exp + d + 2) * B * Hq * S * Tc * rescale_chance
         sfpu_flops = base_sfpu_flops + rescale_sfpu_flops
 
@@ -447,7 +447,7 @@ def fused_attention_roofline(
         # We read Q only once
         Rq = B * Hq * S * d * bytes_per_elem
 
-        # We reread K and V S / tile size times
+        # We reread K and V N / tile size times
         # Also, depending on the implementation, we might reuse same k and v for the whole group or not
         Rk = B * Hkv * Tr * d * bytes_per_elem * reuse_factor
         Rv = B * Hkv * Tr * d * bytes_per_elem * reuse_factor
