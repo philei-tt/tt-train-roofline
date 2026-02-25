@@ -27,10 +27,15 @@ Run from tt-train directory:
     python3 -m roofline.examples.nanogpt --model llama-70b -b 1 -s 2048
     python3 -m roofline.examples.nanogpt --model llama-405b -b 1 -s 1024
 
+    # Load from tt-train training config (infers model arch + training hyperparams)
+    python3 -m roofline.examples.nanogpt --config path/to/training_config.yaml
+    python3 -m roofline.examples.nanogpt --config path/to/training_config.yaml -b 32 -s 128
+
     # List all available models
     python3 -m roofline.examples.nanogpt --list
 """
 
+import os
 import sys
 from dataclasses import dataclass
 from enum import Enum
@@ -137,6 +142,7 @@ MODEL_PRESETS: Dict[str, dict] = {
         # "max_sequence_length": 2048,
         "max_sequence_length": 131072,
         "embedding_dim": 2048,
+        "intermediate_dim": 5632,
         "num_heads": 32,
         "num_groups": 4,
         "num_blocks": 22,
@@ -163,6 +169,7 @@ MODEL_PRESETS: Dict[str, dict] = {
         "vocab_size": 128256,
         "max_sequence_length": 131072,
         "embedding_dim": 2048,
+        "intermediate_dim": 8192,
         "num_heads": 32,
         "num_groups": 8,  # GQA with 8 KV heads (32/8 = 4 queries per KV)
         "num_blocks": 16,
@@ -176,6 +183,7 @@ MODEL_PRESETS: Dict[str, dict] = {
         "vocab_size": 128256,
         "max_sequence_length": 131072,
         "embedding_dim": 4096,
+        "intermediate_dim": 14336,
         "num_heads": 32,
         "num_groups": 8,  # GQA with 8 KV heads (32/8 = 4 queries per KV)
         "num_blocks": 32,
@@ -189,6 +197,7 @@ MODEL_PRESETS: Dict[str, dict] = {
         "vocab_size": 128256,
         "max_sequence_length": 131072,
         "embedding_dim": 8192,
+        "intermediate_dim": 28672,
         "num_heads": 64,
         "num_groups": 8,  # GQA with 8 KV heads (64/8 = 8 queries per KV)
         "num_blocks": 80,
@@ -202,6 +211,7 @@ MODEL_PRESETS: Dict[str, dict] = {
         "vocab_size": 128256,
         "max_sequence_length": 131072,
         "embedding_dim": 16384,
+        "intermediate_dim": 53248,
         "num_heads": 128,
         "num_groups": 8,  # GQA with 16 KV heads (128/16 = 8 queries per KV, using 8 groups for consistency)
         "num_blocks": 126,
@@ -213,6 +223,125 @@ MODEL_PRESETS: Dict[str, dict] = {
 }
 
 
+def _resolve_model_config_path(model_config_rel: str, training_config_path: str) -> str:
+    """Resolve a model config path that is relative to the tt-train project root.
+
+    tt-train config files store the model_config path relative to the project root
+    (e.g. "configs/model_configs/nanollama3.yaml").  We walk up from the training
+    config file until we find a directory that contains the referenced path.
+    """
+    if os.path.isabs(model_config_rel) and os.path.exists(model_config_rel):
+        return model_config_rel
+
+    candidate = os.path.dirname(os.path.abspath(training_config_path))
+    for _ in range(6):
+        path = os.path.normpath(os.path.join(candidate, model_config_rel))
+        if os.path.exists(path):
+            return path
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            break
+        candidate = parent
+
+    raise FileNotFoundError(
+        f"Could not resolve model config path '{model_config_rel}' "
+        f"relative to '{training_config_path}'. "
+        "Make sure the file exists and the path is correct."
+    )
+
+
+def load_training_config(config_path: str) -> dict:
+    """Load model and training parameters from a tt-train training config YAML.
+
+    Reads both the training config and the model config it references, returning
+    a preset dict compatible with MODEL_PRESETS plus a ``_training`` sub-dict
+    with training hyperparameters.
+
+    Args:
+        config_path: Path to a tt-train training config YAML file.
+
+    Returns:
+        A preset dict with keys matching MODEL_PRESETS entries, plus::
+
+            preset["_training"] = {
+                "batch_size": ...,
+                "learning_rate": ...,
+                "weight_decay": ...,
+                "use_clip_grad_norm": ...,
+                "clip_grad_norm_max_norm": ...,
+            }
+    """
+    try:
+        import yaml
+    except ImportError as exc:
+        raise ImportError(
+            "PyYAML is required to load training configs. Install it with: pip install pyyaml"
+        ) from exc
+
+    config_path = os.path.abspath(config_path)
+    with open(config_path) as f:
+        training_cfg = yaml.safe_load(f)
+
+    tc = training_cfg.get("training_config", {})
+
+    model_config_rel = tc.get("model_config")
+    if model_config_rel is None:
+        raise ValueError(
+            f"'model_config' key not found in training_config section of: {config_path}"
+        )
+
+    model_config_path = _resolve_model_config_path(model_config_rel, config_path)
+    with open(model_config_path) as f:
+        model_cfg = yaml.safe_load(f)
+
+    mc = model_cfg.get("transformer_config", {})
+    model_type_str = mc.get("model_type", "llama").lower()
+    config_label = os.path.basename(config_path)
+
+    if model_type_str == "llama":
+        preset: dict = {
+            "model_type": ModelType.LLAMA,
+            "vocab_size": mc["vocab_size"],
+            "max_sequence_length": mc["max_sequence_length"],
+            "embedding_dim": mc["embedding_dim"],
+            "num_heads": mc["num_heads"],
+            "num_groups": mc.get("num_groups", mc["num_heads"]),
+            "num_blocks": mc["num_blocks"],
+            "dropout": mc.get("dropout_prob", 0.0),
+            "theta": mc.get("theta", 500000.0),
+            "weight_tying": mc.get("weight_tying", False),
+            "description": f"Loaded from {config_label} ({model_config_rel})",
+        }
+        if "intermediate_dim" in mc:
+            preset["intermediate_dim"] = mc["intermediate_dim"]
+    elif model_type_str in ("gpt", "nanogpt"):
+        preset = {
+            "model_type": ModelType.GPT,
+            "vocab_size": mc["vocab_size"],
+            "block_size": mc.get("block_size", mc.get("max_sequence_length", 256)),
+            "n_embd": mc.get("n_embd", mc.get("embedding_dim", 384)),
+            "n_layer": mc.get("n_layer", mc.get("num_blocks", 6)),
+            "n_head": mc.get("n_head", mc.get("num_heads", 6)),
+            "dropout": mc.get("dropout", mc.get("dropout_prob", 0.0)),
+            "description": f"Loaded from {config_label} ({model_config_rel})",
+        }
+    else:
+        raise ValueError(
+            f"Unknown model_type '{model_type_str}' in {model_config_path}. "
+            "Expected 'llama' or 'gpt'."
+        )
+
+    preset["_training"] = {
+        "batch_size": tc.get("batch_size"),
+        "learning_rate": tc.get("learning_rate", 1e-4),
+        "weight_decay": tc.get("weight_decay", 0.1),
+        "use_clip_grad_norm": tc.get("use_clip_grad_norm", False),
+        "clip_grad_norm_max_norm": tc.get("clip_grad_norm_max_norm", 1.0),
+    }
+
+    return preset
+
+
 def run_model_roofline(
     model_name: str = "nanogpt-char",
     batch_size: int = 64,
@@ -220,15 +349,27 @@ def run_model_roofline(
     hardware: str = "n150",
     plot_memory: bool = True,
     detailed: bool = False,
+    preset: Optional[dict] = None,
+    lr: float = 1e-4,
+    weight_decay: float = 0.1,
+    use_clip_grad_norm: bool = True,
+    clip_grad_norm_max_norm: float = 1.0,
 ):
     """Run transformer model roofline analysis (supports both GPT and Llama models).
 
     Args:
-        model_name: Name of the model preset to use
-        batch_size: Batch size for the analysis
-        seq_len: Sequence length for the analysis
-        hardware: Hardware configuration to use
-        plot_memory: Whether to generate memory usage plot
+        model_name: Name of the model preset to use (ignored when ``preset`` is given).
+        batch_size: Batch size for the analysis.
+        seq_len: Sequence length for the analysis.
+        hardware: Hardware configuration to use.
+        plot_memory: Whether to generate memory usage plot.
+        detailed: Print full per-op summary at the end.
+        preset: Optional preset dict (same format as MODEL_PRESETS values).
+            When provided, ``model_name`` is used only as a display label.
+        lr: AdamW learning rate.
+        weight_decay: AdamW weight-decay coefficient.
+        use_clip_grad_norm: Whether to run gradient-norm clipping.
+        clip_grad_norm_max_norm: Max norm value for gradient clipping.
     """
     from roofline import (
         MockTensor,
@@ -275,13 +416,14 @@ def run_model_roofline(
     print(f"  Peak (HiFi4): {hw_spec.tflops_per_chip(MathFidelity.HiFi4):.1f} TFLOPs")
     print()
 
-    # Get preset or use default
-    if model_name not in MODEL_PRESETS:
-        print(f"Unknown model: {model_name}")
-        print(f"Available presets: {', '.join(MODEL_PRESETS.keys())}")
-        return
+    # Resolve preset: use the directly-supplied preset or look up by name
+    if preset is None:
+        if model_name not in MODEL_PRESETS:
+            print(f"Unknown model: {model_name}")
+            print(f"Available presets: {', '.join(MODEL_PRESETS.keys())}")
+            return
+        preset = MODEL_PRESETS[model_name]
 
-    preset = MODEL_PRESETS[model_name]
     model_type = preset["model_type"]
 
     # Create roofline context FIRST so that parameter tensors are tracked
@@ -319,6 +461,7 @@ def run_model_roofline(
             vocab_size=preset["vocab_size"],
             max_sequence_length=preset["max_sequence_length"],
             embedding_dim=preset["embedding_dim"],
+            intermediate_dim=preset.get("intermediate_dim"),
             num_heads=preset["num_heads"],
             num_groups=preset["num_groups"],
             num_blocks=preset["num_blocks"],
@@ -386,7 +529,7 @@ def run_model_roofline(
 
     # Create optimizer right after model (like ttml)
     # This allocates optimizer state (m and v tensors for AdamW)
-    optimizer = MockAdamW(params, lr=1e-4, weight_decay=0.1)
+    optimizer = MockAdamW(params, lr=lr, weight_decay=weight_decay)
 
     # Snapshot after optimizer creation
     print_memory_snapshot("AFTER_OPTIMIZER_CREATION")
@@ -445,7 +588,8 @@ def run_model_roofline(
     # Gradient clipping (optional)
     after_optimizer_time_ms = ctx.total_time_ms()
     after_optimizer_flops = ctx.total_flops()
-    mock_clip_grad_norm(ctx, params, max_norm=1.0)
+    if use_clip_grad_norm:
+        mock_clip_grad_norm(ctx, params, max_norm=clip_grad_norm_max_norm)
 
     # Snapshot after iteration complete
     print_memory_snapshot("ITERATION_COMPLETE")
@@ -570,6 +714,10 @@ Examples:
   python3 -m roofline.examples.nanogpt --model nanollama -b 64 -s 256
   python3 -m roofline.examples.nanogpt --model tinyllama -b 1 -s 2048
 
+  # Load from tt-train training config (infers model arch + training hyperparams)
+  python3 -m roofline.examples.nanogpt --config path/to/training_config.yaml
+  python3 -m roofline.examples.nanogpt --config path/to/training_config.yaml -b 32
+
   # Hardware configurations
   python3 -m roofline.examples.nanogpt --hardware n300            # Wormhole n300
   python3 -m roofline.examples.nanogpt --hardware p100            # Blackhole P100
@@ -581,25 +729,44 @@ Examples:
 """,
     )
     parser.add_argument(
+        "--config",
+        "-c",
+        type=str,
+        default=None,
+        metavar="TRAINING_CONFIG",
+        help=(
+            "Path to a tt-train training config YAML file. "
+            "Model architecture and training hyperparameters are inferred from the config "
+            "and the model config it references. "
+            "Individual flags (--batch, --seq, --hardware) still override config values."
+        ),
+    )
+    parser.add_argument(
         "--model",
         "-m",
         type=str,
         default=None,
-        help="Model preset name (see --list for available presets)",
+        help="Model preset name (see --list for available presets). Ignored when --config is set.",
     )
     parser.add_argument(
         "--batch",
         "-b",
         type=int,
-        default=64,
-        help="Batch size (default: 64)",
+        default=None,
+        help=(
+            "Batch size. When --config is provided defaults to the config value; "
+            "otherwise defaults to 64."
+        ),
     )
     parser.add_argument(
         "--seq",
         "-s",
         type=int,
-        default=256,
-        help="Sequence length (default: 256)",
+        default=None,
+        help=(
+            "Sequence length. When --config is provided defaults to the model's "
+            "max_sequence_length; otherwise defaults to 256."
+        ),
     )
     parser.add_argument(
         "--hardware",
@@ -631,19 +798,58 @@ Examples:
         list_models()
         return
 
-    # Determine model name
-    if args.model:
-        model_name = args.model
+    # ------------------------------------------------------------------ #
+    # Resolve model preset and training hyperparameters                    #
+    # ------------------------------------------------------------------ #
+    preset = None
+    lr = 1e-4
+    weight_decay = 0.1
+    use_clip_grad_norm = True
+    clip_grad_norm_max_norm = 1.0
+
+    if args.config:
+        try:
+            preset = load_training_config(args.config)
+        except (FileNotFoundError, ValueError, KeyError) as exc:
+            print(f"Error loading training config: {exc}")
+            sys.exit(1)
+
+        training = preset.get("_training", {})
+        model_name = os.path.splitext(os.path.basename(args.config))[0]
+
+        lr = training.get("learning_rate", lr)
+        weight_decay = training.get("weight_decay", weight_decay)
+        use_clip_grad_norm = training.get("use_clip_grad_norm", use_clip_grad_norm)
+        clip_grad_norm_max_norm = training.get("clip_grad_norm_max_norm", clip_grad_norm_max_norm)
+
+        # Defaults sourced from config; CLI flags override
+        mt = preset["model_type"]
+        max_seq_from_config = (
+            preset.get("max_sequence_length")
+            if mt == ModelType.LLAMA
+            else preset.get("block_size")
+        )
+        batch_size = args.batch if args.batch is not None else (training.get("batch_size") or 64)
+        seq_len = args.seq if args.seq is not None else (max_seq_from_config or 256)
+
+        print(f"Loaded training config: {args.config}")
     else:
-        model_name = "nanogpt-char"  # Default
+        model_name = args.model or "nanogpt-char"
+        batch_size = args.batch if args.batch is not None else 64
+        seq_len = args.seq if args.seq is not None else 256
 
     run_model_roofline(
         model_name,
-        batch_size=args.batch,
-        seq_len=args.seq,
+        batch_size=batch_size,
+        seq_len=seq_len,
         hardware=args.hardware,
         plot_memory=not args.no_plot,
-        detailed=args.detailed
+        detailed=args.detailed,
+        preset=preset,
+        lr=lr,
+        weight_decay=weight_decay,
+        use_clip_grad_norm=use_clip_grad_norm,
+        clip_grad_norm_max_norm=clip_grad_norm_max_norm,
     )
 
 if __name__ == "__main__":
