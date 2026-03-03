@@ -31,6 +31,13 @@ from .attention import (
 from .rope import MockRoPEOp
 from .cross_entropy import MockCrossEntropyLossOp
 from .swiglu_fused import MockSwiGLUFusedOp, SwiGLUFusedImpl
+from .comm_ops import (
+    MockAllReduceOp,
+    MockReduceScatterOp,
+    MockAllGatherOp,
+    MockBroadcastOp,
+    MockScatterOp,
+)
 
 __all__ = [
     # Base classes
@@ -67,4 +74,10 @@ __all__ = [
     # Fused SwiGLU
     "MockSwiGLUFusedOp",
     "SwiGLUFusedImpl",
+    # CCL operations
+    "MockAllReduceOp",
+    "MockReduceScatterOp",
+    "MockAllGatherOp",
+    "MockBroadcastOp",
+    "MockScatterOp",
 ]

@@ -89,18 +89,30 @@ class MockTensor:
         requires_grad: bool = True,
         label: Optional[TensorLabel] = None,
         name: Optional[str] = None,
+        num_shards: Optional[Tuple[int, ...]] = None,
     ):
         """Initialize a MockTensor.
 
         Args:
-            shape: Tensor shape as tuple of ints
+            shape: Per-device tensor shape as tuple of ints (after sharding)
             dtype: Data type (default: BFLOAT16)
             layout: Memory layout (default: "TILE")
             requires_grad: Whether gradients should be tracked (default: True)
             label: Memory category label (default: None, auto-inferred)
             name: Optional name for tracking (default: None)
+            num_shards: Per-dimension shard counts, same length as shape (default: all 1s).
+                num_shards[i] is the number of devices over which dimension i is sharded.
         """
         self.shape = tuple(shape)
+        ndim = len(self.shape)
+        if num_shards is None:
+            self.num_shards = (1,) * ndim
+        else:
+            assert len(num_shards) == ndim, (
+                f"num_shards length {len(num_shards)} must match shape length {ndim}"
+            )
+            assert all(n >= 1 for n in num_shards), "num_shards elements must be >= 1"
+            self.num_shards = tuple(num_shards)
         self.dtype = dtype
         self.layout = layout
         self.requires_grad = requires_grad
@@ -166,12 +178,29 @@ class MockTensor:
     # Size/memory calculations
     # =========================================================================
 
+    @property
+    def is_sharded(self) -> bool:
+        """Whether this tensor is sharded across multiple devices."""
+        return any(n > 1 for n in self.num_shards)
+
+    @property
+    def global_shape(self) -> Tuple[int, ...]:
+        """Reconstruct the full (unsharded) shape.
+
+        global_shape[i] = shape[i] * num_shards[i] for each dimension.
+        """
+        return tuple(self.shape[i] * self.num_shards[i] for i in range(len(self.shape)))
+
+    def num_devices(self) -> int:
+        """Total number of devices (product of num_shards)."""
+        return math.prod(self.num_shards)
+
     def logical_volume(self) -> int:
-        """Return total number of elements."""
+        """Return total number of elements (per-device)."""
         return math.prod(self.shape)
 
     def bytes(self) -> int:
-        """Return total size in bytes."""
+        """Return total size in bytes (per-device)."""
         return int(self.logical_volume() * self.dtype.value)
 
     # =========================================================================
@@ -204,6 +233,7 @@ class MockTensor:
                 requires_grad=False,
                 label=TensorLabel.GRADIENT,
                 name="loss_grad",
+                num_shards=self.num_shards,
             )
 
         # Topological sort for backward traversal
@@ -260,7 +290,8 @@ class MockTensor:
     def __repr__(self) -> str:
         label_str = f", label={self.label.value}" if self.label else ""
         name_str = f", name={self.name}" if self.name else ""
-        return f"MockTensor(shape={self.shape}, dtype={self.dtype.name}, requires_grad={self.requires_grad}{label_str}{name_str})"
+        shard_str = f", num_shards={self.num_shards}" if self.is_sharded else ""
+        return f"MockTensor(shape={self.shape}, dtype={self.dtype.name}, requires_grad={self.requires_grad}{label_str}{name_str}{shard_str})"
 
     def clone(self) -> "MockTensor":
         """Create a copy with the same metadata."""
@@ -271,4 +302,5 @@ class MockTensor:
             self.requires_grad,
             self.label,
             self.name,
+            self.num_shards,
         )

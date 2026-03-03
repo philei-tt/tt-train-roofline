@@ -11,6 +11,7 @@ without ttml/ttnn dependencies.
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
+from typing import Literal
 
 
 class MathFidelity(Enum):
@@ -65,8 +66,13 @@ class HardwareSpec:
     noc_bw_tb_s: float
     noc_link_bw_gb_s: float
 
-    # Fabric (for multi-chip)
-    eth_bw_gb_s_per_chip: float
+    # Fabric (for multi-chip CCL)
+    # Per-link Ethernet bandwidth (GB/s). Aggregate BW per device = eth_bw_gb_s_per_link * num_links.
+    eth_bw_gb_s_per_link: float
+    # Topology: "ring" (e.g. 2D torus) gives 2x better effective BW than "linear" in the CCL model.
+    topology: Literal["linear", "ring"] = "ring"
+    # Number of links per device used in the collective (e.g. 2 for ring).
+    num_links: int = 1
 
     # Defaults at end
     mul_adds_per_cycle: int = 4096  # 8x16 × 16x16 matrix engine
@@ -129,7 +135,9 @@ WORMHOLE_N150 = HardwareSpec(
     sram_mb_per_core=1.5,
     noc_bw_tb_s=1.4,
     noc_link_bw_gb_s=83,
-    eth_bw_gb_s_per_chip=200,  # 16 × 100GbE = 1.6 Tb/s = 200 GB/s
+    eth_bw_gb_s_per_link=100,  # 100GbE per link; 16 links → 200 GB/s per chip
+    topology="linear",
+    num_links=1,
     chips_per_galaxy=1,
 )
 
@@ -142,7 +150,9 @@ WORMHOLE_N300 = HardwareSpec(
     sram_mb_per_core=1.5,
     noc_bw_tb_s=2.8,  # 1.4 × 2
     noc_link_bw_gb_s=83,
-    eth_bw_gb_s_per_chip=400,
+    eth_bw_gb_s_per_link=100,
+    topology="linear",
+    num_links=1,
     chips_per_galaxy=1,
 )
 
@@ -155,7 +165,9 @@ WORMHOLE_GALAXY = HardwareSpec(
     sram_mb_per_core=1.5,
     noc_bw_tb_s=1.4,
     noc_link_bw_gb_s=83,
-    eth_bw_gb_s_per_chip=200,
+    eth_bw_gb_s_per_link=100,
+    topology="linear",
+    num_links=1,
     chips_per_galaxy=32,
 )
 
@@ -168,7 +180,9 @@ BLACKHOLE_P100 = HardwareSpec(
     sram_mb_per_core=1.5,  # 210 MB / 140 cores
     noc_bw_tb_s=1.4,
     noc_link_bw_gb_s=200,
-    eth_bw_gb_s_per_chip=480,  # 10 × 400GbE × 48 GB/s effective
+    eth_bw_gb_s_per_link=48,
+    topology="linear",
+    num_links=1,
     chips_per_galaxy=1,
 )
 
@@ -181,19 +195,23 @@ BLACKHOLE_P150 = HardwareSpec(
     sram_mb_per_core=1.5,  # 210 MB / 140 cores
     noc_bw_tb_s=1.4,
     noc_link_bw_gb_s=200,
-    eth_bw_gb_s_per_chip=480,  # 10 × 400GbE × 48 GB/s effective
+    eth_bw_gb_s_per_link=48,
+    topology="linear",
+    num_links=1,
     chips_per_galaxy=1,
 )
 
 BLACKHOLE_GALAXY = HardwareSpec(
     name="Blackhole Galaxy",
-    tensix_cores_per_chip=140,
+    tensix_cores_per_chip=120,
     clock_ghz=1.35,
     dram_gb_per_chip=32,
     dram_bw_gb_s=512,
     sram_mb_per_core=1.5,
     noc_bw_tb_s=1.4,
     noc_link_bw_gb_s=200,
-    eth_bw_gb_s_per_chip=480,
+    eth_bw_gb_s_per_link=48,
+    topology="linear",
+    num_links=1,
     chips_per_galaxy=32,
 )

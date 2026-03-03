@@ -24,17 +24,16 @@ def create_grad_tensor(
     dtype: DataType = DataType.BFLOAT16,
     layout: str = "TILE",
     name: Optional[str] = None,
+    num_shards: Optional[Tuple[int, ...]] = None,
 ) -> MockTensor:
     """Create a gradient tensor with proper GRADIENT label.
-
-    This is a helper function for backward methods to create properly
-    labeled gradient tensors.
 
     Args:
         shape: Tensor shape
         dtype: Data type (default: BFLOAT16)
         layout: Memory layout (default: "TILE")
         name: Optional name for tracking
+        num_shards: Per-dimension shard counts, len = len(shape) (default: all 1s)
 
     Returns:
         MockTensor with GRADIENT label
@@ -46,6 +45,7 @@ def create_grad_tensor(
         requires_grad=False,
         label=TensorLabel.GRADIENT,
         name=name,
+        num_shards=num_shards,
     )
 
 
@@ -55,11 +55,9 @@ def create_activation_tensor(
     layout: str = "TILE",
     requires_grad: bool = True,
     name: Optional[str] = None,
+    num_shards: Optional[Tuple[int, ...]] = None,
 ) -> MockTensor:
     """Create an activation tensor with proper ACTIVATION label.
-
-    This is a helper function for forward methods to create properly
-    labeled output tensors that will be saved for backward pass.
 
     Args:
         shape: Tensor shape
@@ -67,6 +65,7 @@ def create_activation_tensor(
         layout: Memory layout (default: "TILE")
         requires_grad: Whether gradients should be tracked (default: True)
         name: Optional name for tracking
+        num_shards: Per-dimension shard counts, len = len(shape) (default: all 1s)
 
     Returns:
         MockTensor with ACTIVATION label
@@ -78,6 +77,7 @@ def create_activation_tensor(
         requires_grad=requires_grad,
         label=TensorLabel.ACTIVATION,
         name=name,
+        num_shards=num_shards,
     )
 
 
@@ -252,12 +252,13 @@ class RooflineFunction:
                     if isinstance(out, MockTensor):
                         grad = out.get_grad()
                         if grad is None:
-                            grad = MockTensor(
+                                grad = MockTensor(
                                 out.shape,
                                 out.dtype,
                                 requires_grad=False,
                                 label=TensorLabel.GRADIENT,
                                 name=f"grad_{out.name}" if out.name else None,
+                                num_shards=out.num_shards,
                             )
                         grad_outputs.append(grad)
                     else:

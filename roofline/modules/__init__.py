@@ -23,6 +23,7 @@ from .gpt_block import MockGPTBlock
 from .llama_block import MockLlamaBlock
 from .nanogpt import MockNanoGPT, MockNanoGPTConfig, create_mock_nanogpt
 from .llama import MockLlama, MockLlamaConfig, create_mock_llama
+from .distributed_linear import MockColumnParallelLinear, MockRowParallelLinear
 
 __all__ = [
     # Base classes
@@ -32,6 +33,9 @@ __all__ = [
     "MockModuleDict",
     # Linear
     "MockLinearLayer",
+    # Distributed Linear (TP)
+    "MockColumnParallelLinear",
+    "MockRowParallelLinear",
     # Embedding
     "MockEmbedding",
     "MockTrainablePositionalEmbedding",

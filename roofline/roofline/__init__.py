@@ -29,6 +29,7 @@ from .rope import rope_roofline
 from .dropout import dropout_roofline
 from .cross_entropy import cross_entropy_roofline
 from .swiglu_fused import swiglu_fused_row_mcast_roofline, swiglu_fused_mcast_roofline
+from .ccl import all_reduce_roofline, reduce_scatter_roofline, all_gather_roofline
 
 __all__ = [
     # Core classes
@@ -50,6 +51,10 @@ __all__ = [
     "rope_roofline",
     "dropout_roofline",
     "cross_entropy_roofline",
+    # CCL roofline
+    "all_reduce_roofline",
+    "reduce_scatter_roofline",
+    "all_gather_roofline",
     # Fused SwiGLU
     "swiglu_fused_row_mcast_roofline",
     "swiglu_fused_mcast_roofline",

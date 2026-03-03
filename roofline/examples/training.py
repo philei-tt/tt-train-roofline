@@ -180,13 +180,13 @@ MODEL_PRESETS: Dict[str, dict] = {
     },
     "llama-8b": {
         "model_type": ModelType.LLAMA,
-        "vocab_size": 128256,
+        "vocab_size": 32000,
         "max_sequence_length": 131072,
         "embedding_dim": 4096,
         "intermediate_dim": 14336,
         "num_heads": 32,
         "num_groups": 8,  # GQA with 8 KV heads (32/8 = 4 queries per KV)
-        "num_blocks": 32,
+        "num_blocks": 8,
         "dropout": 0.0,
         "theta": 500000.0,
         "weight_tying": False,
@@ -354,12 +354,13 @@ def run_model_roofline(
     weight_decay: float = 0.1,
     use_clip_grad_norm: bool = True,
     clip_grad_norm_max_norm: float = 1.0,
+    num_devices: int = 1,
 ):
     """Run transformer model roofline analysis (supports both GPT and Llama models).
 
     Args:
         model_name: Name of the model preset to use (ignored when ``preset`` is given).
-        batch_size: Batch size for the analysis.
+        batch_size: Global batch size for the analysis.
         seq_len: Sequence length for the analysis.
         hardware: Hardware configuration to use.
         plot_memory: Whether to generate memory usage plot.
@@ -370,6 +371,7 @@ def run_model_roofline(
         weight_decay: AdamW weight-decay coefficient.
         use_clip_grad_norm: Whether to run gradient-norm clipping.
         clip_grad_norm_max_norm: Max norm value for gradient clipping.
+        num_devices: Number of DDP devices (1 = single device, >1 = DDP).
     """
     from roofline import (
         MockTensor,
@@ -382,6 +384,7 @@ def run_model_roofline(
         WORMHOLE_N300,
         BLACKHOLE_P100,
         BLACKHOLE_P150,
+        BLACKHOLE_GALAXY,
         DataType,
         MathFidelity,
         MockAdamW,
@@ -389,6 +392,7 @@ def run_model_roofline(
         MockCrossEntropyLossOp,
         TensorLabel,
     )
+    from roofline.training.distributed import shard_batch, synchronize_gradients
 
     # Hardware mapping
     hardware_map = {
@@ -396,6 +400,7 @@ def run_model_roofline(
         "n300": WORMHOLE_N300,
         "p100": BLACKHOLE_P100,
         "p150": BLACKHOLE_P150,
+        "bh_glx": BLACKHOLE_GALAXY,
     }
 
     if hardware not in hardware_map:
@@ -404,6 +409,11 @@ def run_model_roofline(
         return
 
     hw_spec = hardware_map[hardware]
+    ddp_enabled = num_devices > 1
+
+    if ddp_enabled and batch_size % num_devices != 0:
+        print(f"Error: batch_size ({batch_size}) must be divisible by num_devices ({num_devices})")
+        return
 
     print("=" * 70)
     print("TRANSFORMER MODEL ROOFLINE ANALYSIS")
@@ -413,7 +423,10 @@ def run_model_roofline(
     print(f"  Cores:      {hw_spec.tensix_cores_per_chip}")
     print(f"  Clock:      {hw_spec.clock_ghz} GHz")
     print(f"  DRAM BW:    {hw_spec.dram_bw_gb_s} GB/s")
+    print(f"  Eth BW/link: {hw_spec.eth_bw_gb_s_per_link} GB/s ({hw_spec.num_links} links, {hw_spec.topology})")
     print(f"  Peak (HiFi4): {hw_spec.tflops_per_chip(MathFidelity.HiFi4):.1f} TFLOPs")
+    if ddp_enabled:
+        print(f"  DDP Devices: {num_devices}")
     print()
 
     # Resolve preset: use the directly-supplied preset or look up by name
@@ -498,8 +511,12 @@ def run_model_roofline(
         )
         seq_len = max_seq_len
 
+    per_device_batch = batch_size // num_devices if ddp_enabled else batch_size
+
     print(f"Batch Configuration:")
-    print(f"  batch_size:  {batch_size}")
+    print(f"  batch_size (global): {batch_size}")
+    if ddp_enabled:
+        print(f"  batch_size (per device): {per_device_batch}")
     print(f"  seq_len:     {seq_len}")
     print()
 
@@ -540,7 +557,7 @@ def run_model_roofline(
         (batch_size, 1, 1, seq_len),
         dtype=DataType.BFLOAT16,  # Will be cast to int internally
         requires_grad=False,
-        label=TensorLabel.ACTIVATION,  # Input data, not a training tensor
+        label=TensorLabel.ACTIVATION,
         name="indices",
     )
 
@@ -549,9 +566,14 @@ def run_model_roofline(
         (batch_size, 1, 1, seq_len),
         dtype=DataType.BFLOAT16,
         requires_grad=False,
-        label=TensorLabel.ACTIVATION,  # Target data, not a training tensor
+        label=TensorLabel.ACTIVATION,
         name="targets",
     )
+
+    # DDP: shard batch across devices (each device gets batch_size/N)
+    if ddp_enabled:
+        indices = shard_batch(indices, dim=0, num_devices=num_devices)
+        targets = shard_batch(targets, dim=0, num_devices=num_devices)
 
     # Forward pass
     logits = model(ctx, indices)
@@ -576,14 +598,26 @@ def run_model_roofline(
     after_backward_time_ms = ctx.total_time_ms()
     after_backward_flops = ctx.total_flops()
 
+    # DDP: synchronize gradients (all-reduce + average) before optimizer
+    ccl_time_ms = 0.0
+    ccl_flops = 0
+    if ddp_enabled:
+        synchronize_gradients(ctx, params, num_devices)
+        print_memory_snapshot("AFTER_GRAD_SYNC")
+        ccl_time_ms = ctx.total_time_ms() - after_backward_time_ms
+        ccl_flops = ctx.total_flops() - after_backward_flops
+
+    after_ccl_time_ms = ctx.total_time_ms()
+    after_ccl_flops = ctx.total_flops()
+
     # Optimizer step (optimizer already created above)
     optimizer.step(ctx)
 
     # Snapshot after optimizer step
     print_memory_snapshot("AFTER_OPTIMIZER_STEP")
 
-    optimizer_time_ms = ctx.total_time_ms() - after_backward_time_ms
-    optimizer_flops = ctx.total_flops() - after_backward_flops
+    optimizer_time_ms = ctx.total_time_ms() - after_ccl_time_ms
+    optimizer_flops = ctx.total_flops() - after_ccl_flops
 
     # Gradient clipping (optional)
     after_optimizer_time_ms = ctx.total_time_ms()
@@ -601,15 +635,19 @@ def run_model_roofline(
     # Final metrics
     iteration_time_ms = ctx.total_time_ms()
     iteration_flops = ctx.total_flops()
-    tokens_per_iteration = batch_size * seq_len
-    tokens_per_second = tokens_per_iteration / (iteration_time_ms / 1000)
+    total_tokens = batch_size * seq_len  # global batch tokens
+    tokens_per_second = total_tokens / (iteration_time_ms / 1000)
 
     print()
-    print("Timing Breakdown:")
+    print("Timing Breakdown (per device):")
     print(f"  Forward:     {forward_time_ms:.4f} ms ({forward_flops/1e12:.4f} TFLOPs)")
     print(
         f"  Backward:    {backward_time_ms:.4f} ms ({backward_flops/1e12:.4f} TFLOPs)"
     )
+    if ddp_enabled:
+        print(
+            f"  CCL Sync:    {ccl_time_ms:.4f} ms"
+        )
     print(
         f"  Optimizer:   {optimizer_time_ms:.4f} ms ({optimizer_flops/1e12:.4f} TFLOPs)"
     )
@@ -621,9 +659,20 @@ def run_model_roofline(
     )
     print()
     print("Throughput:")
-    print(f"  Tokens/iter: {tokens_per_iteration:,}")
-    print(f"  Tokens/sec:  {tokens_per_second:,.0f}")
-    print(f"  TFLOPs:      {ctx.achieved_tflops():.2f}")
+    print(f"  Tokens/iter: {total_tokens:,} (global batch)")
+    if ddp_enabled:
+        per_device_tokens = per_device_batch * seq_len
+        print(f"  Tokens/device: {per_device_tokens:,}")
+    print(f"  Tokens/sec:  {tokens_per_second:,.0f} (cluster total)")
+    print(f"  TFLOPs/dev:  {ctx.achieved_tflops():.2f}")
+    if ddp_enabled:
+        compute_only_time_ms = forward_time_ms + backward_time_ms + optimizer_time_ms + grad_clip_time_ms
+        ccl_overhead_pct = ccl_time_ms / iteration_time_ms * 100 if iteration_time_ms > 0 else 0
+        print()
+        print(f"DDP Summary ({num_devices} devices):")
+        print(f"  Compute time:   {compute_only_time_ms:.4f} ms")
+        print(f"  CCL overhead:   {ccl_time_ms:.4f} ms ({ccl_overhead_pct:.1f}%)")
+        print(f"  Scaling eff:    {compute_only_time_ms / iteration_time_ms * 100:.1f}%")
     print()
 
     # Bottleneck analysis
@@ -723,6 +772,10 @@ Examples:
   python3 -m roofline.examples.nanogpt --hardware p100            # Blackhole P100
   python3 -m roofline.examples.nanogpt --hardware p150            # Blackhole P150
 
+  # DDP (data-distributed parallelism)
+  python3 -m roofline.examples.nanogpt --model gpt2-small -b 32 -n 8  # 8-device DDP
+  python3 -m roofline.examples.nanogpt --model nanogpt-char -b 64 -n 4
+
   # Utilities
   python3 -m roofline.examples.nanogpt --list                     # List available presets
   python3 -m roofline.examples.nanogpt --detailed                 # Single-block analysis
@@ -772,7 +825,7 @@ Examples:
         "--hardware",
         "-hw",
         type=str,
-        choices=["n150", "n300", "p100", "p150"],
+        choices=["n150", "n300", "p100", "p150", "bh_glx"],
         default="n150",
         help="Hardware configuration (default: n150)",
     )
@@ -786,6 +839,13 @@ Examples:
         "--detailed",
         action="store_true",
         help="Run detailed single-block analysis (GPT only)",
+    )
+    parser.add_argument(
+        "--num-devices",
+        "-n",
+        type=int,
+        default=1,
+        help="Number of DDP devices (default: 1, single device)",
     )
     parser.add_argument(
         "--no-plot",
@@ -850,6 +910,7 @@ Examples:
         weight_decay=weight_decay,
         use_clip_grad_norm=use_clip_grad_norm,
         clip_grad_norm_max_norm=clip_grad_norm_max_norm,
+        num_devices=args.num_devices,
     )
 
 if __name__ == "__main__":

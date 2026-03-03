@@ -105,6 +105,9 @@ from .roofline import (
     rope_roofline,
     dropout_roofline,
     cross_entropy_roofline,
+    all_reduce_roofline,
+    reduce_scatter_roofline,
+    all_gather_roofline,
 )
 
 # Module system
@@ -116,6 +119,9 @@ from .modules import (
     MockModuleDict,
     # Linear
     MockLinearLayer,
+    # Distributed Linear (TP)
+    MockColumnParallelLinear,
+    MockRowParallelLinear,
     # Embedding
     MockEmbedding,
     MockTrainablePositionalEmbedding,
@@ -177,12 +183,20 @@ from .operations import (
     MockRoPEOp,
     # Loss
     MockCrossEntropyLossOp,
+    # CCL operations
+    MockAllReduceOp,
+    MockReduceScatterOp,
+    MockAllGatherOp,
+    MockBroadcastOp,
+    MockScatterOp,
 )
 
 # Training utilities
 from .training import (
     MockAdamW,
     mock_clip_grad_norm,
+    shard_batch,
+    synchronize_gradients,
 )
 
 __all__ = [
@@ -222,6 +236,9 @@ __all__ = [
     "rope_roofline",
     "dropout_roofline",
     "cross_entropy_roofline",
+    "all_reduce_roofline",
+    "reduce_scatter_roofline",
+    "all_gather_roofline",
     # Mock tensor
     "MockTensor",
     "BackwardNode",
@@ -232,6 +249,8 @@ __all__ = [
     "MockModuleDict",
     # Modules
     "MockLinearLayer",
+    "MockColumnParallelLinear",
+    "MockRowParallelLinear",
     "MockEmbedding",
     "MockTrainablePositionalEmbedding",
     "MockLayerNorm",
@@ -272,7 +291,15 @@ __all__ = [
     "MockScaledDotProductAttentionFusedOp",
     "MockRoPEOp",
     "MockCrossEntropyLossOp",
+    # CCL operations
+    "MockAllReduceOp",
+    "MockReduceScatterOp",
+    "MockAllGatherOp",
+    "MockBroadcastOp",
+    "MockScatterOp",
     # Training utilities
     "MockAdamW",
     "mock_clip_grad_norm",
+    "shard_batch",
+    "synchronize_gradients",
 ]
