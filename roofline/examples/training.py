@@ -270,6 +270,13 @@ def load_training_config(config_path: str) -> dict:
                 "use_clip_grad_norm": ...,
                 "clip_grad_norm_max_norm": ...,
             }
+            preset["_device_config"] = {
+                "ddp_size": int,  # from device_config.mesh_shape[0]
+                "tp_size": int,   # from device_config.mesh_shape[1]
+            }
+
+        mesh_shape is [ddp_size, tp_size]: (1,1)=single chip, (N,1)=DDP only,
+        (1,N)=TP only, (N,M)=both. Defaults to [1, 1] if device_config is absent.
     """
     try:
         import yaml
@@ -337,6 +344,19 @@ def load_training_config(config_path: str) -> dict:
         "weight_decay": tc.get("weight_decay", 0.1),
         "use_clip_grad_norm": tc.get("use_clip_grad_norm", False),
         "clip_grad_norm_max_norm": tc.get("clip_grad_norm_max_norm", 1.0),
+    }
+
+    # device_config: mesh_shape is [ddp_size, tp_size] (DDP over first dim, TP over second)
+    # (1, 1) = single chip; (N, 1) = DDP only; (1, N) = TP only; (N, M) = both
+    device_cfg = training_cfg.get("device_config", {})
+    mesh = device_cfg.get("mesh_shape", [1, 1])
+    if len(mesh) != 2:
+        raise ValueError(
+            f"device_config.mesh_shape must be [ddp_size, tp_size] (length 2). Got: {mesh}"
+        )
+    preset["_device_config"] = {
+        "ddp_size": int(mesh[0]),
+        "tp_size": int(mesh[1]),
     }
 
     return preset
@@ -944,11 +964,30 @@ Examples:
         batch_size = args.batch if args.batch is not None else (training.get("batch_size") or 64)
         seq_len = args.seq if args.seq is not None else (max_seq_from_config or 256)
 
+        # TP/DDP from device_config.mesh_shape [ddp_size, tp_size]; CLI overrides if given
+        dev_cfg = preset.get("_device_config", {})
+        tp_size = dev_cfg.get("tp_size", 1)
+        ddp_size = dev_cfg.get("ddp_size", 1)
+        if args.tp != 1:
+            if tp_size != args.tp:
+                print(
+                    f"Warning: overriding config mesh_shape tp_size ({tp_size}) with --tp {args.tp}"
+                )
+            tp_size = args.tp
+        if args.ddp != 1:
+            if ddp_size != args.ddp:
+                print(
+                    f"Warning: overriding config mesh_shape ddp_size ({ddp_size}) with --ddp {args.ddp}"
+                )
+            ddp_size = args.ddp
+
         print(f"Loaded training config: {args.config}")
     else:
         model_name = args.model or "nanogpt-char"
         batch_size = args.batch if args.batch is not None else 64
         seq_len = args.seq if args.seq is not None else 256
+        tp_size = args.tp
+        ddp_size = args.ddp
 
     run_model_roofline(
         model_name,
@@ -962,8 +1001,8 @@ Examples:
         weight_decay=weight_decay,
         use_clip_grad_norm=use_clip_grad_norm,
         clip_grad_norm_max_norm=clip_grad_norm_max_norm,
-        tp_size=args.tp,
-        ddp_size=args.ddp,
+        tp_size=tp_size,
+        ddp_size=ddp_size,
     )
 
 if __name__ == "__main__":
