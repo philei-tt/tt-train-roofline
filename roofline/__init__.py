@@ -150,6 +150,13 @@ from .modules import (
     MockLlama,
     MockLlamaConfig,
     create_mock_llama,
+    # Distributed Llama (TP)
+    MockDistributedLlama,
+    MockDistributedLlamaConfig,
+    create_mock_distributed_llama,
+    MockDistributedLlamaBlock,
+    MockDistributedLlamaMLP,
+    MockDistributedGroupedQueryAttention,
 )
 
 # Operations
@@ -270,6 +277,12 @@ __all__ = [
     "MockLlama",
     "MockLlamaConfig",
     "create_mock_llama",
+    "MockDistributedLlama",
+    "MockDistributedLlamaConfig",
+    "create_mock_distributed_llama",
+    "MockDistributedLlamaBlock",
+    "MockDistributedLlamaMLP",
+    "MockDistributedGroupedQueryAttention",
     # Operation base classes
     "RooflineFunctionContext",
     "RooflineFunction",

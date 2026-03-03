@@ -24,6 +24,14 @@ from .llama_block import MockLlamaBlock
 from .nanogpt import MockNanoGPT, MockNanoGPTConfig, create_mock_nanogpt
 from .llama import MockLlama, MockLlamaConfig, create_mock_llama
 from .distributed_linear import MockColumnParallelLinear, MockRowParallelLinear
+from .distributed_llama import (
+    MockDistributedLlama,
+    MockDistributedLlamaConfig,
+    create_mock_distributed_llama,
+)
+from .distributed_llama_block import MockDistributedLlamaBlock
+from .distributed_llama_mlp import MockDistributedLlamaMLP
+from .distributed_grouped_query_attention import MockDistributedGroupedQueryAttention
 
 __all__ = [
     # Base classes
@@ -65,4 +73,11 @@ __all__ = [
     "MockLlama",
     "MockLlamaConfig",
     "create_mock_llama",
+    # Distributed Llama (TP)
+    "MockDistributedLlama",
+    "MockDistributedLlamaConfig",
+    "create_mock_distributed_llama",
+    "MockDistributedLlamaBlock",
+    "MockDistributedLlamaMLP",
+    "MockDistributedGroupedQueryAttention",
 ]

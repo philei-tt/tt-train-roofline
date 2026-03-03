@@ -180,13 +180,13 @@ MODEL_PRESETS: Dict[str, dict] = {
     },
     "llama-8b": {
         "model_type": ModelType.LLAMA,
-        "vocab_size": 32000,
+        "vocab_size": 128256,
         "max_sequence_length": 131072,
         "embedding_dim": 4096,
         "intermediate_dim": 14336,
         "num_heads": 32,
         "num_groups": 8,  # GQA with 8 KV heads (32/8 = 4 queries per KV)
-        "num_blocks": 8,
+        "num_blocks": 32,
         "dropout": 0.0,
         "theta": 500000.0,
         "weight_tying": False,
@@ -354,13 +354,14 @@ def run_model_roofline(
     weight_decay: float = 0.1,
     use_clip_grad_norm: bool = True,
     clip_grad_norm_max_norm: float = 1.0,
-    num_devices: int = 1,
+    tp_size: int = 1,
+    ddp_size: int = 1,
 ):
     """Run transformer model roofline analysis (supports both GPT and Llama models).
 
     Args:
         model_name: Name of the model preset to use (ignored when ``preset`` is given).
-        batch_size: Global batch size for the analysis.
+        batch_size: Global  size for the analysis.
         seq_len: Sequence length for the analysis.
         hardware: Hardware configuration to use.
         plot_memory: Whether to generate memory usage plot.
@@ -371,7 +372,8 @@ def run_model_roofline(
         weight_decay: AdamW weight-decay coefficient.
         use_clip_grad_norm: Whether to run gradient-norm clipping.
         clip_grad_norm_max_norm: Max norm value for gradient clipping.
-        num_devices: Number of DDP devices (1 = single device, >1 = DDP).
+        tp_size: Tensor parallelism size (1 = no TP). For Llama, tp_size > 1 uses MockDistributedLlama.
+        ddp_size: Data-parallel replicas (1 = no DDP). Total devices = tp_size * ddp_size.
     """
     from roofline import (
         MockTensor,
@@ -379,6 +381,8 @@ def run_model_roofline(
         MockNanoGPTConfig,
         MockLlama,
         MockLlamaConfig,
+        MockDistributedLlama,
+        MockDistributedLlamaConfig,
         RooflineContext,
         WORMHOLE_N150,
         WORMHOLE_N300,
@@ -409,10 +413,14 @@ def run_model_roofline(
         return
 
     hw_spec = hardware_map[hardware]
-    ddp_enabled = num_devices > 1
+    num_devices = tp_size * ddp_size
+    assert (
+        num_devices <= hw_spec.chips_per_galaxy
+    ), f"num_devices (tp={tp_size} * ddp={ddp_size} = {num_devices}) must be <= chips_per_galaxy ({hw_spec.chips_per_galaxy}) for {hw_spec.name}"
+    ddp_enabled = ddp_size > 1
 
-    if ddp_enabled and batch_size % num_devices != 0:
-        print(f"Error: batch_size ({batch_size}) must be divisible by num_devices ({num_devices})")
+    if ddp_enabled and batch_size % ddp_size != 0:
+        print(f"Error: batch_size ({batch_size}) must be divisible by ddp_size ({ddp_size})")
         return
 
     print("=" * 70)
@@ -426,7 +434,9 @@ def run_model_roofline(
     print(f"  Eth BW/link: {hw_spec.eth_bw_gb_s_per_link} GB/s ({hw_spec.num_links} links, {hw_spec.topology})")
     print(f"  Peak (HiFi4): {hw_spec.tflops_per_chip(MathFidelity.HiFi4):.1f} TFLOPs")
     if ddp_enabled:
-        print(f"  DDP Devices: {num_devices}")
+        print(f"  DDP replicas: {ddp_size}")
+    if tp_size > 1:
+        print(f"  TP Size: {tp_size} (tensor-parallel Llama)")
     print()
 
     # Resolve preset: use the directly-supplied preset or look up by name
@@ -470,23 +480,49 @@ def run_model_roofline(
         print()
 
     elif model_type == ModelType.LLAMA:
-        config = MockLlamaConfig(
-            vocab_size=preset["vocab_size"],
-            max_sequence_length=preset["max_sequence_length"],
-            embedding_dim=preset["embedding_dim"],
-            intermediate_dim=preset.get("intermediate_dim"),
-            num_heads=preset["num_heads"],
-            num_groups=preset["num_groups"],
-            num_blocks=preset["num_blocks"],
-            dropout_prob=preset["dropout"],
-            theta=preset["theta"],
-            weight_tying=preset["weight_tying"],
-        )
-        model = MockLlama(config)
+        use_distributed_llama = tp_size > 1
+        if use_distributed_llama:
+            num_heads = preset["num_heads"]
+            num_groups = preset["num_groups"]
+            if num_heads % tp_size != 0 or num_groups % tp_size != 0:
+                print(
+                    f"Error: for TP size {tp_size}, Llama requires num_heads ({num_heads}) "
+                    f"and num_groups ({num_groups}) divisible by tp_size. "
+                    f"Choose a model preset where both are divisible by {tp_size}, or use --tp 1."
+                )
+                return
+        if use_distributed_llama:
+            config = MockDistributedLlamaConfig(
+                vocab_size=preset["vocab_size"],
+                max_sequence_length=preset["max_sequence_length"],
+                embedding_dim=preset["embedding_dim"],
+                intermediate_dim=preset.get("intermediate_dim"),
+                num_heads=preset["num_heads"],
+                num_groups=preset["num_groups"],
+                num_blocks=preset["num_blocks"],
+                dropout_prob=preset["dropout"],
+                theta=preset["theta"],
+                tp_size=tp_size,
+            )
+            model = MockDistributedLlama(config)
+        else:
+            config = MockLlamaConfig(
+                vocab_size=preset["vocab_size"],
+                max_sequence_length=preset["max_sequence_length"],
+                embedding_dim=preset["embedding_dim"],
+                intermediate_dim=preset.get("intermediate_dim"),
+                num_heads=preset["num_heads"],
+                num_groups=preset["num_groups"],
+                num_blocks=preset["num_blocks"],
+                dropout_prob=preset["dropout"],
+                theta=preset["theta"],
+                weight_tying=preset["weight_tying"],
+            )
+            model = MockLlama(config)
         max_seq_len = config.max_sequence_length
 
         # Print Llama-specific config
-        print(f"Model: {model_name} (Llama)")
+        print(f"Model: {model_name} (Llama{' [TP]' if use_distributed_llama else ''})")
         print(f"Description: {preset['description']}")
         print()
         print(f"Model Configuration:")
@@ -498,6 +534,8 @@ def run_model_roofline(
         print(f"  num_groups:         {config.num_groups}")
         print(f"  dropout:            {config.dropout_prob}")
         print(f"  theta:              {config.theta}")
+        if use_distributed_llama:
+            print(f"  tp_size:            {config.tp_size}")
         print()
 
     else:
@@ -511,7 +549,7 @@ def run_model_roofline(
         )
         seq_len = max_seq_len
 
-    per_device_batch = batch_size // num_devices if ddp_enabled else batch_size
+    per_device_batch = batch_size // ddp_size if ddp_enabled else batch_size
 
     print(f"Batch Configuration:")
     print(f"  batch_size (global): {batch_size}")
@@ -572,8 +610,8 @@ def run_model_roofline(
 
     # DDP: shard batch across devices (each device gets batch_size/N)
     if ddp_enabled:
-        indices = shard_batch(indices, dim=0, num_devices=num_devices)
-        targets = shard_batch(targets, dim=0, num_devices=num_devices)
+        indices = shard_batch(indices, dim=0, num_devices=ddp_size)
+        targets = shard_batch(targets, dim=0, num_devices=ddp_size)
 
     # Forward pass
     logits = model(ctx, indices)
@@ -602,7 +640,7 @@ def run_model_roofline(
     ccl_time_ms = 0.0
     ccl_flops = 0
     if ddp_enabled:
-        synchronize_gradients(ctx, params, num_devices)
+        synchronize_gradients(ctx, params, ddp_size)
         print_memory_snapshot("AFTER_GRAD_SYNC")
         ccl_time_ms = ctx.total_time_ms() - after_backward_time_ms
         ccl_flops = ctx.total_flops() - after_backward_flops
@@ -669,7 +707,7 @@ def run_model_roofline(
         compute_only_time_ms = forward_time_ms + backward_time_ms + optimizer_time_ms + grad_clip_time_ms
         ccl_overhead_pct = ccl_time_ms / iteration_time_ms * 100 if iteration_time_ms > 0 else 0
         print()
-        print(f"DDP Summary ({num_devices} devices):")
+        print(f"DDP Summary ({ddp_size} replicas):")
         print(f"  Compute time:   {compute_only_time_ms:.4f} ms")
         print(f"  CCL overhead:   {ccl_time_ms:.4f} ms ({ccl_overhead_pct:.1f}%)")
         print(f"  Scaling eff:    {compute_only_time_ms / iteration_time_ms * 100:.1f}%")
@@ -772,9 +810,16 @@ Examples:
   python3 -m roofline.examples.nanogpt --hardware p100            # Blackhole P100
   python3 -m roofline.examples.nanogpt --hardware p150            # Blackhole P150
 
-  # DDP (data-distributed parallelism)
-  python3 -m roofline.examples.nanogpt --model gpt2-small -b 32 -n 8  # 8-device DDP
-  python3 -m roofline.examples.nanogpt --model nanogpt-char -b 64 -n 4
+  # DDP (data-distributed parallelism). Total devices = tp * ddp.
+  python3 -m roofline.examples.nanogpt --model gpt2-small -b 32 --ddp 8  # 8-device DDP
+  python3 -m roofline.examples.nanogpt --model nanogpt-char -b 64 --ddp 4
+
+  # Tensor parallelism (Llama only; uses MockDistributedLlama when tp > 1)
+  python3 -m roofline.examples.nanogpt --model tinyllama -b 1 -s 2048 --tp 2
+  python3 -m roofline.examples.nanogpt --model nanollama --tp 4
+
+  # TP + DDP combined
+  python3 -m roofline.examples.nanogpt --model tinyllama --tp 2 --ddp 4 -b 8
 
   # Utilities
   python3 -m roofline.examples.nanogpt --list                     # List available presets
@@ -841,11 +886,18 @@ Examples:
         help="Run detailed single-block analysis (GPT only)",
     )
     parser.add_argument(
-        "--num-devices",
-        "-n",
+        "--ddp",
         type=int,
         default=1,
-        help="Number of DDP devices (default: 1, single device)",
+        metavar="N",
+        help="Number of data-parallel replicas (default: 1). Total devices = --tp * --ddp.",
+    )
+    parser.add_argument(
+        "--tp",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Tensor parallelism size for Llama (default: 1). If > 1, uses MockDistributedLlama.",
     )
     parser.add_argument(
         "--no-plot",
@@ -910,7 +962,8 @@ Examples:
         weight_decay=weight_decay,
         use_clip_grad_norm=use_clip_grad_norm,
         clip_grad_norm_max_norm=clip_grad_norm_max_norm,
-        num_devices=args.num_devices,
+        tp_size=args.tp,
+        ddp_size=args.ddp,
     )
 
 if __name__ == "__main__":
