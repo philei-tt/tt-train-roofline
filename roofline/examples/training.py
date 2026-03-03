@@ -35,11 +35,12 @@ Run from tt-train directory:
     python3 -m roofline.examples.nanogpt --list
 """
 
+import json
 import os
 import sys
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 
 
 class ModelType(Enum):
@@ -180,13 +181,13 @@ MODEL_PRESETS: Dict[str, dict] = {
     },
     "llama-8b": {
         "model_type": ModelType.LLAMA,
-        "vocab_size": 128256,
+        "vocab_size": 32000,
         "max_sequence_length": 131072,
         "embedding_dim": 4096,
         "intermediate_dim": 14336,
         "num_heads": 32,
         "num_groups": 8,  # GQA with 8 KV heads (32/8 = 4 queries per KV)
-        "num_blocks": 32,
+        "num_blocks": 8,
         "dropout": 0.0,
         "theta": 500000.0,
         "weight_tying": False,
@@ -364,37 +365,91 @@ def load_training_config(config_path: str) -> dict:
 
 def run_model_roofline(
     model_name: str = "nanogpt-char",
-    batch_size: int = 64,
-    seq_len: int = 256,
+    batch_size: Optional[int] = None,
+    seq_len: Optional[int] = None,
     hardware: str = "n150",
     plot_memory: bool = True,
     detailed: bool = False,
     preset: Optional[dict] = None,
+    config: Optional[str] = None,
     lr: float = 1e-4,
     weight_decay: float = 0.1,
     use_clip_grad_norm: bool = True,
     clip_grad_norm_max_norm: float = 1.0,
-    tp_size: int = 1,
-    ddp_size: int = 1,
-):
+    tp_size: Optional[int] = None,
+    ddp_size: Optional[int] = None,
+    verbose: bool = False,
+) -> Dict[str, Any]:
     """Run transformer model roofline analysis (supports both GPT and Llama models).
 
+    Callable programmatically: pass verbose=False (default) to suppress print output.
+    Returns a dict with hardware, model_config, batch_config, model_statistics,
+    peak_memory, memory_usage_breakdown, timing_breakdown, ccl, throughput,
+    and bottleneck_analysis. On validation error, returns {"error": "message"}.
+
     Args:
-        model_name: Name of the model preset to use (ignored when ``preset`` is given).
-        batch_size: Global  size for the analysis.
-        seq_len: Sequence length for the analysis.
-        hardware: Hardware configuration to use.
+        model_name: Name of the model preset to use (ignored when ``preset`` or ``config`` is given).
+        batch_size: Global batch size. None = use config default or 64.
+        seq_len: Sequence length. None = use config default or 256.
+        hardware: Hardware configuration to use (n150, n300, p100, p150, bh_glx).
         plot_memory: Whether to generate memory usage plot.
-        detailed: Print full per-op summary at the end.
+        detailed: Print full per-op summary at the end (when verbose).
         preset: Optional preset dict (same format as MODEL_PRESETS values).
             When provided, ``model_name`` is used only as a display label.
+        config: Path to tt-train training config YAML. When set, loads preset and training defaults;
+            batch_size/seq_len/tp_size/ddp_size passed here override config values.
         lr: AdamW learning rate.
         weight_decay: AdamW weight-decay coefficient.
         use_clip_grad_norm: Whether to run gradient-norm clipping.
         clip_grad_norm_max_norm: Max norm value for gradient clipping.
-        tp_size: Tensor parallelism size (1 = no TP). For Llama, tp_size > 1 uses MockDistributedLlama.
-        ddp_size: Data-parallel replicas (1 = no DDP). Total devices = tp_size * ddp_size.
+        tp_size: Tensor parallelism size (None = from config or 1). For Llama, tp_size > 1 uses MockDistributedLlama.
+        ddp_size: Data-parallel replicas (None = from config or 1). Total devices = tp_size * ddp_size.
+        verbose: If True, print progress and summaries to stdout. Default False for programmatic use.
+
+    Returns:
+        Result dict with keys: hardware, model_config, batch_config, model_statistics,
+        peak_memory, memory_usage_breakdown, timing_breakdown, ccl, throughput,
+        bottleneck_analysis; or {"error": str} on failure.
     """
+    # Resolve config file: load preset and training defaults when config path is given
+    if config is not None:
+        try:
+            loaded = load_training_config(config)
+            preset = loaded
+            model_name = os.path.splitext(os.path.basename(config))[0]
+            training = loaded.get("_training", {})
+            lr = training.get("learning_rate", lr)
+            weight_decay = training.get("weight_decay", weight_decay)
+            use_clip_grad_norm = training.get("use_clip_grad_norm", use_clip_grad_norm)
+            clip_grad_norm_max_norm = training.get("clip_grad_norm_max_norm", clip_grad_norm_max_norm)
+            dev_cfg = loaded.get("_device_config", {})
+            if tp_size is None:
+                tp_size = dev_cfg.get("tp_size", 1)
+            if ddp_size is None:
+                ddp_size = dev_cfg.get("ddp_size", 1)
+            mt = loaded["model_type"]
+            max_seq_from_config = (
+                loaded.get("max_sequence_length") if mt == ModelType.LLAMA else loaded.get("block_size")
+            )
+            if batch_size is None:
+                batch_size = training.get("batch_size") or 64
+            if seq_len is None:
+                seq_len = max_seq_from_config or 256
+        except (FileNotFoundError, ValueError, KeyError) as exc:
+            return {"error": str(exc)}
+    if batch_size is None:
+        batch_size = 64
+    if seq_len is None:
+        seq_len = 256
+    if tp_size is None:
+        tp_size = 1
+    if ddp_size is None:
+        ddp_size = 1
+
+    def _log(*args, **kwargs) -> None:
+        if verbose:
+            print(*args, **kwargs)
+
     from roofline import (
         MockTensor,
         MockNanoGPT,
@@ -428,43 +483,46 @@ def run_model_roofline(
     }
 
     if hardware not in hardware_map:
-        print(f"Unknown hardware: {hardware}")
-        print(f"Available hardware: {', '.join(hardware_map.keys())}")
-        return
+        return {
+            "error": f"Unknown hardware: {hardware}. Available: {', '.join(hardware_map.keys())}"
+        }
 
     hw_spec = hardware_map[hardware]
     num_devices = tp_size * ddp_size
-    assert (
-        num_devices <= hw_spec.chips_per_galaxy
-    ), f"num_devices (tp={tp_size} * ddp={ddp_size} = {num_devices}) must be <= chips_per_galaxy ({hw_spec.chips_per_galaxy}) for {hw_spec.name}"
+    if num_devices > hw_spec.chips_per_galaxy:
+        return {
+            "error": (
+                f"num_devices (tp={tp_size} * ddp={ddp_size} = {num_devices}) must be <= "
+                f"chips_per_galaxy ({hw_spec.chips_per_galaxy}) for {hw_spec.name}"
+            )
+        }
     ddp_enabled = ddp_size > 1
 
     if ddp_enabled and batch_size % ddp_size != 0:
-        print(f"Error: batch_size ({batch_size}) must be divisible by ddp_size ({ddp_size})")
-        return
+        return {"error": f"batch_size ({batch_size}) must be divisible by ddp_size ({ddp_size})"}
 
-    print("=" * 70)
-    print("TRANSFORMER MODEL ROOFLINE ANALYSIS")
-    print("=" * 70)
-    print()
-    print(f"Hardware: {hw_spec.name}")
-    print(f"  Cores:      {hw_spec.tensix_cores_per_chip}")
-    print(f"  Clock:      {hw_spec.clock_ghz} GHz")
-    print(f"  DRAM BW:    {hw_spec.dram_bw_gb_s} GB/s")
-    print(f"  Eth BW/link: {hw_spec.eth_bw_gb_s_per_link} GB/s ({hw_spec.num_links} links, {hw_spec.topology})")
-    print(f"  Peak (HiFi4): {hw_spec.tflops_per_chip(MathFidelity.HiFi4):.1f} TFLOPs")
+    _log("=" * 70)
+    _log("TRANSFORMER MODEL ROOFLINE ANALYSIS")
+    _log("=" * 70)
+    _log()
+    _log(f"Hardware: {hw_spec.name}")
+    _log(f"  Cores:      {hw_spec.tensix_cores_per_chip}")
+    _log(f"  Clock:      {hw_spec.clock_ghz} GHz")
+    _log(f"  DRAM BW:    {hw_spec.dram_bw_gb_s} GB/s")
+    _log(f"  Eth BW/link: {hw_spec.eth_bw_gb_s_per_link} GB/s ({hw_spec.num_links} links, {hw_spec.topology})")
+    _log(f"  Peak (HiFi4): {hw_spec.tflops_per_chip(MathFidelity.HiFi4):.1f} TFLOPs")
     if ddp_enabled:
-        print(f"  DDP replicas: {ddp_size}")
+        _log(f"  DDP replicas: {ddp_size}")
     if tp_size > 1:
-        print(f"  TP Size: {tp_size} (tensor-parallel Llama)")
-    print()
+        _log(f"  TP Size: {tp_size} (tensor-parallel Llama)")
+    _log()
 
     # Resolve preset: use the directly-supplied preset or look up by name
     if preset is None:
         if model_name not in MODEL_PRESETS:
-            print(f"Unknown model: {model_name}")
-            print(f"Available presets: {', '.join(MODEL_PRESETS.keys())}")
-            return
+            return {
+                "error": f"Unknown model: {model_name}. Available: {', '.join(MODEL_PRESETS.keys())}"
+            }
         preset = MODEL_PRESETS[model_name]
 
     model_type = preset["model_type"]
@@ -487,17 +545,17 @@ def run_model_roofline(
         max_seq_len = config.block_size
 
         # Print GPT-specific config
-        print(f"Model: {model_name} (GPT)")
-        print(f"Description: {preset['description']}")
-        print()
-        print(f"Model Configuration:")
-        print(f"  vocab_size:  {config.vocab_size:,}")
-        print(f"  block_size:  {config.block_size}")
-        print(f"  n_embd:      {config.n_embd}")
-        print(f"  n_layer:     {config.n_layer}")
-        print(f"  n_head:      {config.n_head}")
-        print(f"  dropout:     {config.dropout}")
-        print()
+        _log(f"Model: {model_name} (GPT)")
+        _log(f"Description: {preset['description']}")
+        _log()
+        _log(f"Model Configuration:")
+        _log(f"  vocab_size:  {config.vocab_size:,}")
+        _log(f"  block_size:  {config.block_size}")
+        _log(f"  n_embd:      {config.n_embd}")
+        _log(f"  n_layer:     {config.n_layer}")
+        _log(f"  n_head:      {config.n_head}")
+        _log(f"  dropout:     {config.dropout}")
+        _log()
 
     elif model_type == ModelType.LLAMA:
         use_distributed_llama = tp_size > 1
@@ -505,12 +563,13 @@ def run_model_roofline(
             num_heads = preset["num_heads"]
             num_groups = preset["num_groups"]
             if num_heads % tp_size != 0 or num_groups % tp_size != 0:
-                print(
-                    f"Error: for TP size {tp_size}, Llama requires num_heads ({num_heads}) "
-                    f"and num_groups ({num_groups}) divisible by tp_size. "
-                    f"Choose a model preset where both are divisible by {tp_size}, or use --tp 1."
-                )
-                return
+                return {
+                    "error": (
+                        f"For TP size {tp_size}, Llama requires num_heads ({num_heads}) and "
+                        f"num_groups ({num_groups}) divisible by tp_size. "
+                        f"Choose a model preset where both are divisible by {tp_size}, or use tp_size=1."
+                    )
+                }
         if use_distributed_llama:
             config = MockDistributedLlamaConfig(
                 vocab_size=preset["vocab_size"],
@@ -542,62 +601,59 @@ def run_model_roofline(
         max_seq_len = config.max_sequence_length
 
         # Print Llama-specific config
-        print(f"Model: {model_name} (Llama{' [TP]' if use_distributed_llama else ''})")
-        print(f"Description: {preset['description']}")
-        print()
-        print(f"Model Configuration:")
-        print(f"  vocab_size:         {config.vocab_size:,}")
-        print(f"  max_sequence_length: {config.max_sequence_length}")
-        print(f"  embedding_dim:      {config.embedding_dim}")
-        print(f"  num_blocks:         {config.num_blocks}")
-        print(f"  num_heads:          {config.num_heads}")
-        print(f"  num_groups:         {config.num_groups}")
-        print(f"  dropout:            {config.dropout_prob}")
-        print(f"  theta:              {config.theta}")
+        _log(f"Model: {model_name} (Llama{' [TP]' if use_distributed_llama else ''})")
+        _log(f"Description: {preset['description']}")
+        _log()
+        _log(f"Model Configuration:")
+        _log(f"  vocab_size:         {config.vocab_size:,}")
+        _log(f"  max_sequence_length: {config.max_sequence_length}")
+        _log(f"  embedding_dim:      {config.embedding_dim}")
+        _log(f"  num_blocks:         {config.num_blocks}")
+        _log(f"  num_heads:          {config.num_heads}")
+        _log(f"  num_groups:         {config.num_groups}")
+        _log(f"  dropout:            {config.dropout_prob}")
+        _log(f"  theta:              {config.theta}")
         if use_distributed_llama:
-            print(f"  tp_size:            {config.tp_size}")
-        print()
+            _log(f"  tp_size:            {config.tp_size}")
+        _log()
 
     else:
-        print(f"Unknown model type: {model_type}")
-        return
+        return {"error": f"Unknown model type: {model_type}"}
 
     # Clamp seq_len to max sequence length
     if seq_len > max_seq_len:
-        print(
-            f"Warning: seq_len ({seq_len}) > max_seq_len ({max_seq_len}), clamping to max_seq_len"
-        )
+        _log(f"Warning: seq_len ({seq_len}) > max_seq_len ({max_seq_len}), clamping to max_seq_len")
         seq_len = max_seq_len
 
     per_device_batch = batch_size // ddp_size if ddp_enabled else batch_size
 
-    print(f"Batch Configuration:")
-    print(f"  batch_size (global): {batch_size}")
+    _log(f"Batch Configuration:")
+    _log(f"  batch_size (global): {batch_size}")
     if ddp_enabled:
-        print(f"  batch_size (per device): {per_device_batch}")
-    print(f"  seq_len:     {seq_len}")
-    print()
+        _log(f"  batch_size (per device): {per_device_batch}")
+    _log(f"  seq_len:     {seq_len}")
+    _log()
 
     # Count parameters
     params = model.parameters()
     total_params = sum(p.logical_volume() for p in params.values())
     param_memory = sum(p.bytes() for p in params.values())
 
-    print(f"Model Statistics:")
-    print(f"  Parameters:  {total_params:,} ({total_params/1e6:.1f}M)")
-    print(f"  Param Memory: {param_memory/1e9:.3f} GB (BF16)")
-    print()
+    _log(f"Model Statistics:")
+    _log(f"  Parameters:  {total_params:,} ({total_params/1e6:.1f}M)")
+    _log(f"  Param Memory: {param_memory/1e9:.3f} GB (BF16)")
+    _log()
 
-    print("-" * 70)
-    print(f"Running Analysis: B={batch_size}, S={seq_len}")
-    print("-" * 70)
+    _log("-" * 70)
+    _log(f"Running Analysis: B={batch_size}, S={seq_len}")
+    _log("-" * 70)
 
-    # Helper to print memory snapshot
+    # Helper to print memory snapshot (only when verbose)
     def print_memory_snapshot(label: str):
-        if ctx.memory_tracker is not None:
+        if verbose and ctx.memory_tracker is not None:
             current_bytes, breakdown = ctx.memory_tracker.current_memory()
-            print(f"--- {label} ---")
-            print(f"  Current Memory: {current_bytes / 1e6:.2f} MB")
+            _log(f"--- {label} ---")
+            _log(f"  Current Memory: {current_bytes / 1e6:.2f} MB")
 
     # Snapshot after model creation
     print_memory_snapshot("AFTER_MODEL_CREATION")
@@ -685,7 +741,8 @@ def run_model_roofline(
 
     # Snapshot after iteration complete
     print_memory_snapshot("ITERATION_COMPLETE")
-    ctx.print_peak_memory()
+    if verbose:
+        ctx.print_peak_memory()
 
     grad_clip_time_ms = ctx.total_time_ms() - after_optimizer_time_ms
     grad_clip_flops = ctx.total_flops() - after_optimizer_flops
@@ -696,55 +753,81 @@ def run_model_roofline(
     total_tokens = batch_size * seq_len  # global batch tokens
     tokens_per_second = total_tokens / (iteration_time_ms / 1000)
 
-    print()
-    print("Timing Breakdown (per device):")
-    print(f"  Forward:     {forward_time_ms:.4f} ms ({forward_flops/1e12:.4f} TFLOPs)")
-    print(
-        f"  Backward:    {backward_time_ms:.4f} ms ({backward_flops/1e12:.4f} TFLOPs)"
-    )
-    if ddp_enabled:
-        print(
-            f"  CCL Sync:    {ccl_time_ms:.4f} ms"
+    # CCL time (TP): sum time for collective ops in forward/backward (AllReduce, AllGather, Broadcast, Scatter, ReduceScatter, SyncGrad)
+    def _is_ccl_operation(op_name: str) -> bool:
+        return (
+            "AllReduce" in op_name
+            or "AllGather" in op_name
+            or "Broadcast" in op_name
+            or "Scatter" in op_name
+            or "ReduceScatter" in op_name
+            or op_name.startswith("SyncGrad.")
         )
-    print(
-        f"  Optimizer:   {optimizer_time_ms:.4f} ms ({optimizer_flops/1e12:.4f} TFLOPs)"
+
+    ccl_forward_time_ns = sum(
+        e.theoretical_time_ns
+        for e in ctx.estimates
+        if _is_ccl_operation(e.operation) and e.phase == "forward"
     )
-    print(
-        f"  Grad Clip:   {grad_clip_time_ms:.4f} ms ({grad_clip_flops/1e12:.4f} TFLOPs)"
+    ccl_backward_time_ns = sum(
+        e.theoretical_time_ns
+        for e in ctx.estimates
+        if _is_ccl_operation(e.operation) and e.phase == "backward"
     )
-    print(
-        f"  Total:       {iteration_time_ms:.4f} ms ({iteration_flops/1e12:.4f} TFLOPs)"
-    )
-    print()
-    print("Throughput:")
-    print(f"  Tokens/iter: {total_tokens:,} (global batch)")
+    ccl_forward_time_ms = ccl_forward_time_ns / 1e6
+    ccl_backward_time_ms = ccl_backward_time_ns / 1e6
+
+    _log()
+    _log("Timing Breakdown (per device):")
+    _log(f"  Forward:     {forward_time_ms:.4f} ms ({forward_flops/1e12:.4f} TFLOPs)")
+    _log(f"  Backward:    {backward_time_ms:.4f} ms ({backward_flops/1e12:.4f} TFLOPs)")
+    if ddp_enabled:
+        _log(f"  CCL Sync:    {ccl_time_ms:.4f} ms")
+    _log(f"  Optimizer:   {optimizer_time_ms:.4f} ms ({optimizer_flops/1e12:.4f} TFLOPs)")
+    _log(f"  Grad Clip:   {grad_clip_time_ms:.4f} ms ({grad_clip_flops/1e12:.4f} TFLOPs)")
+    _log(f"  Total:       {iteration_time_ms:.4f} ms ({iteration_flops/1e12:.4f} TFLOPs)")
+    if tp_size > 1:
+        _log()
+        _log("CCL time (TP) — time spent on collectives in forward/backward:")
+        pct_fwd = (ccl_forward_time_ms / forward_time_ms * 100) if forward_time_ms > 0 else 0.0
+        pct_bwd = (ccl_backward_time_ms / backward_time_ms * 100) if backward_time_ms > 0 else 0.0
+        _log(f"  Forward:     {ccl_forward_time_ms:.4f} ms  ({pct_fwd:.1f}% of forward)")
+        _log(f"  Backward:    {ccl_backward_time_ms:.4f} ms  ({pct_bwd:.1f}% of backward)")
+        ccl_total_ms = ccl_forward_time_ms + ccl_backward_time_ms
+        compute_fwd_bwd_ms = forward_time_ms + backward_time_ms
+        pct_total = (ccl_total_ms / compute_fwd_bwd_ms * 100) if compute_fwd_bwd_ms > 0 else 0.0
+        _log(f"  Total CCL:   {ccl_total_ms:.4f} ms  ({pct_total:.1f}% of fwd+bwd)")
+    _log()
+    _log("Throughput:")
+    _log(f"  Tokens/iter: {total_tokens:,} (global batch)")
     if ddp_enabled:
         per_device_tokens = per_device_batch * seq_len
-        print(f"  Tokens/device: {per_device_tokens:,}")
-    print(f"  Tokens/sec:  {tokens_per_second:,.0f} (cluster total)")
-    print(f"  TFLOPs/dev:  {ctx.achieved_tflops():.2f}")
+        _log(f"  Tokens/device: {per_device_tokens:,}")
+    _log(f"  Tokens/sec:  {tokens_per_second:,.0f} (cluster total)")
+    _log(f"  TFLOPs/dev:  {ctx.achieved_tflops():.2f}")
     if ddp_enabled:
         compute_only_time_ms = forward_time_ms + backward_time_ms + optimizer_time_ms + grad_clip_time_ms
         ccl_overhead_pct = ccl_time_ms / iteration_time_ms * 100 if iteration_time_ms > 0 else 0
-        print()
-        print(f"DDP Summary ({ddp_size} replicas):")
-        print(f"  Compute time:   {compute_only_time_ms:.4f} ms")
-        print(f"  CCL overhead:   {ccl_time_ms:.4f} ms ({ccl_overhead_pct:.1f}%)")
-        print(f"  Scaling eff:    {compute_only_time_ms / iteration_time_ms * 100:.1f}%")
-    print()
+        _log()
+        _log(f"DDP Summary ({ddp_size} replicas):")
+        _log(f"  Compute time:   {compute_only_time_ms:.4f} ms")
+        _log(f"  CCL overhead:   {ccl_time_ms:.4f} ms ({ccl_overhead_pct:.1f}%)")
+        _log(f"  Scaling eff:    {compute_only_time_ms / iteration_time_ms * 100:.1f}%")
+    _log()
 
     # Bottleneck analysis
     breakdown = ctx.bottleneck_breakdown()
-    print("Bottleneck Analysis:")
+    _log("Bottleneck Analysis:")
     for btype, count in sorted(breakdown.items(), key=lambda x: -x[1]):
-        print(f"  {btype.value}: {count} ops")
+        _log(f"  {btype.value}: {count} ops")
 
     # Peak memory analysis from tracking
-    print()
-    print("-" * 70)
-    print("Memory Tracking Analysis")
-    print("-" * 70)
-    ctx.print_peak_memory()
+    _log()
+    _log("-" * 70)
+    _log("Memory Tracking Analysis")
+    _log("-" * 70)
+    if verbose:
+        ctx.print_peak_memory()
 
     # Generate memory usage plots
     if plot_memory:
@@ -763,16 +846,97 @@ def run_model_roofline(
             stacked=False,
         )
     
-    if detailed:
-        print(ctx.summary())
+    if detailed and verbose:
+        _log(ctx.summary())
 
-    print()
-    print("=" * 70)
-    print("ANALYSIS COMPLETE")
-    print("=" * 70)
+    _log()
+    _log("=" * 70)
+    _log("ANALYSIS COMPLETE")
+    _log("=" * 70)
+
+    # Build result dict for programmatic use
+    peak_bytes, memory_breakdown_by_label = ctx.peak_memory_tracked()
+    memory_usage_breakdown = {k.value: v for k, v in memory_breakdown_by_label.items()}
+    bottleneck_analysis = {btype.value: count for btype, count in breakdown.items()}
+    ccl_total_tp_ms = ccl_forward_time_ms + ccl_backward_time_ms
+    compute_fwd_bwd_ms = forward_time_ms + backward_time_ms
+    pct_fwd = (ccl_forward_time_ms / forward_time_ms * 100) if forward_time_ms > 0 else 0.0
+    pct_bwd = (ccl_backward_time_ms / backward_time_ms * 100) if backward_time_ms > 0 else 0.0
+    pct_total_ccl = (ccl_total_tp_ms / compute_fwd_bwd_ms * 100) if compute_fwd_bwd_ms > 0 else 0.0
+
+    result: Dict[str, Any] = {
+        "hardware": {
+            "name": hw_spec.name,
+            "tensix_cores_per_chip": hw_spec.tensix_cores_per_chip,
+            "clock_ghz": hw_spec.clock_ghz,
+            "dram_bw_gb_s": hw_spec.dram_bw_gb_s,
+            "eth_bw_gb_s_per_link": hw_spec.eth_bw_gb_s_per_link,
+            "num_links": hw_spec.num_links,
+            "topology": hw_spec.topology,
+            "peak_tflops_hifi4": hw_spec.tflops_per_chip(MathFidelity.HiFi4),
+            "chips_per_galaxy": hw_spec.chips_per_galaxy,
+            "ddp_size": ddp_size,
+            "tp_size": tp_size,
+        },
+        "model_config": {
+            "model_name": model_name,
+            "model_type": model_type.value,
+            "description": preset.get("description", ""),
+            **{k: v for k, v in preset.items() if not k.startswith("_") and k != "model_type"},
+        },
+        "batch_config": {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "per_device_batch": per_device_batch if ddp_enabled else batch_size,
+            "ddp_size": ddp_size,
+            "tp_size": tp_size,
+        },
+        "model_statistics": {
+            "total_parameters": total_params,
+            "param_memory_bytes": param_memory,
+            "param_memory_gb": param_memory / 1e9,
+        },
+        "peak_memory": {
+            "peak_bytes": peak_bytes,
+            "peak_gb": peak_bytes / 1e9,
+            "breakdown": memory_usage_breakdown,
+        },
+        "memory_usage_breakdown": memory_usage_breakdown,
+        "timing_breakdown": {
+            "forward": {"time_ms": forward_time_ms, "flops": forward_flops, "tflops": forward_flops / 1e12},
+            "backward": {"time_ms": backward_time_ms, "flops": backward_flops, "tflops": backward_flops / 1e12},
+            "optimizer": {"time_ms": optimizer_time_ms, "flops": optimizer_flops, "tflops": optimizer_flops / 1e12},
+            "grad_clip": {"time_ms": grad_clip_time_ms, "flops": grad_clip_flops, "tflops": grad_clip_flops / 1e12},
+            "total": {"time_ms": iteration_time_ms, "flops": iteration_flops, "tflops": iteration_flops / 1e12},
+        },
+        "ccl": {
+            "ccl_forward_time_ms": ccl_forward_time_ms,
+            "ccl_backward_time_ms": ccl_backward_time_ms,
+            "ccl_total_tp_ms": ccl_total_tp_ms,
+            "ccl_pct_forward": pct_fwd,
+            "ccl_pct_backward": pct_bwd,
+            "ccl_pct_of_fwd_bwd": pct_total_ccl,
+        },
+        "throughput": {
+            "total_tokens": total_tokens,
+            "tokens_per_second": tokens_per_second,
+            "achieved_tflops_per_device": ctx.achieved_tflops(),
+        },
+        "bottleneck_analysis": bottleneck_analysis,
+    }
+    if ddp_enabled:
+        result["timing_breakdown"]["ccl_sync"] = {"time_ms": ccl_time_ms, "flops": ccl_flops}
+        result["ccl"]["grad_sync_time_ms"] = ccl_time_ms
+        compute_only_time_ms = forward_time_ms + backward_time_ms + optimizer_time_ms + grad_clip_time_ms
+        result["throughput"]["compute_time_ms"] = compute_only_time_ms
+        result["throughput"]["ccl_overhead_ms"] = ccl_time_ms
+        result["throughput"]["ccl_overhead_pct"] = (ccl_time_ms / iteration_time_ms * 100) if iteration_time_ms > 0 else 0.0
+        result["throughput"]["scaling_efficiency_pct"] = (compute_only_time_ms / iteration_time_ms * 100) if iteration_time_ms > 0 else 0.0
+        result["throughput"]["tokens_per_device"] = per_device_batch * seq_len
 
     # Disable memory tracking when done
     ctx.disable_memory_tracking()
+    return result
 
 
 def list_models():
@@ -924,6 +1088,14 @@ Examples:
         action="store_true",
         help="Disable memory usage plot generation",
     )
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Export roofline analysis result to JSON file",
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -989,7 +1161,7 @@ Examples:
         tp_size = args.tp
         ddp_size = args.ddp
 
-    run_model_roofline(
+    result = run_model_roofline(
         model_name,
         batch_size=batch_size,
         seq_len=seq_len,
@@ -1003,7 +1175,16 @@ Examples:
         clip_grad_norm_max_norm=clip_grad_norm_max_norm,
         tp_size=tp_size,
         ddp_size=ddp_size,
+        verbose=True,
     )
+    if isinstance(result, dict) and "error" in result:
+        print(f"Error: {result['error']}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.output:
+        with open(args.output, "w") as f:
+            json.dump(result, f, indent=2)
+        print(f"Roofline analysis written to {args.output}")
 
 if __name__ == "__main__":
     main()
