@@ -272,12 +272,15 @@ def load_training_config(config_path: str) -> dict:
                 "clip_grad_norm_max_norm": ...,
             }
             preset["_device_config"] = {
-                "ddp_size": int,  # from device_config.mesh_shape[0]
-                "tp_size": int,   # from device_config.mesh_shape[1]
+                "ddp_size": int,
+                "tp_size": int,
             }
 
-        mesh_shape is [ddp_size, tp_size]: (1,1)=single chip, (N,1)=DDP only,
-        (1,N)=TP only, (N,M)=both. Defaults to [1, 1] if device_config is absent.
+        device_config may set ``enable_ddp``, ``enable_tp``, and ``mesh_shape``.
+        mesh_shape[0] is the DDP dimension, mesh_shape[1] is the TP dimension.
+        When both are enabled: ddp_size=mesh[0], tp_size=mesh[1]. When only one
+        is enabled, the other dimension is 1 and the enabled size is the non-1
+        value. Defaults to [1, 1] if device_config is absent.
     """
     try:
         import yaml
@@ -347,17 +350,33 @@ def load_training_config(config_path: str) -> dict:
         "clip_grad_norm_max_norm": tc.get("clip_grad_norm_max_norm", 1.0),
     }
 
-    # device_config: mesh_shape is [ddp_size, tp_size] (DDP over first dim, TP over second)
-    # (1, 1) = single chip; (N, 1) = DDP only; (1, N) = TP only; (N, M) = both
+    # device_config: mesh_shape[0] = DDP dimension, mesh_shape[1] = TP dimension.
+    # When both enable_ddp and enable_tp: ddp_size = mesh[0], tp_size = mesh[1].
+    # When only one is enabled: the disabled dimension is 1, the other is the size.
     device_cfg = training_cfg.get("device_config", {})
     mesh = device_cfg.get("mesh_shape", [1, 1])
     if len(mesh) != 2:
         raise ValueError(
-            f"device_config.mesh_shape must be [ddp_size, tp_size] (length 2). Got: {mesh}"
+            f"device_config.mesh_shape must have length 2. Got: {mesh}"
         )
+    mesh = [int(mesh[0]), int(mesh[1])]
+    enable_ddp = device_cfg.get("enable_ddp", mesh[0] > 1)
+    enable_tp = device_cfg.get("enable_tp", mesh[1] > 1)
+    if enable_ddp and enable_tp:
+        ddp_size = mesh[0]
+        tp_size = mesh[1]
+    elif enable_ddp:
+        ddp_size = mesh[0] if mesh[0] != 1 else mesh[1]
+        tp_size = 1
+    elif enable_tp:
+        ddp_size = 1
+        tp_size = mesh[1] if mesh[1] != 1 else mesh[0]
+    else:
+        ddp_size = 1
+        tp_size = 1
     preset["_device_config"] = {
-        "ddp_size": int(mesh[0]),
-        "tp_size": int(mesh[1]),
+        "ddp_size": ddp_size,
+        "tp_size": tp_size,
     }
 
     return preset
