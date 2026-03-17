@@ -14,7 +14,8 @@ from typing import Optional, TYPE_CHECKING
 
 from ..mock_tensor import MockTensor
 from ..hardware import DataType
-from ..operations.rmsnorm import MockRMSNormOp
+from ..operations.rmsnorm import MockRMSNormOp  # noqa: F401 (keep for re-export compat)
+from ..operations import MockLinearOp
 from .module import MockModule, MockParameter, MockModuleList
 from .embedding import MockEmbedding
 from .linear import MockLinearLayer
@@ -93,23 +94,15 @@ class MockLlama(MockModule):
             theta=config.theta,
         )
 
-        # Handle weight tying
+        # Token embedding
+        self.tok_emb = MockEmbedding(
+            vocab_size_padded, config.embedding_dim, dtype=dtype
+        )
+
         if config.weight_tying:
-            # Output projection first (will be shared with embedding)
-            self.fc = MockLinearLayer(
-                config.embedding_dim, vocab_size_padded, has_bias=False, dtype=dtype
-            )
-            # Token embedding shares weight with fc
-            # Note: In actual implementation, this uses tied weights
-            # For roofline, we create separate parameters but account for shared memory
-            self.tok_emb = MockEmbedding(
-                vocab_size_padded, config.embedding_dim, dtype=dtype
-            )
+            # fc shares the tok_emb weight: no separate parameter registered
+            self.fc = None
         else:
-            # Token embedding
-            self.tok_emb = MockEmbedding(
-                vocab_size_padded, config.embedding_dim, dtype=dtype
-            )
             # Output projection (no bias)
             self.fc = MockLinearLayer(
                 config.embedding_dim, vocab_size_padded, has_bias=False, dtype=dtype
@@ -160,8 +153,12 @@ class MockLlama(MockModule):
         # Final normalization
         out = self.ln_fc(ctx, out)
 
-        # Output projection
-        logits = self.fc(ctx, out)
+        # Output projection (tied to tok_emb weight when weight_tying=True)
+        if self.fc is not None:
+            logits = self.fc(ctx, out)
+        else:
+            # Tied weights: reuse tok_emb weight, same linear cost
+            logits = MockLinearOp.apply(ctx, out, self.tok_emb.weight.tensor, None)
 
         return logits
 
