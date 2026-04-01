@@ -236,22 +236,26 @@ class MockTensor:
                 num_shards=self.num_shards,
             )
 
-        # Topological sort for backward traversal
+        # Iterative topological sort for backward traversal
         visited = set()
         order: List[MockTensor] = []
+        stack: List[tuple] = [(self, False)]
 
-        def build_order(tensor: MockTensor):
-            if id(tensor) in visited:
-                return
-            visited.add(id(tensor))
-
-            if tensor._node is not None:
-                for inp in tensor._node.inputs:
-                    if inp is not None and inp.requires_grad:
-                        build_order(inp)
+        while stack:
+            tensor, processed = stack.pop()
+            if processed:
                 order.append(tensor)
-
-        build_order(self)
+                continue
+            tid = id(tensor)
+            if tid in visited:
+                continue
+            visited.add(tid)
+            if tensor._node is None:
+                continue
+            stack.append((tensor, True))
+            for inp in tensor._node.inputs:
+                if inp is not None and inp.requires_grad and id(inp) not in visited:
+                    stack.append((inp, False))
 
         # Execute backward in reverse topological order
         # Pop from list to release references as we go
