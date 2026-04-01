@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING
 
-from ..mock_tensor import MockTensor
+from ..mock_tensor import MockTensor, memory_efficient_runner
 from ..hardware import DataType
 from .module import MockModule, MockModuleList
 from .embedding import MockEmbedding
@@ -56,11 +56,13 @@ class MockDistributedLlama(MockModule):
         self,
         config: MockDistributedLlamaConfig,
         dtype: DataType = DataType.BFLOAT16,
+        runner: str = "default",
     ):
         super().__init__()
 
         self.config = config
         self.dtype = dtype
+        self.runner = runner
         tp_size = config.tp_size
 
         vocab_size_padded = (config.vocab_size + 31) // 32 * 32
@@ -107,7 +109,10 @@ class MockDistributedLlama(MockModule):
     ) -> MockTensor:
         out = self.tok_emb(ctx, indices)
         for block in self.blocks:
-            out = block(ctx, out, mask)
+            if self.runner == "mem_eff":
+                out = memory_efficient_runner(block, ctx, out, mask)
+            else:
+                out = block(ctx, out, mask)
         out = self.ln_fc(ctx, out)
         logits = self.fc(ctx, out)
         return logits

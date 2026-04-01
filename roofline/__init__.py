@@ -77,6 +77,7 @@ from .mock_tensor import (
     TensorLabel,
     set_global_memory_tracker,
     get_global_memory_tracker,
+    memory_efficient_runner,
 )
 
 # Memory tracking
@@ -249,6 +250,7 @@ __all__ = [
     # Mock tensor
     "MockTensor",
     "BackwardNode",
+    "memory_efficient_runner",
     # Module base classes
     "MockParameter",
     "MockModule",

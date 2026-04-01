@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING
 
-from ..mock_tensor import MockTensor
+from ..mock_tensor import MockTensor, memory_efficient_runner
 from ..hardware import DataType
 from ..operations import MockLayerNormOp
 from .module import MockModule, MockParameter, MockModuleList
@@ -66,14 +66,17 @@ class MockNanoGPT(MockModule):
         self,
         config: MockNanoGPTConfig,
         dtype: DataType = DataType.BFLOAT16,
+        runner: str = "default",
     ):
         """Initialize NanoGPT model.
 
         Args:
             config: Model configuration
             dtype: Data type for parameters
+            runner: Runner type for transformer blocks ("default" or "mem_eff")
         """
         super().__init__()
+        self.runner = runner
 
         self.config = config
         self.dtype = dtype
@@ -136,7 +139,10 @@ class MockNanoGPT(MockModule):
 
         # Transformer blocks
         for block in self.blocks:
-            out = block(ctx, out, mask)
+            if self.runner == "mem_eff":
+                out = memory_efficient_runner(block, ctx, out, mask)
+            else:
+                out = block(ctx, out, mask)
 
         # Final layer norm
         out = self.ln_f(ctx, out)

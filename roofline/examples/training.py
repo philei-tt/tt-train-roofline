@@ -427,6 +427,7 @@ def run_model_roofline(
     clip_grad_norm_max_norm: float = 1.0,
     tp_size: Optional[int] = None,
     ddp_size: Optional[int] = None,
+    runner: str = "default",
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """Run transformer model roofline analysis (supports both GPT and Llama models).
@@ -453,6 +454,9 @@ def run_model_roofline(
         clip_grad_norm_max_norm: Max norm value for gradient clipping.
         tp_size: Tensor parallelism size (None = from config or 1). For Llama, tp_size > 1 uses MockDistributedLlama.
         ddp_size: Data-parallel replicas (None = from config or 1). Total devices = tp_size * ddp_size.
+        runner: Runner type for transformer blocks ("default" or "mem_eff").
+            "mem_eff" enables gradient checkpointing: block forward is recomputed during
+            backward, trading compute for memory.
         verbose: If True, print progress and summaries to stdout. Default False for programmatic use.
 
     Returns:
@@ -564,6 +568,8 @@ def run_model_roofline(
         _log(f"  DDP replicas: {ddp_size}")
     if tp_size > 1:
         _log(f"  TP Size: {tp_size} (tensor-parallel Llama)")
+    if runner == "mem_eff":
+        _log(f"  Runner: memory_efficient (gradient checkpointing)")
     _log()
 
     # Resolve preset: use the directly-supplied preset or look up by name
@@ -590,7 +596,7 @@ def run_model_roofline(
             n_head=preset["n_head"],
             dropout=preset["dropout"],
         )
-        model = MockNanoGPT(config)
+        model = MockNanoGPT(config, runner=runner)
         max_seq_len = config.block_size
 
         # Print GPT-specific config
@@ -632,7 +638,7 @@ def run_model_roofline(
                 theta=preset["theta"],
                 tp_size=tp_size,
             )
-            model = MockDistributedLlama(config)
+            model = MockDistributedLlama(config, runner=runner)
         else:
             config = MockLlamaConfig(
                 vocab_size=preset["vocab_size"],
@@ -646,7 +652,7 @@ def run_model_roofline(
                 theta=preset["theta"],
                 weight_tying=preset["weight_tying"],
             )
-            model = MockLlama(config)
+            model = MockLlama(config, runner=runner)
         max_seq_len = config.max_sequence_length
 
         # Print Llama-specific config
@@ -1133,6 +1139,14 @@ Examples:
         help="Tensor parallelism size for Llama (default: 1). If > 1, uses MockDistributedLlama.",
     )
     parser.add_argument(
+        "--runner",
+        type=str,
+        choices=["default", "mem_eff"],
+        default="default",
+        help="Runner type for transformer blocks (default: default). "
+             "'mem_eff' enables gradient checkpointing (recomputes block forward during backward).",
+    )
+    parser.add_argument(
         "--no-plot",
         action="store_true",
         help="Disable memory usage plot generation",
@@ -1224,6 +1238,7 @@ Examples:
         clip_grad_norm_max_norm=clip_grad_norm_max_norm,
         tp_size=tp_size,
         ddp_size=ddp_size,
+        runner=args.runner,
         verbose=True,
     )
     if isinstance(result, dict) and "error" in result:

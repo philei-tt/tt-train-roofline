@@ -308,3 +308,58 @@ class MockTensor:
             self.name,
             self.num_shards,
         )
+
+
+def memory_efficient_runner(
+    block: Callable,
+    ctx: "RooflineContext",
+    input_tensor: MockTensor,
+    mask: Optional[MockTensor] = None,
+) -> MockTensor:
+    """Gradient checkpointing: recomputes block forward during backward.
+
+    Mirrors ttml::models::common::transformer::memory_efficient_runner.
+
+    During forward the block is executed normally (recording FLOPs/time) but
+    intermediate activations are freed immediately.  A single backward node is
+    attached to the output that, when executed, re-runs the forward (adding
+    recomputation cost) and then runs the local backward graph.
+
+    Effects on roofline estimates:
+    - Forward compute: unchanged (1x block forward)
+    - Backward compute: +1x block forward (recomputation) on top of normal backward
+    - Memory: intermediate activations within the block are NOT held between
+      forward and backward, significantly reducing peak memory.
+    """
+    import gc
+
+    out = block(ctx, input_tensor, mask)
+
+    saved_input = input_tensor
+    saved_out = out
+
+    def backward_fn(bwd_ctx: "RooflineContext") -> None:
+        input_detached = MockTensor(
+            saved_input.shape,
+            saved_input.dtype,
+            saved_input.layout,
+            requires_grad=True,
+            label=TensorLabel.ACTIVATION,
+            name=f"{saved_input.name}_recompute" if saved_input.name else None,
+            num_shards=saved_input.num_shards,
+        )
+
+        recomputed_out = block(bwd_ctx, input_detached, mask)
+
+        recomputed_out._grad = saved_out._grad
+
+        recomputed_out.backward(bwd_ctx, retain_graph=False)
+
+        if input_detached._grad is not None:
+            saved_input.add_grad(input_detached._grad)
+
+    out._node = BackwardNode(backward_fn=backward_fn, inputs=[input_tensor])
+
+    gc.collect()
+
+    return out

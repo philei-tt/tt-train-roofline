@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING
 
-from ..mock_tensor import MockTensor
+from ..mock_tensor import MockTensor, memory_efficient_runner
 from ..hardware import DataType
 from ..operations.rmsnorm import MockRMSNormOp  # noqa: F401 (keep for re-export compat)
 from ..operations import MockLinearOp
@@ -71,17 +71,20 @@ class MockLlama(MockModule):
         self,
         config: MockLlamaConfig,
         dtype: DataType = DataType.BFLOAT16,
+        runner: str = "default",
     ):
         """Initialize Llama model.
 
         Args:
             config: Model configuration
             dtype: Data type for parameters
+            runner: Runner type for transformer blocks ("default" or "mem_eff")
         """
         super().__init__()
 
         self.config = config
         self.dtype = dtype
+        self.runner = runner
 
         # Round vocab size up to be divisible by 32 (for efficient tiling)
         vocab_size_padded = (config.vocab_size + 31) // 32 * 32
@@ -148,7 +151,10 @@ class MockLlama(MockModule):
 
         # Transformer blocks
         for block in self.blocks:
-            out = block(ctx, out, mask)
+            if self.runner == "mem_eff":
+                out = memory_efficient_runner(block, ctx, out, mask)
+            else:
+                out = block(ctx, out, mask)
 
         # Final normalization
         out = self.ln_fc(ctx, out)
