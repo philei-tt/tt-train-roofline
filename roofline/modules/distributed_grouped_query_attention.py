@@ -17,7 +17,7 @@ from ..hardware import DataType
 from ..operations import (
     MockGroupedHeadsCreationOp,
     MockHeadsFusionOp,
-    MockScaledDotProductAttentionOp,
+    MockScaledDotProductAttentionFusedOp,
     MockDropoutOp,
 )
 from .module import MockModule
@@ -122,7 +122,7 @@ class MockDistributedGroupedQueryAttention(MockModule):
             query = self.rope(ctx, query)
             key = self.rope(ctx, key)
 
-        attn_out = MockScaledDotProductAttentionOp.apply(ctx, query, key, value, mask)
+        attn_out = MockScaledDotProductAttentionFusedOp.apply(ctx, query, key, value, mask)
         merged = MockHeadsFusionOp.apply(ctx, attn_out)
         out = self.out_linear(ctx, merged)
 

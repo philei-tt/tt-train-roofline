@@ -17,7 +17,7 @@ from ..operations import (
     MockLinearOp,
     MockHeadsCreationOp,
     MockHeadsFusionOp,
-    MockScaledDotProductAttentionOp,
+    MockScaledDotProductAttentionFusedOp,
     MockDropoutOp,
 )
 from .module import MockModule, MockParameter
@@ -105,8 +105,8 @@ class MockMultiHeadAttention(MockModule):
         # Split into heads: [B, 1, S, 3*H*d] -> 3x [B, H, S, d]
         query, key, value = MockHeadsCreationOp.apply(ctx, qkv, self.num_heads)
 
-        # Scaled dot-product attention
-        attn_out = MockScaledDotProductAttentionOp.apply(ctx, query, key, value, mask)
+        # Scaled dot-product attention (fused / Flash Attention style)
+        attn_out = MockScaledDotProductAttentionFusedOp.apply(ctx, query, key, value, mask)
 
         # Merge heads: [B, H, S, d] -> [B, 1, S, H*d]
         merged = MockHeadsFusionOp.apply(ctx, attn_out)
