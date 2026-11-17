@@ -37,6 +37,7 @@ class MockDistributedLlamaMLP(MockModule):
         intermediate_dim: Optional[int] = None,
         tp_size: int = 1,
         dtype: DataType = DataType.BFLOAT16,
+        sequence_parallel: bool = False,
     ):
         super().__init__()
 
@@ -59,6 +60,7 @@ class MockDistributedLlamaMLP(MockModule):
             gather_output=False,
             tp_size=tp_size,
             dtype=dtype,
+            sequence_parallel=sequence_parallel,
         )
         self.w3 = MockColumnParallelLinear(
             embedding_size,
@@ -67,6 +69,7 @@ class MockDistributedLlamaMLP(MockModule):
             gather_output=False,
             tp_size=tp_size,
             dtype=dtype,
+            sequence_parallel=sequence_parallel,
         )
         self.w2 = MockRowParallelLinear(
             hidden_size,
@@ -75,6 +78,7 @@ class MockDistributedLlamaMLP(MockModule):
             input_is_parallel=True,
             tp_size=tp_size,
             dtype=dtype,
+            sequence_parallel=sequence_parallel,
         )
 
     def forward(self, ctx: "RooflineContext", x: MockTensor) -> MockTensor:

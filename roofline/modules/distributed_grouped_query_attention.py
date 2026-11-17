@@ -18,6 +18,7 @@ from ..operations import (
     MockGroupedHeadsCreationOp,
     MockHeadsFusionOp,
     MockScaledDotProductAttentionFusedOp,
+    MockRingAttentionOp,
     MockDropoutOp,
 )
 from .module import MockModule
@@ -37,6 +38,8 @@ class MockDistributedGroupedQueryAttention(MockModule):
     - kv_linear: ColumnParallelLinear (gather_output=False)
     - out_linear: RowParallelLinear (input_is_parallel=True)
     Uses num_local_heads and num_local_groups for head creation (sharded across TP).
+    sequence_parallel: input/output sharded along the sequence across TP devices.
+    cp_size > 1: the input holds S/cp_size tokens and attention runs as ring attention.
     """
 
     def __init__(
@@ -48,6 +51,8 @@ class MockDistributedGroupedQueryAttention(MockModule):
         rope_params: Optional[RoPEParams] = None,
         tp_size: int = 1,
         dtype: DataType = DataType.BFLOAT16,
+        sequence_parallel: bool = False,
+        cp_size: int = 1,
     ):
         super().__init__()
 
@@ -68,6 +73,7 @@ class MockDistributedGroupedQueryAttention(MockModule):
         self.head_dim = embedding_dim // num_heads
         self.dropout_prob = dropout
         self.tp_size = tp_size
+        self.cp_size = cp_size
 
         self.q_linear = MockColumnParallelLinear(
             embedding_dim,
@@ -76,6 +82,7 @@ class MockDistributedGroupedQueryAttention(MockModule):
             gather_output=False,
             tp_size=tp_size,
             dtype=dtype,
+            sequence_parallel=sequence_parallel,
         )
         concat_kv_dim = 2 * num_groups * self.head_dim
         self.kv_linear = MockColumnParallelLinear(
@@ -85,6 +92,7 @@ class MockDistributedGroupedQueryAttention(MockModule):
             gather_output=False,
             tp_size=tp_size,
             dtype=dtype,
+            sequence_parallel=sequence_parallel,
         )
         self.out_linear = MockRowParallelLinear(
             embedding_dim,
@@ -93,6 +101,7 @@ class MockDistributedGroupedQueryAttention(MockModule):
             input_is_parallel=True,
             tp_size=tp_size,
             dtype=dtype,
+            sequence_parallel=sequence_parallel,
         )
 
         if rope_params is not None:
@@ -122,7 +131,10 @@ class MockDistributedGroupedQueryAttention(MockModule):
             query = self.rope(ctx, query)
             key = self.rope(ctx, key)
 
-        attn_out = MockScaledDotProductAttentionFusedOp.apply(ctx, query, key, value, mask)
+        if self.cp_size > 1:
+            attn_out = MockRingAttentionOp.apply(ctx, query, key, value, self.cp_size)
+        else:
+            attn_out = MockScaledDotProductAttentionFusedOp.apply(ctx, query, key, value, mask)
         merged = MockHeadsFusionOp.apply(ctx, attn_out)
         out = self.out_linear(ctx, merged)
 
@@ -135,5 +147,5 @@ class MockDistributedGroupedQueryAttention(MockModule):
         return (
             f"MockDistributedGroupedQueryAttention(embedding_dim={self.embedding_dim}, "
             f"num_heads={self.num_heads}, num_groups={self.num_groups}, "
-            f"tp_size={self.tp_size})"
+            f"tp_size={self.tp_size}, cp_size={self.cp_size})"
         )

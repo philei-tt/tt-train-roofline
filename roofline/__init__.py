@@ -21,6 +21,7 @@ Hardware Configurations:
     - WORMHOLE_GALAXY: 32-chip Galaxy system
     - BLACKHOLE_CHIP: Single Blackhole chip
     - BLACKHOLE_GALAXY: 32-chip Blackhole Galaxy
+    - BLACKHOLE_QUAD: 4 Blackhole Galaxies (128 chips, 32 x 4 torus)
 
 Example:
     >>> from roofline import (
@@ -68,6 +69,7 @@ from .hardware import (
     BLACKHOLE_P100,
     BLACKHOLE_P150,
     BLACKHOLE_GALAXY,
+    BLACKHOLE_QUAD,
 )
 
 # Mock tensor with autograd
@@ -109,6 +111,8 @@ from .roofline import (
     all_reduce_roofline,
     reduce_scatter_roofline,
     all_gather_roofline,
+    ring_shift_roofline,
+    send_recv_roofline,
 )
 
 # Module system
@@ -156,6 +160,8 @@ from .modules import (
     MockDistributedLlamaConfig,
     create_mock_distributed_llama,
     MockDistributedLlamaBlock,
+    MockLlamaPipelineStage,
+    MockLlamaPipelineStageConfig,
     MockDistributedLlamaMLP,
     MockDistributedGroupedQueryAttention,
 )
@@ -187,6 +193,7 @@ from .operations import (
     MockGroupedHeadsCreationOp,
     MockScaledDotProductAttentionOp,
     MockScaledDotProductAttentionFusedOp,
+    MockRingAttentionOp,
     # Rotary Position Embedding
     MockRoPEOp,
     # Loss
@@ -218,6 +225,7 @@ __all__ = [
     "WORMHOLE_GALAXY",
     "BLACKHOLE_CHIP",
     "BLACKHOLE_GALAXY",
+    "BLACKHOLE_QUAD",
     # Roofline core
     "RooflineEstimate",
     "RooflineContext",
@@ -245,6 +253,8 @@ __all__ = [
     "dropout_roofline",
     "cross_entropy_roofline",
     "all_reduce_roofline",
+    "ring_shift_roofline",
+    "send_recv_roofline",
     "reduce_scatter_roofline",
     "all_gather_roofline",
     # Mock tensor
@@ -283,6 +293,8 @@ __all__ = [
     "MockDistributedLlamaConfig",
     "create_mock_distributed_llama",
     "MockDistributedLlamaBlock",
+    "MockLlamaPipelineStage",
+    "MockLlamaPipelineStageConfig",
     "MockDistributedLlamaMLP",
     "MockDistributedGroupedQueryAttention",
     # Operation base classes
@@ -304,6 +316,7 @@ __all__ = [
     "MockGroupedHeadsCreationOp",
     "MockScaledDotProductAttentionOp",
     "MockScaledDotProductAttentionFusedOp",
+    "MockRingAttentionOp",
     "MockRoPEOp",
     "MockCrossEntropyLossOp",
     # CCL operations

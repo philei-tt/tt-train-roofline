@@ -27,6 +27,7 @@ from .attention import (
     MockGroupedHeadsCreationOp,
     MockScaledDotProductAttentionOp,
     MockScaledDotProductAttentionFusedOp,
+    MockRingAttentionOp,
 )
 from .rope import MockRoPEOp
 from .cross_entropy import MockCrossEntropyLossOp
@@ -67,6 +68,7 @@ __all__ = [
     "MockGroupedHeadsCreationOp",
     "MockScaledDotProductAttentionOp",
     "MockScaledDotProductAttentionFusedOp",
+    "MockRingAttentionOp",
     # Rotary Position Embedding
     "MockRoPEOp",
     # Loss

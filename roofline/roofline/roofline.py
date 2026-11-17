@@ -77,10 +77,11 @@ class RooflineEstimate:
         - operation, phase: metadata
         - total_flops, total_bytes: raw counts
         - ideal_compute_ns, ideal_memory_ns: roofline bounds
+        - ideal_network_ns: Ethernet (fabric) time for collectives and point-to-point transfers
         - hw: hardware spec (for computing derived metrics)
 
     Derived (properties):
-        - theoretical_time_ns: max(compute, memory)
+        - theoretical_time_ns: max(compute, memory, network)
         - bottleneck: which bound dominates
         - arithmetic_intensity, achieved_tflops, etc.
     """
@@ -92,15 +93,18 @@ class RooflineEstimate:
     ideal_compute_ns: float
     ideal_memory_ns: float
     hw: HardwareSpec
+    ideal_network_ns: float = 0.0
 
     @property
     def theoretical_time_ns(self) -> float:
-        """Roofline time = max(compute, memory)."""
-        return max(self.ideal_compute_ns, self.ideal_memory_ns)
+        """Roofline time = max(compute, memory, network)."""
+        return max(self.ideal_compute_ns, self.ideal_memory_ns, self.ideal_network_ns)
 
     @property
     def bottleneck(self) -> BottleneckType:
         """Classification based on which bound dominates."""
+        if self.ideal_network_ns > max(self.ideal_compute_ns, self.ideal_memory_ns):
+            return BottleneckType.FABRIC
         if self.ideal_compute_ns > self.ideal_memory_ns * 1.5:
             return BottleneckType.COMPUTE
         elif self.ideal_memory_ns > self.ideal_compute_ns * 1.5:
@@ -162,6 +166,10 @@ class RooflineContext:
     hw: HardwareSpec
     estimates: List[RooflineEstimate] = field(default_factory=list)
 
+    # Fused attention backward: K/V block (tokens) kept on chip per pass. None = one tile (32),
+    # i.e. Q, O, dO and dQ are re-read from DRAM for every 32-token K/V tile.
+    attn_bwd_kv_block: Optional[int] = None
+
     # Memory tracker for detailed allocation tracking
     memory_tracker: Optional[MemoryTracker] = field(default=None)
 
@@ -213,6 +221,30 @@ class RooflineContext:
     def total_bytes(self) -> int:
         """Total bytes transferred across all operations."""
         return sum(e.total_bytes for e in self.estimates)
+
+    def compute_time_ns(self, phases: Optional[Tuple[str, ...]] = None) -> float:
+        """Sum of ideal compute time (FLOPs / peak) over operations, optionally filtered by phase."""
+        return sum(e.ideal_compute_ns for e in self.estimates if phases is None or e.phase in phases)
+
+    def dram_time_ns(self, phases: Optional[Tuple[str, ...]] = None) -> float:
+        """Sum of ideal DRAM time (bytes / DRAM bandwidth) over operations."""
+        return sum(e.ideal_memory_ns for e in self.estimates if phases is None or e.phase in phases)
+
+    def network_time_ns(self, phases: Optional[Tuple[str, ...]] = None) -> float:
+        """Sum of ideal Ethernet (fabric) time over operations."""
+        return sum(e.ideal_network_ns for e in self.estimates if phases is None or e.phase in phases)
+
+    def overlapped_time_ns(self, phases: Optional[Tuple[str, ...]] = None) -> float:
+        """Resource-level roofline: max(sum of compute, sum of DRAM, sum of fabric time).
+
+        Unlike total_time_ns (sum of per-op max(compute, memory)), this lets compute-bound
+        ops, DRAM-bound ops and collectives overlap perfectly across the whole range.
+        """
+        return max(
+            self.compute_time_ns(phases),
+            self.dram_time_ns(phases),
+            self.network_time_ns(phases),
+        )
 
     def forward_time_ns(self) -> float:
         """Total time for forward pass operations."""

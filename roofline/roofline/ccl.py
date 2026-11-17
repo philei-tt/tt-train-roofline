@@ -9,7 +9,7 @@ Ethernet bandwidth. Ring topology has 2x better effective bandwidth than linear.
 """
 
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 from ..hardware import HardwareSpec, DataType
 
@@ -90,7 +90,8 @@ def all_reduce_roofline(
         total_flops=0,
         total_bytes=bytes_per_device,
         ideal_compute_ns=0.0,
-        ideal_memory_ns=ideal_network_ns,
+        ideal_memory_ns=0.0,
+        ideal_network_ns=ideal_network_ns,
         hw=hw,
     )
 
@@ -136,7 +137,8 @@ def reduce_scatter_roofline(
         total_flops=0,
         total_bytes=bytes_per_device,
         ideal_compute_ns=0.0,
-        ideal_memory_ns=ideal_network_ns,
+        ideal_memory_ns=0.0,
+        ideal_network_ns=ideal_network_ns,
         hw=hw,
     )
 
@@ -185,6 +187,106 @@ def all_gather_roofline(
         total_flops=0,
         total_bytes=bytes_per_device,
         ideal_compute_ns=0.0,
-        ideal_memory_ns=ideal_network_ns,
+        ideal_memory_ns=0.0,
+        ideal_network_ns=ideal_network_ns,
         hw=hw,
+    )
+
+
+def ring_shift_roofline(
+    hw: HardwareSpec,
+    tensor_bytes: int,
+    num_devices: int,
+    num_steps: Optional[int] = None,
+    operation: str = "RingShift",
+    phase: str = "ccl",
+) -> "RooflineEstimate":
+    """Ring shift: every device passes a tensor to its ring neighbour, num_steps times.
+
+    Used by ring attention (context parallelism): the K/V shards travel around the CP ring.
+    All devices send at once. On a ring, half of every tensor goes clockwise and half
+    counter-clockwise, so both directions of the full-duplex links carry data (topology
+    divisor 2, as for the other collectives).
+
+    Formula: time = num_steps * tensor_bytes / (num_links * topology_divisor * link bandwidth)
+
+    Args:
+        hw: Hardware specification
+        tensor_bytes: Bytes each device sends per step
+        num_devices: Ring size
+        num_steps: Number of shifts (default: num_devices - 1, a full rotation)
+        operation: Name for the operation
+        phase: Phase label
+
+    Returns:
+        RooflineEstimate with the time in ideal_network_ns
+    """
+    from .roofline import RooflineEstimate
+
+    if num_devices <= 1:
+        return RooflineEstimate(
+            operation=operation, phase=phase,
+            total_flops=0, total_bytes=0,
+            ideal_compute_ns=0.0, ideal_memory_ns=0.0, hw=hw,
+        )
+    steps = num_devices - 1 if num_steps is None else num_steps
+    topology_divisor = 2 if hw.topology == "ring" else 1
+    total_bytes_moved = int(steps * tensor_bytes)
+    ideal_network_ns = (
+        total_bytes_moved / (hw.num_links * topology_divisor) / hw.eth_bw_gb_s_per_link
+        if hw.eth_bw_gb_s_per_link > 0 else 0.0
+    )
+    return RooflineEstimate(
+        operation=operation,
+        phase=phase,
+        total_flops=0,
+        total_bytes=total_bytes_moved,
+        ideal_compute_ns=0.0,
+        ideal_memory_ns=0.0,
+        hw=hw,
+        ideal_network_ns=ideal_network_ns,
+    )
+
+
+def send_recv_roofline(
+    hw: HardwareSpec,
+    tensor_bytes: int,
+    num_links: int,
+    operation: str = "SendRecv",
+    phase: str = "ccl",
+) -> "RooflineEstimate":
+    """Point-to-point transfer over a fixed number of links (pipeline stage hand-off).
+
+    A pipeline hand-off moves the activation (forward) or its gradient (backward) across the
+    cut between two neighbouring stages. Every chip pair on the cut carries part of it, so the
+    transfer uses all links across the cut. Activations and gradients travel in opposite
+    directions of the full-duplex links and do not share bandwidth.
+
+    Formula: time = tensor_bytes / (num_links * link bandwidth)
+
+    Args:
+        hw: Hardware specification
+        tensor_bytes: Bytes crossing the cut
+        num_links: Links across the cut (per direction)
+        operation: Name for the operation
+        phase: Phase label
+
+    Returns:
+        RooflineEstimate with the time in ideal_network_ns
+    """
+    from .roofline import RooflineEstimate
+
+    ideal_network_ns = (
+        tensor_bytes / num_links / hw.eth_bw_gb_s_per_link
+        if hw.eth_bw_gb_s_per_link > 0 and num_links > 0 else 0.0
+    )
+    return RooflineEstimate(
+        operation=operation,
+        phase=phase,
+        total_flops=0,
+        total_bytes=int(tensor_bytes),
+        ideal_compute_ns=0.0,
+        ideal_memory_ns=0.0,
+        hw=hw,
+        ideal_network_ns=ideal_network_ns,
     )

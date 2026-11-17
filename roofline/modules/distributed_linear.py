@@ -23,11 +23,15 @@ from ..operations import MockLinearOp
 from ..operations.comm_ops import (
     MockAllReduceOp,
     MockAllGatherOp,
+    MockReduceScatterOp,
     MockBroadcastOp,
     MockScatterOp,
 )
 from ..operations.elementwise import MockAddOp
 from .module import MockModule, MockParameter
+
+# Activations are [B, 1, S, E]: sequence parallelism shards dim 2
+SEQ_DIM = 2
 
 if TYPE_CHECKING:
     from ..roofline import RooflineContext
@@ -38,6 +42,8 @@ class MockColumnParallelLinear(MockModule):
 
     Each TP device holds weight [1, 1, out_features/tp_size, in_features].
     Forward: broadcast input -> per-device linear -> optionally all-gather.
+    With sequence_parallel the input arrives sharded along the sequence and is all-gathered
+    (reduce-scatter in backward) instead of broadcast (Megatron sequence parallelism).
 
     Mirrors ttml::modules::distributed::ColumnParallelLinear.
 
@@ -48,6 +54,7 @@ class MockColumnParallelLinear(MockModule):
         gather_output: If True, all-gather output to full size
         tp_size: Tensor parallelism degree (number of TP devices)
         dtype: Data type for parameters
+        sequence_parallel: Input is sharded along the sequence (dim 2) across TP devices
     """
 
     def __init__(
@@ -58,6 +65,7 @@ class MockColumnParallelLinear(MockModule):
         gather_output: bool = False,
         tp_size: int = 1,
         dtype: DataType = DataType.BFLOAT16,
+        sequence_parallel: bool = False,
     ):
         super().__init__()
 
@@ -70,6 +78,7 @@ class MockColumnParallelLinear(MockModule):
         self.has_bias = has_bias
         self.gather_output = gather_output
         self.tp_size = tp_size
+        self.sequence_parallel = sequence_parallel
 
         local_out_features = out_features // tp_size
 
@@ -87,8 +96,12 @@ class MockColumnParallelLinear(MockModule):
             self.bias = None
 
     def forward(self, ctx: "RooflineContext", x: MockTensor) -> MockTensor:
-        # Broadcast: noop in forward, all-reduce in backward
-        x = MockBroadcastOp.apply(ctx, x, self.tp_size)
+        if self.sequence_parallel and self.tp_size > 1:
+            # All-gather the sequence shards: all-gather in forward, reduce-scatter in backward
+            x = MockAllGatherOp.apply(ctx, x, SEQ_DIM, self.tp_size)
+        else:
+            # Broadcast: noop in forward, all-reduce in backward
+            x = MockBroadcastOp.apply(ctx, x, self.tp_size)
 
         bias_tensor = self.bias.tensor if self.bias is not None else None
         x = MockLinearOp.apply(ctx, x, self.weight.tensor, bias_tensor)
@@ -110,6 +123,8 @@ class MockRowParallelLinear(MockModule):
 
     Each TP device holds weight [1, 1, out_features, in_features/tp_size].
     Forward: optionally scatter input -> per-device linear -> all-reduce.
+    With sequence_parallel the partial sums are reduce-scattered along the sequence
+    (all-gather in backward) instead of all-reduced.
 
     Mirrors ttml::modules::distributed::RowParallelLinear.
 
@@ -120,6 +135,7 @@ class MockRowParallelLinear(MockModule):
         input_is_parallel: If True, input is already sharded (skip scatter)
         tp_size: Tensor parallelism degree (number of TP devices)
         dtype: Data type for parameters
+        sequence_parallel: Output is reduce-scattered along the sequence (dim 2)
     """
 
     def __init__(
@@ -130,6 +146,7 @@ class MockRowParallelLinear(MockModule):
         input_is_parallel: bool = False,
         tp_size: int = 1,
         dtype: DataType = DataType.BFLOAT16,
+        sequence_parallel: bool = False,
     ):
         super().__init__()
 
@@ -142,6 +159,7 @@ class MockRowParallelLinear(MockModule):
         self.has_bias = has_bias
         self.input_is_parallel = input_is_parallel
         self.tp_size = tp_size
+        self.sequence_parallel = sequence_parallel
 
         local_in_features = in_features // tp_size
 
@@ -165,12 +183,16 @@ class MockRowParallelLinear(MockModule):
         # Linear without bias (bias added after all-reduce)
         x = MockLinearOp.apply(ctx, x, self.weight.tensor, None)
 
-        # All-reduce to sum partial results across TP devices.
-        # noop_backward when input_is_parallel to avoid double all-reduce
-        # (broadcast in the paired ColumnParallelLinear already handles it).
-        x = MockAllReduceOp.apply(
-            ctx, x, self.input_is_parallel, self.tp_size,
-        )
+        if self.sequence_parallel and self.tp_size > 1:
+            # Reduce-scatter partial sums into sequence shards (all-gather in backward)
+            x = MockReduceScatterOp.apply(ctx, x, SEQ_DIM, self.tp_size)
+        else:
+            # All-reduce to sum partial results across TP devices.
+            # noop_backward when input_is_parallel to avoid double all-reduce
+            # (broadcast in the paired ColumnParallelLinear already handles it).
+            x = MockAllReduceOp.apply(
+                ctx, x, self.input_is_parallel, self.tp_size,
+            )
 
         if self.bias is not None:
             x = MockAddOp.apply(ctx, x, self.bias.tensor)

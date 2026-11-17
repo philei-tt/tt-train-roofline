@@ -30,6 +30,7 @@ from .distributed_llama import (
     create_mock_distributed_llama,
 )
 from .distributed_llama_block import MockDistributedLlamaBlock
+from .pipeline_stage import MockLlamaPipelineStage, MockLlamaPipelineStageConfig
 from .distributed_llama_mlp import MockDistributedLlamaMLP
 from .distributed_grouped_query_attention import MockDistributedGroupedQueryAttention
 
@@ -78,6 +79,8 @@ __all__ = [
     "MockDistributedLlamaConfig",
     "create_mock_distributed_llama",
     "MockDistributedLlamaBlock",
+    "MockLlamaPipelineStage",
+    "MockLlamaPipelineStageConfig",
     "MockDistributedLlamaMLP",
     "MockDistributedGroupedQueryAttention",
 ]

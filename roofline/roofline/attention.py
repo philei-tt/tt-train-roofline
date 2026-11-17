@@ -369,6 +369,7 @@ def fused_attention_roofline(
     phase: str = "forward",
     tile_height: int = 32,
     tile_width: int = 32,
+    bwd_kv_block: Optional[int] = None,
 ) -> "RooflineEstimate":
     """
     Performance model for fused scaled dot-product attention (Flash Attention style).
@@ -402,6 +403,9 @@ def fused_attention_roofline(
         num_cores: Number of cores to use (default: all)
         operation: Base name for the operation
         phase: "forward" or "backward"
+        bwd_kv_block: Backward only. Number of K/V tokens kept on chip per pass. Q, O, dO and dQ
+            are streamed from DRAM once per K/V block, so their traffic scales with S / bwd_kv_block.
+            None (default) = one tile (tile_width tokens), the current kernel.
 
     Returns:
         Single RooflineEstimate for the fused operation
@@ -488,18 +492,21 @@ def fused_attention_roofline(
         Rd = 2 * B * Hq * S * d * bytes_per_elem
         Wd = B * Hq * S * d * bytes_per_elem
 
+        # Q, O, dO, the softmax statistics and dQ are streamed once per K/V block
+        Tc_bwd = S / bwd_kv_block if bwd_kv_block else Tc
+
         # Read Q, O, dO
-        Rq = B * Hq * Tc * S * d * bytes_per_elem
-        Ro = B * Hq * Tc * S * d * bytes_per_elem
-        Rdo = B * Hq * Tc * S * d * bytes_per_elem
+        Rq = B * Hq * Tc_bwd * S * d * bytes_per_elem
+        Ro = B * Hq * Tc_bwd * S * d * bytes_per_elem
+        Rdo = B * Hq * Tc_bwd * S * d * bytes_per_elem
 
         # Read intermediates
-        Rl = B * Hq * Tc * S * bytes_per_elem
-        Rd = B * Hq * Tc * S * bytes_per_elem
+        Rl = B * Hq * Tc_bwd * S * bytes_per_elem
+        Rd = B * Hq * Tc_bwd * S * bytes_per_elem
 
         # dQ read/modify/write
-        Rdq = B * Hq * Tc * S * d * bytes_per_elem
-        Wdq = B * Hq * Tc * S * d * bytes_per_elem
+        Rdq = B * Hq * Tc_bwd * S * d * bytes_per_elem
+        Wdq = B * Hq * Tc_bwd * S * d * bytes_per_elem
 
         # K/V streaming
         Rk = B * Hkv * S * d * bytes_per_elem * reuse_factor

@@ -41,6 +41,7 @@ class BottleneckType(Enum):
     COMPUTE = "COMPUTE"
     DRAM = "DRAM"
     NOC = "NOC"
+    FABRIC = "FABRIC"  # Ethernet links between chips
     L1_CAPACITY = "L1_CAPACITY"
     BOTH = "BOTH"  # Both compute and memory bound (>65% each)
     SLOW = "SLOW"  # Neither bound (<65% both) - needs optimization
@@ -214,4 +215,19 @@ BLACKHOLE_GALAXY = HardwareSpec(
     topology="linear",
     num_links=1,
     chips_per_galaxy=32,
+)
+
+BLACKHOLE_QUAD = HardwareSpec(
+    name="Blackhole Quad Galaxy",
+    tensix_cores_per_chip=120,
+    clock_ghz=1.35,
+    dram_gb_per_chip=32,
+    dram_bw_gb_s=512,
+    sram_mb_per_core=1.5,
+    noc_bw_tb_s=1.4,
+    noc_link_bw_gb_s=200,
+    eth_bw_gb_s_per_link=48,
+    topology="ring",  # 32 x 4 torus (RING, RING), 2 links per neighbouring chip pair
+    num_links=2,
+    chips_per_galaxy=128,
 )

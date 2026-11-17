@@ -184,6 +184,52 @@ Minimal example — a 5-layer linear model showing per-layer roofline breakdown:
 python3 -m roofline.examples.matmuls
 ```
 
+### Parallel training: pipeline, tensor, sequence and context parallelism
+
+`roofline.examples.parallel_training` models one optimizer step of a Llama on `pp * tp * cp` chips:
+
+- **PP**: interleaved 1F1B (`--interleave v`, v = 1 is plain 1F1B), optional vocabulary parallelism (`--vocab-parallel`, LM head split across stages)
+- **TP** inside a stage, optionally with Megatron sequence parallelism (`--sp`)
+- **CP** inside a stage: ring attention with a load-balanced split and K/V shifts in both ring directions
+- activation recompute (`--recompute`, the memory-efficient runner)
+
+```bash
+# One configuration: Llama 70B, 8K sequences, 2048 sequences per step, on a quad galaxy (128 chips)
+python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \
+    --pp 16 --tp 2 --cp 4 --recompute --vocab-parallel --attn-bwd-kv-block 512
+
+# Every PP x TP x CP split of 128 chips, best ones that fit in memory
+python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \
+    --sweep 128 --sp --vocab-parallel --attn-bwd-kv-block 512
+```
+
+The first and the last pipeline stage are each run for one micro-batch in their own `RooflineContext`. Step time is a resource-level roofline: compute, DRAM and fabric (Ethernet) time are summed separately and the largest one sets the time, so the three overlap:
+
+```
+D       = max(FLOP, DRAM, fabric) for one micro-batch on the slowest stage
+          (fabric includes 2v stage hand-offs per micro-batch)
+T_step  = max( (m + (P - 1)/v) * D + max(optimizer FLOP, optimizer DRAM),  m * fabric + CP gradient sync )
+bubble  = (P - 1) / (v * m + P - 1)
+MFU     = (6 N + 12 L H Q S) * tokens / T_step / (chips * peak)       (tt-train's MFU formula)
+```
+
+The per-op serial time (sum of `max(compute, DRAM, network)` over ops, as in `training.py`) is reported next to it.
+
+Supporting changes:
+
+| Where | What |
+|---|---|
+| `RooflineEstimate.ideal_network_ns` | Collectives put their time on the fabric instead of DRAM; `theoretical_time_ns = max(compute, memory, network)`, so existing totals are unchanged |
+| `RooflineContext.compute_time_ns / dram_time_ns / network_time_ns / overlapped_time_ns` | Per-resource sums and their max |
+| `fused_attention_roofline(..., bwd_kv_block)`, `RooflineContext.attn_bwd_kv_block` | Backward re-reads Q, O, dO and dQ once per K/V block; default one 32-token tile (current kernel). 512 makes the backward compute-bound |
+| `ring_shift_roofline`, `send_recv_roofline` | CP ring shifts (both ring directions) and stage hand-offs over the links across a stage cut |
+| `MockRingAttentionOp`, `cp_size` on the distributed block | Ring attention: attention of the full sequence divided by `cp`, K/V (bf16) shifts forward, K/V + dK/dV (fp32) backward, fp32 accumulator read + write per ring step |
+| `sequence_parallel` on the parallel linears, attention, MLP, block | All-gather / reduce-scatter along the sequence instead of broadcast / all-reduce; norms and residual adds hold `S / tp` tokens |
+| `MockLlamaPipelineStage`, `training/pipeline.py` | One pipeline stage; interleaved 1F1B order and simulator (activations held per device) |
+| `BLACKHOLE_QUAD` | 4 galaxies, 128 chips, 32 x 4 torus, 2 links per neighbouring chip pair |
+
+Limitations: TP must divide the number of KV heads (as in tt-train). With `--sp` each column-parallel linear keeps its all-gathered input for backward (Megatron keeps the shard and re-gathers), so memory is higher than Megatron's. The communication of vocabulary parallelism is not modelled. `--cut-links` (default 8) assumes stages laid along the 32-chip axis of a quad.
+
 ## Dependencies
 
 Python 3.10+ with only standard-library dependencies. `matplotlib` is optional (used for memory usage plots).
