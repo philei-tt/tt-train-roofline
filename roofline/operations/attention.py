@@ -601,13 +601,14 @@ def _ring_attention_estimates(
     cp_size: int,
     phase: str,
     accumulator_elements: int,
-    shift_bytes: int,
+    kv_bytes: int,
 ) -> None:
     """Add the three parts of one ring-attention pass to the context.
 
     - attention: fused attention over the full sequence, divided by cp_size (balanced split)
     - merge: one read + one write of the fp32 accumulators per ring step (fused into the kernel)
-    - shift: the K/V (and, backward, dK/dV) shards travelling once around the CP ring
+    - shift: the K/V shards visit every device (cp - 1 hops); backward also moves the fp32
+      dK/dV accumulators, which need cp hops to return to the device that owns K/V
     """
     batch_size, num_q_heads, local_seq, head_dim = query.shape
     full = fused_attention_roofline(
@@ -627,8 +628,13 @@ def _ring_attention_estimates(
         dtype=DataType.FLOAT32, operation="RingAttention.merge", phase=phase,
     ))
     roofline_ctx.add_perf_result(ring_shift_roofline(
-        roofline_ctx.hw, shift_bytes, cp_size, operation="RingAttention.shift", phase=phase,
+        roofline_ctx.hw, kv_bytes, cp_size, operation="RingAttention.shift_kv", phase=phase,
     ))
+    if phase == "backward":
+        roofline_ctx.add_perf_result(ring_shift_roofline(
+            roofline_ctx.hw, 2 * kv_bytes, cp_size, operation="RingAttention.shift_dkv", phase=phase,
+            num_steps=cp_size,  # dK, dV accumulators in fp32: twice the bytes of K, V in bf16
+        ))
 
 
 class MockRingAttentionOp(RooflineFunction):
@@ -674,7 +680,7 @@ class MockRingAttentionOp(RooflineFunction):
         _ring_attention_estimates(
             roofline_ctx, query, key, cp_size, "forward",
             accumulator_elements=query.logical_volume(),
-            shift_bytes=key.bytes() + value.bytes(),
+            kv_bytes=key.bytes() + value.bytes(),
         )
         return create_activation_tensor(query.shape, query.dtype, query.layout)
 
@@ -686,11 +692,10 @@ class MockRingAttentionOp(RooflineFunction):
     ) -> Tuple[MockTensor, MockTensor, MockTensor, None]:
         """Backward pass: dQ, dK, dV with the K/V shards and dK, dV accumulators on the ring."""
         query, key, value, stats = ctx.saved_tensors
-        kv_bytes = key.bytes() + value.bytes()
         _ring_attention_estimates(
             roofline_ctx, query, key, ctx._cp_size, "backward",
             accumulator_elements=query.logical_volume() + key.logical_volume() + value.logical_volume(),
-            shift_bytes=kv_bytes + 2 * kv_bytes,  # K, V in bf16 + dK, dV accumulators in fp32
+            kv_bytes=key.bytes() + value.bytes(),
         )
         grad_query = create_grad_tensor(query.shape, query.dtype, query.layout, name="grad_query")
         grad_key = create_grad_tensor(key.shape, key.dtype, key.layout, name="grad_key")

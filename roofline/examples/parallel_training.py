@@ -67,6 +67,7 @@ class StageCost:
     sync_serial_ms: float
     activation_bytes: int  # held from forward to backward, one micro-batch
     state_bytes: int  # parameters + gradients + optimizer state
+    peak_bytes: int  # peak of the whole one-micro-batch run (incl. backward transients)
     flops_per_mb: int  # one micro-batch on one device, forward + backward
     embedding_flops_per_mb: int
     output_bytes: int  # activation sent to the next stage, per device
@@ -124,7 +125,10 @@ def _run_stage(hw, preset, seq_len, tp, cp, pp, stage_index, sequence_parallel, 
     synchronize_gradients(ctx, params, cp)  # weights are replicated across the CP group
     optimizer.step(ctx)
     mock_clip_grad_norm(ctx, params, max_norm=1.0)
+    del x, out, logits, roots  # release the micro-batch's tensors before reading the state
+    gc.collect()
     state_bytes, _ = ctx.memory_tracker.current_memory()
+    peak_bytes, _ = ctx.memory_tracker.peak_memory()
     ctx.disable_memory_tracking()
 
     def serial_ms(phases):
@@ -142,6 +146,7 @@ def _run_stage(hw, preset, seq_len, tp, cp, pp, stage_index, sequence_parallel, 
         sync_serial_ms=serial_ms(SYNC_PHASES),
         activation_bytes=mem_after_forward - mem_before,
         state_bytes=state_bytes,
+        peak_bytes=peak_bytes,
         flops_per_mb=ctx.forward_flops() + ctx.backward_flops(),
         embedding_flops_per_mb=sum(e.total_flops for e in ctx.estimates if e.operation.startswith("Embedding.")),
         output_bytes=output_bytes,
@@ -240,28 +245,34 @@ def run_parallel_roofline(
 
     # Stage hand-off: every device of the stage sends its part of the activation (forward) or its
     # gradient (backward) across the cut; without SP every TP chip holds the full activation.
+    # Per micro-batch a device sends v activations one way and v gradients the other way; the two
+    # directions of the full-duplex links run concurrently, so v hand-offs count.
     m, v = num_microbatches, sched.interleave
     handoff_bytes = costs[0].output_bytes * tp * cp
     hand = send_recv_roofline(hw, handoff_bytes, cut_links, operation="PipelineHandoff").ideal_network_ns / 1e6
-    hand_per_mb = 2 * v * hand if pp > 1 else 0.0
+    hand_per_mb = v * hand if pp > 1 else 0.0
 
     def device_time(c: StageCost) -> Dict[str, float]:
         flop, dram, fabric = c.mb_flop_ms, c.mb_dram_ms, c.mb_fabric_ms + hand_per_mb
         return {"flop_ms": flop, "dram_ms": dram, "fabric_ms": fabric, "overlapped_ms": max(flop, dram, fabric),
                 "serial_ms": c.mb_serial_ms + hand_per_mb}
 
-    per_stage = [(device_time(c), c) for c in costs]
-    D, c = max(per_stage, key=lambda p: p[0]["overlapped_ms"])
+    per_stage = [device_time(c) for c in costs]
+    D = max(per_stage, key=lambda p: p["overlapped_ms"])
     slots = sched.slots(pp, m)
-    step_overlapped = max(slots * D["overlapped_ms"] + max(c.opt_flop_ms, c.opt_dram_ms),
-                          m * D["fabric_ms"] + c.sync_fabric_ms)
-    D_serial, c_serial = max(per_stage, key=lambda p: p[0]["serial_ms"])
-    step_serial = slots * D_serial["serial_ms"] + c_serial.opt_serial_ms + c_serial.sync_serial_ms
+    # The optimizer runs after the last backward; the step waits for the slowest stage's update
+    opt = max(max(c.opt_flop_ms, c.opt_dram_ms) for c in costs)
+    link_total = max(m * p["fabric_ms"] + c.sync_fabric_ms for p, c in zip(per_stage, costs))
+    step_overlapped = max(slots * D["overlapped_ms"] + opt, link_total)
+    step_serial = (slots * max(p["serial_ms"] for p in per_stage)
+                   + max(c.opt_serial_ms + c.sync_serial_ms for c in costs))
 
-    # Memory: state + peak micro-batches held x one micro-batch's activations, on the first and
-    # the last stage (device 0 holds the most, device P - 1 holds the LM head)
+    # Memory: the one-micro-batch run's peak (state, its activations, backward transients) plus
+    # the other micro-batches held at the same time, on the first and the last stage
+    # (device 0 holds the most, device P - 1 holds the LM head)
     peak_activations = sched.peak_activations(pp, m)
-    memory = max(cs.state_bytes + peak_activations[sid] * cs.activation_bytes for sid, cs in zip(stage_ids, costs))
+    memory = max(cs.peak_bytes + (peak_activations[sid] - 1) * cs.activation_bytes
+                 for sid, cs in zip(stage_ids, costs))
 
     tokens = m * seq_len
     peak = hw.tflops_per_chip(MathFidelity.HiFi4) * 1e12

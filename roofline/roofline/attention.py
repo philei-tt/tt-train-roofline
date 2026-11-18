@@ -493,7 +493,7 @@ def fused_attention_roofline(
         Wd = B * Hq * S * d * bytes_per_elem
 
         # Q, O, dO, the softmax statistics and dQ are streamed once per K/V block
-        Tc_bwd = S / bwd_kv_block if bwd_kv_block else Tc
+        Tc_bwd = max(S / bwd_kv_block, 1.0) if bwd_kv_block else Tc
 
         # Read Q, O, dO
         Rq = B * Hq * Tc_bwd * S * d * bytes_per_elem

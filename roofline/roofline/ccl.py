@@ -9,7 +9,7 @@ Ethernet bandwidth. Ring topology has 2x better effective bandwidth than linear.
 """
 
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 from ..hardware import HardwareSpec, DataType
 
@@ -219,17 +219,19 @@ def ring_shift_roofline(
     num_devices: int,
     operation: str = "RingShift",
     phase: str = "ccl",
+    num_steps: Optional[int] = None,
 ) -> "RooflineEstimate":
-    """A full ring rotation: every device passes tensor_bytes to its neighbour num_devices - 1 times.
+    """Ring shifts: every device passes tensor_bytes to its neighbour num_steps times
+    (default num_devices - 1: every shard visits every device).
 
     Used by ring attention (context parallelism): the K/V shards travel around the CP ring.
     All devices send at once; on a ring half of every tensor goes each way, so both directions
     of the full-duplex links carry data (topology divisor 2, as for the other collectives).
 
-    Formula: time = (num_devices - 1) * tensor_bytes / (num_links * topology_divisor * link bandwidth)
+    Formula: time = num_steps * tensor_bytes / (num_links * topology_divisor * link bandwidth)
     """
     directions = 2 if hw.topology == "ring" else 1
-    steps = max(num_devices - 1, 0)
+    steps = max(num_devices - 1, 0) if num_steps is None else (num_steps if num_devices > 1 else 0)
     return _link_estimate(hw, operation, phase, steps * tensor_bytes, hw.num_links, directions)
 
 
