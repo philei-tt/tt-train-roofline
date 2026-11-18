@@ -210,7 +210,9 @@ D       = max(FLOP, DRAM, fabric) for one micro-batch on the slowest stage
           (fabric includes 2v stage hand-offs per micro-batch)
 T_step  = max( slots * D + max(optimizer FLOP, optimizer DRAM),  m * fabric + CP gradient sync )
 bubble  = (slots - m) / slots
-MFU     = (6 N + 12 L H Q S) * tokens / T_step / (chips * peak)       (tt-train's MFU formula)
+MFU     = model FLOPs / T_step / (chips * peak)
+          model FLOPs: counted by the mock run over all stages, forward + backward without recompute
+          (as tt-train's tools/profiling/results_json/add_roofline.py)
 ```
 
 `slots` is the step length in micro-batch times and comes from the schedule (`roofline/training/pipeline.py`). Each schedule also gives the micro-batches whose activations a device holds at once, which sets memory:

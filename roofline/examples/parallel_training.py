@@ -77,16 +77,7 @@ class StageCost:
     sync_serial_ms: float
     activation_bytes: int  # held from forward to backward, one micro-batch
     state_bytes: int  # parameters + gradients + optimizer state
-    flops_per_mb: int
-
-
-def llama_flops_per_token(preset: dict, seq_len: int) -> float:
-    """Model FLOPs per token, as tt-train computes MFU: 6 N + 12 L H Q S (PaLM)."""
-    e, h, g, L = preset["embedding_dim"], preset["num_heads"], preset["num_groups"], preset["num_blocks"]
-    ff = preset["intermediate_dim"]
-    kv = g * (e // h)
-    n = L * (2 * e * e + 2 * e * kv + e + 3 * e * ff + e) + preset["vocab_size"] * e + e
-    return 6 * n + 12 * L * h * (e // h) * seq_len
+    flops_per_mb: int  # FLOPs counted for one micro-batch on one device (forward + backward)
 
 
 def run_stage(
@@ -246,15 +237,26 @@ def run_parallel_roofline(
             return {"error": msg}
 
     cache = stage_cache if stage_cache is not None else {}
-    stage_ids = sorted({0, pp - 1})
-    costs = []
-    for sid in stage_ids:
+
+    def stage_cost(sid: int, with_recompute: bool) -> StageCost:
         key = (model_name, seq_len, hardware, hw.num_links, hw.topology, pp, tp, cp, sid,
-               sequence_parallel, vocab_parallel, recompute, attn_bwd_kv_block)
+               sequence_parallel, vocab_parallel, with_recompute, attn_bwd_kv_block)
         if key not in cache:
             cache[key] = run_stage(hw, preset, seq_len, tp, cp, pp, sid, sequence_parallel,
-                                   vocab_parallel, recompute, attn_bwd_kv_block)
-        costs.append(cache[key])
+                                   vocab_parallel, with_recompute, attn_bwd_kv_block)
+        return cache[key]
+
+    stage_ids = sorted({0, pp - 1})
+    costs = [stage_cost(sid, recompute) for sid in stage_ids]
+
+    # Model FLOPs for MFU: FLOPs the mock run counts for one micro-batch through every stage,
+    # without recompute (as tt-train's tools/profiling/results_json/add_roofline.py does).
+    # Per-device counts times tp * cp devices per stage; middle stages are all alike.
+    first, last = stage_cost(0, False).flops_per_mb, stage_cost(pp - 1, False).flops_per_mb
+    model_flops_per_mb = first + (last if pp > 1 else 0)
+    if pp > 2:
+        model_flops_per_mb += (pp - 2) * stage_cost(1, False).flops_per_mb
+    model_flops_per_mb *= tp * cp
 
     # Stage hand-off: the activation (forward) or its gradient (backward) of the whole sequence
     # crosses the cut; without SP every TP chip of the next stage needs the full activation.
@@ -285,7 +287,7 @@ def run_parallel_roofline(
 
     tokens = m * seq_len
     peak = hw.tflops_per_chip(MathFidelity.HiFi4) * 1e12
-    model_flops = llama_flops_per_token(preset, seq_len) * tokens
+    model_flops = model_flops_per_mb * m
 
     def throughput(step_ms: float) -> Dict[str, float]:
         return {"step_ms": step_ms, "tokens_per_second": tokens / (step_ms / 1e3),
