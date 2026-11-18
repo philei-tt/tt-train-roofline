@@ -9,7 +9,7 @@ without ttml/ttnn dependencies.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Literal
 
@@ -217,17 +217,20 @@ BLACKHOLE_GALAXY = HardwareSpec(
     chips_per_galaxy=32,
 )
 
-BLACKHOLE_QUAD = HardwareSpec(
+BLACKHOLE_QUAD = replace(
+    BLACKHOLE_GALAXY,
     name="Blackhole Quad Galaxy",
-    tensix_cores_per_chip=120,
-    clock_ghz=1.35,
-    dram_gb_per_chip=32,
-    dram_bw_gb_s=512,
-    sram_mb_per_core=1.5,
-    noc_bw_tb_s=1.4,
-    noc_link_bw_gb_s=200,
-    eth_bw_gb_s_per_link=48,
     topology="ring",  # 32 x 4 torus (RING, RING), 2 links per neighbouring chip pair
     num_links=2,
     chips_per_galaxy=128,
 )
+
+# Hardware presets by CLI name
+HARDWARE_PRESETS = {
+    "n150": WORMHOLE_N150,
+    "n300": WORMHOLE_N300,
+    "p100": BLACKHOLE_P100,
+    "p150": BLACKHOLE_P150,
+    "bh_glx": BLACKHOLE_GALAXY,
+    "bh_quad": BLACKHOLE_QUAD,
+}

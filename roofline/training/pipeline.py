@@ -159,7 +159,7 @@ class InterleavedOneFOneBSchedule(PipelineSchedule):
 
 def make_schedule(name: str, interleave: int = 1) -> PipelineSchedule:
     """Schedule by name: naive, gpipe, 1f1b, interleaved (with interleave = v chunks per device)."""
-    if name == "interleaved" or (name == "1f1b" and interleave > 1):
+    if name == "interleaved":
         if interleave < 2:
             raise ValueError("interleaved 1F1B needs interleave >= 2 (interleave = 1 is plain 1f1b)")
         return InterleavedOneFOneBSchedule(interleave)
@@ -170,23 +170,19 @@ def make_schedule(name: str, interleave: int = 1) -> PipelineSchedule:
 
 
 def simulate_schedule(
-    schedule: PipelineSchedule,
-    num_stages: int,
-    num_microbatches: int,
-    t_forward: float = 1.0,
-    t_backward: float = 2.0,
+    schedule: PipelineSchedule, num_stages: int, num_microbatches: int
 ) -> Tuple[float, List[float]]:
     """Play a schedule out op by op on a common clock.
 
     Each device runs its ops in order; an op starts when the device is free and its input is ready
     (forward: the previous virtual stage's forward of the same micro-batch; backward: the next
     virtual stage's backward, or its own forward on the last stage). Hand-offs take no time.
+    A full-stage forward takes 1 time unit and a backward 2; the bubble does not depend on the ratio.
 
     Args:
         schedule: the schedule
         num_stages: P
         num_microbatches: m
-        t_forward, t_backward: forward / backward time of one full stage (any unit)
 
     Returns:
         (bubble fraction, peak activations held per device in full-stage micro-batches)
@@ -215,7 +211,7 @@ def simulate_schedule(
                 if dep is not None and dep not in done:
                     break
                 start = max(free[d], done[dep] if dep is not None else 0.0)
-                free[d] = start + (t_forward if kind == "F" else t_backward) / v
+                free[d] = start + (1.0 if kind == "F" else 2.0) / v
                 done[(kind, mb, stage)] = free[d]
                 live[d] += (1.0 if kind == "F" else -1.0) / v
                 peak[d] = max(peak[d], live[d])
@@ -223,4 +219,4 @@ def simulate_schedule(
                 progress = True
     if any(pos[d] != len(orders[d]) for d in range(P)):
         raise RuntimeError(f"{schedule} deadlocked")
-    return 1.0 - m * (t_forward + t_backward) / max(free), peak
+    return 1.0 - 3.0 * m / max(free), peak

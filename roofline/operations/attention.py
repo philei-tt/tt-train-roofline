@@ -9,11 +9,13 @@ MockScaledDotProductAttentionOp for roofline estimation of attention operations.
 """
 
 from __future__ import annotations
+import dataclasses
 from typing import Optional, Tuple, TYPE_CHECKING
 
 from ..mock_tensor import MockTensor
+from ..hardware import DataType
 from ..roofline import (
-    RooflineEstimate,
+    elementwise_roofline,
     ring_shift_roofline,
     attention_roofline,
     fused_attention_roofline,
@@ -591,33 +593,42 @@ class MockScaledDotProductAttentionFusedOp(RooflineFunction):
         return grad_query, grad_key, grad_value, None, None, None
 
 
-def _scaled(estimate: "RooflineEstimate", factor: float, operation: str) -> "RooflineEstimate":
-    """Copy of an estimate with FLOPs, bytes and times multiplied by factor."""
-    return RooflineEstimate(
-        operation=operation,
-        phase=estimate.phase,
-        total_flops=int(estimate.total_flops * factor),
-        total_bytes=int(estimate.total_bytes * factor),
-        ideal_compute_ns=estimate.ideal_compute_ns * factor,
-        ideal_memory_ns=estimate.ideal_memory_ns * factor,
-        hw=estimate.hw,
-    )
 
+def _ring_attention_estimates(
+    roofline_ctx: "RooflineContext",
+    query: MockTensor,
+    key: MockTensor,
+    cp_size: int,
+    phase: str,
+    accumulator_elements: int,
+    shift_bytes: int,
+) -> None:
+    """Add the three parts of one ring-attention pass to the context.
 
-def _accumulator_estimate(
-    roofline_ctx: "RooflineContext", num_elements: int, num_steps: int, phase: str
-) -> "RooflineEstimate":
-    """One read and one write of an fp32 accumulator per ring step (DRAM only)."""
-    total_bytes = num_steps * 8 * num_elements
-    return RooflineEstimate(
-        operation="RingAttention.merge",
-        phase=phase,
-        total_flops=0,
-        total_bytes=total_bytes,
-        ideal_compute_ns=0.0,
-        ideal_memory_ns=total_bytes / roofline_ctx.hw.dram_bw_gb_s,
-        hw=roofline_ctx.hw,
+    - attention: fused attention over the full sequence, divided by cp_size (balanced split)
+    - merge: one read + one write of the fp32 accumulators per ring step (fused into the kernel)
+    - shift: the K/V (and, backward, dK/dV) shards travelling once around the CP ring
+    """
+    batch_size, num_q_heads, local_seq, head_dim = query.shape
+    full = fused_attention_roofline(
+        roofline_ctx.hw, batch_size, num_q_heads, key.shape[1], local_seq * cp_size, head_dim,
+        dtype=query.dtype, operation="RingAttention", phase=phase,
+        bwd_kv_block=roofline_ctx.attn_bwd_kv_block if phase == "backward" else None,
     )
+    roofline_ctx.add_perf_result(dataclasses.replace(
+        full,
+        total_flops=full.total_flops // cp_size,
+        total_bytes=full.total_bytes // cp_size,
+        ideal_compute_ns=full.ideal_compute_ns / cp_size,
+        ideal_memory_ns=full.ideal_memory_ns / cp_size,
+    ))
+    roofline_ctx.add_perf_result(elementwise_roofline(
+        roofline_ctx.hw, cp_size * accumulator_elements, num_inputs=1, sfpu_ops_per_element=0.0,
+        dtype=DataType.FLOAT32, operation="RingAttention.merge", phase=phase,
+    ))
+    roofline_ctx.add_perf_result(ring_shift_roofline(
+        roofline_ctx.hw, shift_bytes, cp_size, operation="RingAttention.shift", phase=phase,
+    ))
 
 
 class MockRingAttentionOp(RooflineFunction):
@@ -655,27 +666,15 @@ class MockRingAttentionOp(RooflineFunction):
         Returns:
             Attention output for the local queries [B, H, S/cp_size, d]
         """
-        batch_size, num_q_heads, local_seq, head_dim = query.shape
-        num_kv_heads = key.shape[1]
         stats = create_activation_tensor(
-            (batch_size, num_q_heads, local_seq), query.dtype, query.layout, name="ring_attention_lse",
+            query.shape[:3], query.dtype, query.layout, name="ring_attention_lse",
         )
         ctx.save_for_backward(query, key, value, stats)
         ctx._cp_size = cp_size
-
-        full = fused_attention_roofline(
-            roofline_ctx.hw, batch_size, num_q_heads, num_kv_heads, local_seq * cp_size, head_dim,
-            dtype=query.dtype, operation="RingAttention", phase="forward",
-        )
-        roofline_ctx.add_perf_result(_scaled(full, 1.0 / cp_size, "RingAttention"))
-        roofline_ctx.add_perf_result(
-            _accumulator_estimate(roofline_ctx, query.logical_volume(), cp_size, "forward")
-        )
-        roofline_ctx.add_perf_result(
-            ring_shift_roofline(
-                roofline_ctx.hw, key.bytes() + value.bytes(), cp_size,
-                operation="RingAttention.shift_kv", phase="forward",
-            )
+        _ring_attention_estimates(
+            roofline_ctx, query, key, cp_size, "forward",
+            accumulator_elements=query.logical_volume(),
+            shift_bytes=key.bytes() + value.bytes(),
         )
         return create_activation_tensor(query.shape, query.dtype, query.layout)
 
@@ -687,30 +686,12 @@ class MockRingAttentionOp(RooflineFunction):
     ) -> Tuple[MockTensor, MockTensor, MockTensor, None]:
         """Backward pass: dQ, dK, dV with the K/V shards and dK, dV accumulators on the ring."""
         query, key, value, stats = ctx.saved_tensors
-        cp_size = ctx._cp_size
-        batch_size, num_q_heads, local_seq, head_dim = query.shape
-        num_kv_heads = key.shape[1]
-
-        full = fused_attention_roofline(
-            roofline_ctx.hw, batch_size, num_q_heads, num_kv_heads, local_seq * cp_size, head_dim,
-            dtype=query.dtype, operation="RingAttention", phase="backward",
-            bwd_kv_block=roofline_ctx.attn_bwd_kv_block,
-        )
-        roofline_ctx.add_perf_result(_scaled(full, 1.0 / cp_size, "RingAttention"))
-        roofline_ctx.add_perf_result(
-            _accumulator_estimate(
-                roofline_ctx, query.logical_volume() + key.logical_volume() + value.logical_volume(),
-                cp_size, "backward",
-            )
-        )
         kv_bytes = key.bytes() + value.bytes()
-        roofline_ctx.add_perf_result(
-            ring_shift_roofline(
-                roofline_ctx.hw, kv_bytes + 2 * kv_bytes, cp_size,  # K, V bf16 + dK, dV fp32
-                operation="RingAttention.shift_kv_dkv", phase="backward",
-            )
+        _ring_attention_estimates(
+            roofline_ctx, query, key, ctx._cp_size, "backward",
+            accumulator_elements=query.logical_volume() + key.logical_volume() + value.logical_volume(),
+            shift_bytes=kv_bytes + 2 * kv_bytes,  # K, V in bf16 + dK, dV accumulators in fp32
         )
-
         grad_query = create_grad_tensor(query.shape, query.dtype, query.layout, name="grad_query")
         grad_key = create_grad_tensor(key.shape, key.dtype, key.layout, name="grad_key")
         grad_value = create_grad_tensor(value.shape, value.dtype, value.layout, name="grad_value")

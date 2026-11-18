@@ -42,6 +42,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Dict, Any
 
+from roofline.hardware import HARDWARE_PRESETS
+
 
 class ModelType(Enum):
     """Type of transformer model."""
@@ -252,6 +254,24 @@ MODEL_PRESETS: Dict[str, dict] = {
         "description": "Llama 3.1 405B (128K context)",
     },
 }
+
+
+def distributed_llama_config(preset: dict, **parallel) -> "MockDistributedLlamaConfig":
+    """MockDistributedLlamaConfig for a Llama preset; `parallel` sets tp_size, cp_size, stages, ..."""
+    from roofline import MockDistributedLlamaConfig
+
+    return MockDistributedLlamaConfig(
+        vocab_size=preset["vocab_size"],
+        max_sequence_length=preset["max_sequence_length"],
+        embedding_dim=preset["embedding_dim"],
+        intermediate_dim=preset.get("intermediate_dim"),
+        num_heads=preset["num_heads"],
+        num_groups=preset["num_groups"],
+        num_blocks=preset["num_blocks"],
+        dropout_prob=preset["dropout"],
+        theta=preset["theta"],
+        **parallel,
+    )
 
 
 def _resolve_model_config_path(model_config_rel: str, training_config_path: str) -> str:
@@ -526,14 +546,7 @@ def run_model_roofline(
     )
     from roofline.training.distributed import shard_batch, synchronize_gradients
 
-    # Hardware mapping
-    hardware_map = {
-        "n150": WORMHOLE_N150,
-        "n300": WORMHOLE_N300,
-        "p100": BLACKHOLE_P100,
-        "p150": BLACKHOLE_P150,
-        "bh_glx": BLACKHOLE_GALAXY,
-    }
+    hardware_map = HARDWARE_PRESETS
 
     if hardware not in hardware_map:
         return {
@@ -626,18 +639,7 @@ def run_model_roofline(
                     )
                 }
         if use_distributed_llama:
-            config = MockDistributedLlamaConfig(
-                vocab_size=preset["vocab_size"],
-                max_sequence_length=preset["max_sequence_length"],
-                embedding_dim=preset["embedding_dim"],
-                intermediate_dim=preset.get("intermediate_dim"),
-                num_heads=preset["num_heads"],
-                num_groups=preset["num_groups"],
-                num_blocks=preset["num_blocks"],
-                dropout_prob=preset["dropout"],
-                theta=preset["theta"],
-                tp_size=tp_size,
-            )
+            config = distributed_llama_config(preset, tp_size=tp_size)
             model = MockDistributedLlama(config, runner=runner)
         else:
             config = MockLlamaConfig(
@@ -1109,7 +1111,7 @@ Examples:
         "--hardware",
         "-hw",
         type=str,
-        choices=["n150", "n300", "p100", "p150", "bh_glx"],
+        choices=list(HARDWARE_PRESETS),
         default="n150",
         help="Hardware configuration (default: n150)",
     )

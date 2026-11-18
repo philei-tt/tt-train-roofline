@@ -70,6 +70,7 @@ from .hardware import (
     BLACKHOLE_P150,
     BLACKHOLE_GALAXY,
     BLACKHOLE_QUAD,
+    HARDWARE_PRESETS,
 )
 
 # Mock tensor with autograd
@@ -160,8 +161,6 @@ from .modules import (
     MockDistributedLlamaConfig,
     create_mock_distributed_llama,
     MockDistributedLlamaBlock,
-    MockLlamaPipelineStage,
-    MockLlamaPipelineStageConfig,
     MockDistributedLlamaMLP,
     MockDistributedGroupedQueryAttention,
 )
@@ -226,6 +225,7 @@ __all__ = [
     "BLACKHOLE_CHIP",
     "BLACKHOLE_GALAXY",
     "BLACKHOLE_QUAD",
+    "HARDWARE_PRESETS",
     # Roofline core
     "RooflineEstimate",
     "RooflineContext",
@@ -293,8 +293,6 @@ __all__ = [
     "MockDistributedLlamaConfig",
     "create_mock_distributed_llama",
     "MockDistributedLlamaBlock",
-    "MockLlamaPipelineStage",
-    "MockLlamaPipelineStageConfig",
     "MockDistributedLlamaMLP",
     "MockDistributedGroupedQueryAttention",
     # Operation base classes
