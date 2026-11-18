@@ -188,7 +188,7 @@ python3 -m roofline.examples.matmuls
 
 `roofline.examples.parallel_training` models one optimizer step of a Llama on `pp * tp * cp` chips:
 
-- **PP**: interleaved 1F1B (`--interleave v`, v = 1 is plain 1F1B), optional vocabulary parallelism (`--vocab-parallel`, LM head split across stages)
+- **PP** with a choice of schedule (`--schedule naive | gpipe | 1f1b | interleaved`, `--interleave v` chunks per device for interleaved), optional vocabulary parallelism (`--vocab-parallel`, LM head split across stages)
 - **TP** inside a stage, optionally with Megatron sequence parallelism (`--sp`)
 - **CP** inside a stage: ring attention with a load-balanced split and K/V shifts in both ring directions
 - activation recompute (`--recompute`, the memory-efficient runner)
@@ -208,10 +208,21 @@ The first and the last pipeline stage are each run for one micro-batch in their 
 ```
 D       = max(FLOP, DRAM, fabric) for one micro-batch on the slowest stage
           (fabric includes 2v stage hand-offs per micro-batch)
-T_step  = max( (m + (P - 1)/v) * D + max(optimizer FLOP, optimizer DRAM),  m * fabric + CP gradient sync )
-bubble  = (P - 1) / (v * m + P - 1)
+T_step  = max( slots * D + max(optimizer FLOP, optimizer DRAM),  m * fabric + CP gradient sync )
+bubble  = (slots - m) / slots
 MFU     = (6 N + 12 L H Q S) * tokens / T_step / (chips * peak)       (tt-train's MFU formula)
 ```
+
+`slots` is the step length in micro-batch times and comes from the schedule (`roofline/training/pipeline.py`). Each schedule also gives the micro-batches whose activations a device holds at once, which sets memory:
+
+| Schedule | slots | bubble | held on device 0 |
+|---|---|---|---|
+| `naive`: one micro-batch at a time | m P | (P - 1) / P | 1 |
+| `gpipe`: all forwards, then all backwards (Huang et al., 2019) | m + P - 1 | (P - 1) / (m + P - 1) | m |
+| `1f1b` (Narayanan et al., 2021) | m + P - 1 | (P - 1) / (m + P - 1) | P |
+| `interleaved`, v chunks per device (same paper) | m + (P - 1) / v | (P - 1) / (v m + P - 1) | simulated |
+
+`simulate_schedule` plays any schedule out op by op on a common clock; every closed form above matches it.
 
 The per-op serial time (sum of `max(compute, DRAM, network)` over ops, as in `training.py`) is reported next to it.
 
@@ -225,7 +236,7 @@ Supporting changes:
 | `ring_shift_roofline`, `send_recv_roofline` | CP ring shifts (both ring directions) and stage hand-offs over the links across a stage cut |
 | `MockRingAttentionOp`, `cp_size` on the distributed block | Ring attention: attention of the full sequence divided by `cp`, K/V (bf16) shifts forward, K/V + dK/dV (fp32) backward, fp32 accumulator read + write per ring step |
 | `sequence_parallel` on the parallel linears, attention, MLP, block | All-gather / reduce-scatter along the sequence instead of broadcast / all-reduce; norms and residual adds hold `S / tp` tokens |
-| `MockLlamaPipelineStage`, `training/pipeline.py` | One pipeline stage; interleaved 1F1B order and simulator (activations held per device) |
+| `MockLlamaPipelineStage`, `training/pipeline.py` | One pipeline stage; schedule classes (`NaiveSchedule`, `GPipeSchedule`, `OneFOneBSchedule`, `InterleavedOneFOneBSchedule`) and a schedule simulator |
 | `BLACKHOLE_QUAD` | 4 galaxies, 128 chips, 32 x 4 torus, 2 links per neighbouring chip pair |
 
 Limitations: TP must divide the number of KV heads (as in tt-train). With `--sp` each column-parallel linear keeps its all-gathered input for backward (Megatron keeps the shard and re-gathers), so memory is higher than Megatron's. The communication of vocabulary parallelism is not modelled. `--cut-links` (default 8) assumes stages laid along the 32-chip axis of a quad.

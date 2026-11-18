@@ -5,7 +5,8 @@
 """Roofline analysis for Llama training with pipeline, tensor, sequence and context parallelism.
 
 Combines, on `chips = pp * tp * cp` devices:
-  - PP: interleaved 1F1B (v chunks per device; v = 1 is plain 1F1B), optional vocabulary parallelism
+  - PP: a pipeline schedule (naive, GPipe, 1F1B, interleaved 1F1B with v chunks per device),
+    optional vocabulary parallelism
   - TP: tensor parallelism inside a stage, optionally with sequence parallelism (--sp)
   - CP: context parallelism inside a stage (ring attention, load-balanced split)
   - activation recompute (--recompute, the memory-efficient runner)
@@ -15,9 +16,10 @@ RooflineContext. The step time is a resource-level roofline: FLOP time, DRAM tim
 (Ethernet) time are each summed and the largest one sets the time, i.e. all three overlap:
 
     D       = max(FLOP, DRAM, fabric) of one micro-batch on the slowest stage, fabric incl. hand-offs
-    T_step  = max( (m + (P - 1) / v) * D + max(optimizer FLOP, optimizer DRAM),
-                   m * fabric + CP gradient sync )
-    bubble  = (P - 1) / (v * m + P - 1)
+    T_step  = max( slots * D + max(optimizer FLOP, optimizer DRAM),  m * fabric + CP gradient sync )
+    slots   = step length in micro-batch times, from the schedule (training/pipeline.py):
+              naive m * P, GPipe and 1F1B m + P - 1, interleaved 1F1B m + (P - 1) / v
+    bubble  = (slots - m) / slots
 
 The per-op serial time (sum over ops of max(compute, DRAM, network), as in training.py) is
 reported next to it.
@@ -55,7 +57,7 @@ from roofline import (
 )
 from roofline.examples.training import MODEL_PRESETS, ModelType
 from roofline.training.distributed import synchronize_gradients
-from roofline.training.pipeline import pipeline_bubble, simulate_pipeline
+from roofline.training.pipeline import make_schedule
 
 HARDWARE = {"p150": BLACKHOLE_P150, "bh_glx": BLACKHOLE_GALAXY, "bh_quad": BLACKHOLE_QUAD}
 
@@ -183,6 +185,7 @@ def run_parallel_roofline(
     pp: int = 1,
     tp: int = 1,
     cp: int = 1,
+    schedule: str = "1f1b",
     interleave: int = 1,
     sequence_parallel: bool = False,
     vocab_parallel: bool = False,
@@ -201,7 +204,8 @@ def run_parallel_roofline(
         num_microbatches: m, sequences per optimizer step
         hardware: "bh_quad", "bh_glx" or "p150"
         pp, tp, cp: pipeline, tensor and context parallel degrees
-        interleave: v, model chunks per pipeline device (1 = plain 1F1B)
+        schedule: pipeline schedule: "naive", "gpipe", "1f1b" or "interleaved"
+        interleave: v, model chunks per pipeline device (interleaved schedule only)
         sequence_parallel: Megatron sequence parallelism inside TP
         vocab_parallel: split the LM head across all pipeline stages
         recompute: recompute each block's forward in backward (memory-efficient runner)
@@ -226,11 +230,14 @@ def run_parallel_roofline(
         hw = dataclasses.replace(hw, **overrides)
     chips = pp * tp * cp
     L = preset["num_blocks"]
+    try:
+        sched = make_schedule(schedule, interleave)
+    except ValueError as exc:
+        return {"error": str(exc)}
     checks = [
         (chips <= hw.chips_per_galaxy, f"pp*tp*cp = {chips} > {hw.chips_per_galaxy} chips of {hw.name}"),
         (L % pp == 0, f"num_blocks ({L}) not divisible by pp ({pp})"),
-        ((L // pp) % interleave == 0, f"blocks per stage ({L // pp}) not divisible by interleave ({interleave})"),
-        (pp == 1 or num_microbatches % pp == 0, f"num_microbatches ({num_microbatches}) not a multiple of pp ({pp})"),
+        (pp == 1 or not sched.validate(pp, num_microbatches, L // pp), sched.validate(pp, num_microbatches, max(L // pp, 1))),
         (preset["num_groups"] % tp == 0, f"num_groups ({preset['num_groups']}) not divisible by tp ({tp})"),
         (seq_len % (2 * cp * (tp if sequence_parallel else 1)) == 0, "seq_len not divisible by 2 * cp (* tp with SP)"),
     ]
@@ -251,7 +258,7 @@ def run_parallel_roofline(
 
     # Stage hand-off: the activation (forward) or its gradient (backward) of the whole sequence
     # crosses the cut; without SP every TP chip of the next stage needs the full activation.
-    m, v = num_microbatches, interleave
+    m, v = num_microbatches, sched.interleave
     act_bytes = seq_len * preset["embedding_dim"] * 2 * (1 if sequence_parallel else tp)
     hand = send_recv_roofline(hw, act_bytes, cut_links, operation="PipelineHandoff").ideal_network_ns / 1e6
     hand_per_mb = 2 * v * hand if pp > 1 else 0.0
@@ -264,7 +271,7 @@ def run_parallel_roofline(
     per_stage = [device_time(c) for c in costs]
     slow = max(range(len(costs)), key=lambda i: per_stage[i]["overlapped_ms"])
     D, c = per_stage[slow], costs[slow]
-    slots = m + (pp - 1) / v
+    slots = sched.slots(pp, m) if pp > 1 else m
     step_overlapped = max(slots * D["overlapped_ms"] + max(c.opt_flop_ms, c.opt_dram_ms),
                           m * D["fabric_ms"] + c.sync_fabric_ms)
     slow_serial = max(range(len(costs)), key=lambda i: per_stage[i]["serial_ms"])
@@ -272,7 +279,7 @@ def run_parallel_roofline(
                    + costs[slow_serial].sync_serial_ms)
 
     # Memory: the device that holds the most micro-batches (stage 0) and the last stage
-    _, stash = simulate_pipeline(pp, min(m, 4 * pp) if pp > 1 else 1, v)
+    stash = sched.peak_activations(pp, m) if pp > 1 else [1.0]
     stash_by_stage = {0: stash[0], pp - 1: stash[-1]}
     memory = max(cs.state_bytes + stash_by_stage[sid] * cs.activation_bytes for sid, cs in zip(stage_ids, costs))
 
@@ -288,11 +295,11 @@ def run_parallel_roofline(
     return {
         "config": {"model": model_name, "seq_len": seq_len, "num_microbatches": m, "hardware": hw.name,
                    "num_links": hw.num_links, "topology": hw.topology, "chips": chips, "pp": pp, "tp": tp,
-                   "cp": cp, "interleave": v, "sequence_parallel": sequence_parallel,
+                   "cp": cp, "schedule": str(sched), "interleave": v, "sequence_parallel": sequence_parallel,
                    "vocab_parallel": vocab_parallel, "recompute": recompute, "cut_links": cut_links,
                    "attn_bwd_kv_block": attn_bwd_kv_block},
         "per_microbatch": {**D, "bound": bound, "handoff_ms": hand},
-        "bubble": pipeline_bubble(pp, m, v),
+        "bubble": sched.bubble(pp, m) if pp > 1 else 0.0,
         "overlapped": throughput(step_overlapped),
         "serial": throughput(step_serial),
         "memory": {"peak_gb": memory / 1e9, "fits": memory <= hw.dram_gb_per_chip * 1e9,
@@ -301,7 +308,10 @@ def run_parallel_roofline(
     }
 
 
-def sweep(chips: int, **kwargs) -> List[Dict[str, Any]]:
+SWEEP_SCHEDULES = (("1f1b", 1), ("interleaved", 2), ("interleaved", 5))
+
+
+def sweep(chips: int, schedules=SWEEP_SCHEDULES, **kwargs) -> List[Dict[str, Any]]:
     """Every split of `chips` into pp * tp * cp, schedule and recompute choice that is valid."""
     cache: Dict[Any, StageCost] = {}
     results = []
@@ -310,12 +320,12 @@ def sweep(chips: int, **kwargs) -> List[Dict[str, Any]]:
             if chips % (tp * cp):
                 continue
             pp = chips // (tp * cp)
-            for v in (1, 2, 5):
-                if v > 1 and pp == 1:
+            for schedule, v in schedules:
+                if pp == 1 and schedule != "1f1b":
                     continue
                 for recompute in (False, True):
-                    r = run_parallel_roofline(pp=pp, tp=tp, cp=cp, interleave=v, recompute=recompute,
-                                              stage_cache=cache, **kwargs)
+                    r = run_parallel_roofline(pp=pp, tp=tp, cp=cp, schedule=schedule, interleave=v,
+                                              recompute=recompute, stage_cache=cache, **kwargs)
                     if "error" not in r:
                         results.append(r)
     return results
@@ -323,7 +333,7 @@ def sweep(chips: int, **kwargs) -> List[Dict[str, Any]]:
 
 def _describe(r: Dict[str, Any]) -> str:
     c = r["config"]
-    sched = "" if c["pp"] == 1 else (", 1F1B" if c["interleave"] == 1 else f", v={c['interleave']}")
+    sched = "" if c["pp"] == 1 else f", {c['schedule']}"
     return (f"PP{c['pp']} x TP{c['tp']} x CP{c['cp']}{sched}"
             f"{', recompute' if c['recompute'] else ''}")
 
@@ -337,7 +347,10 @@ def main():
     parser.add_argument("--pp", type=int, default=1, help="Pipeline stages")
     parser.add_argument("--tp", type=int, default=1, help="Tensor parallel degree")
     parser.add_argument("--cp", type=int, default=1, help="Context parallel degree (ring attention)")
-    parser.add_argument("--interleave", type=int, default=1, help="Chunks per pipeline device (1 = 1F1B)")
+    parser.add_argument("--schedule", default="1f1b", choices=("naive", "gpipe", "1f1b", "interleaved"),
+                        help="Pipeline schedule (default: 1f1b)")
+    parser.add_argument("--interleave", type=int, default=2,
+                        help="Chunks per pipeline device for --schedule interleaved (default: 2)")
     parser.add_argument("--sp", action="store_true", help="Sequence parallelism inside TP")
     parser.add_argument("--vocab-parallel", action="store_true", help="Split the LM head across stages")
     parser.add_argument("--recompute", action="store_true", help="Recompute block forward in backward")
@@ -366,7 +379,8 @@ def main():
                   f"{r['per_microbatch']['bound']:>7s} {r['bubble']:7.1%} {r['memory']['peak_gb']:7.1f}")
         out = results
     else:
-        out = run_parallel_roofline(pp=args.pp, tp=args.tp, cp=args.cp, interleave=args.interleave,
+        out = run_parallel_roofline(pp=args.pp, tp=args.tp, cp=args.cp, schedule=args.schedule,
+                                    interleave=args.interleave if args.schedule == "interleaved" else 1,
                                     recompute=args.recompute, **common)
         if "error" in out:
             raise SystemExit(out["error"])
