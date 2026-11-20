@@ -663,8 +663,9 @@ def _print(out: Dict[str, Any], args) -> None:
     cfg, pm, o, ub, mem = out["config"], out["per_microbatch"], out["roofline"], out["upper_bound"], out["memory"]
     print(f"{_describe(out)} on {cfg['chips']} chips ({cfg['hardware']}), {args.microbatches} x {args.seq} "
           f"tokens per step, mode {cfg['mode']}")
+    parts = [f"{g.upper()} {t}" for g, t in cfg["topology"].items() if cfg[g] > 1]
     print(f"  stage mesh {cfg['stage_mesh'][0]} x {cfg['stage_mesh'][1]}, "
-          + ", ".join(f"{g.upper()} {t}" for g, t in cfg["topology"].items() if cfg[g] > 1) + f", {cfg['cut_links']} links across a stage cut")
+          + ", ".join(parts + [f"{cfg['cut_links']} links across a stage cut"]))
     print(f"  precision: {cfg['master_dtype']} master, {cfg['grad_dtype']} gradient accumulation"
           f"{', ZeRO-1' if cfg['zero1'] else ''}; attention block {cfg['attn_block'] or 32}, ring attention {cfg['cp_mode']}")
     print(f"  per micro-batch, slowest stage: {pm['roofline_ms']:.2f} ms (sum of FLOP {pm['flop_ms']:.2f}, "

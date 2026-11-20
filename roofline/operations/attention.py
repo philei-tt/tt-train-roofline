@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Optional, Tuple, TYPE_CHECKING
 
-from ..mock_tensor import MockTensor
+from ..mock_tensor import MockTensor, TensorLabel
 from ..hardware import DataType
 from ..roofline import (
     elementwise_roofline,
@@ -622,11 +622,25 @@ def _ring_attention_estimates(
 
     The three are one op (their own fusion): the shifts and merges run under the attention.
     """
-    if roofline_ctx.cp_mode == "current":
+    current = roofline_ctx.cp_mode == "current"
+    # Working buffers, live for the pass (in the memory peak): fp32 accumulators and the incoming
+    # K/V shard (backward: also the incoming fp32 dK/dV); today's code also keeps the step output
+    # cast to fp32 (forward), and bf16 step buffers with their zero sources (backward)
+    f32 = DataType.FLOAT32
+    sizes = [(accumulator_elements, f32), (kv_bytes // query.dtype.value, query.dtype)]
+    if phase == "backward":
+        sizes.append((kv_bytes // query.dtype.value, f32))
+    if current:
+        sizes += ([(query.logical_volume(), f32)] if phase == "forward"
+                  else [(accumulator_elements, query.dtype)] * 2)
+    buffers = [MockTensor((n,), dtype, requires_grad=False, label=TensorLabel.ACTIVATION,
+                          name="ring_attention_buffer") for n, dtype in sizes]
+    if current:
         _current_ring_attention(roofline_ctx, query, key, cp_size, phase)
-        return
-    with roofline_ctx.fused(roofline_ctx.new_fusion("RingAttention")):
-        _ring_attention_parts(roofline_ctx, query, key, cp_size, phase, accumulator_elements, kv_bytes)
+    else:
+        with roofline_ctx.fused(roofline_ctx.new_fusion("RingAttention")):
+            _ring_attention_parts(roofline_ctx, query, key, cp_size, phase, accumulator_elements, kv_bytes)
+    del buffers
 
 
 def _current_ring_attention(roofline_ctx, query, key, cp_size, phase) -> None:

@@ -260,11 +260,14 @@ class MockBroadcastOp(RooflineFunction):
         ctx.save_for_backward(tensor)
         ctx._num_devices = num_devices
 
-        # The output aliases the input (ttml's broadcast returns it): no new memory
-        return create_activation_tensor(
+        # The output aliases the input (ttml's broadcast returns it): no new memory. A view of a
+        # selectively recomputed tensor is recomputed with it.
+        view = create_activation_tensor(
             tensor.shape, tensor.dtype, tensor.layout,
             num_shards=tensor.num_shards, track=False,
         )
+        view.recomputed = tensor.recomputed
+        return view
 
     @staticmethod
     def backward(
