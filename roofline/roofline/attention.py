@@ -369,10 +369,11 @@ def fused_attention_roofline(
     phase: str = "forward",
     tile_height: int = 32,
     tile_width: int = 32,
-    bwd_kv_block: Optional[int] = None,
+    block: Optional[int] = None,
 ) -> "RooflineEstimate":
     """
-    Performance model for fused scaled dot-product attention (Flash Attention style).
+    Performance model for fused scaled dot-product attention (Flash Attention style), following
+    tt-train's kernels (tt-train/sources/ttml/metal/ops/sdpa_fw, sdpa_bw).
 
     Fused SDPA computes: softmax(Q @ K^T / sqrt(d_k)) @ V in a single kernel
     using online softmax and tiling to avoid materializing the full attention matrix.
@@ -382,20 +383,27 @@ def fused_attention_roofline(
     - Compute: Same total FLOPs, but better memory access patterns
     - Backward: Uses recomputation instead of reading saved attention weights
 
-    Forward:
-        - Matmul FLOPs: 4 * B * H * S*S * d (QK^T and AV)
-        - SFPU FLOPs: ~6 * B * H * S*S (scale + softmax)
-        - Memory: Only reads Q, K, V and writes output (no intermediate S×S matrix)
+    Causal attention; tiles above the diagonal are skipped, so the visited volume per head is
+    M = S * (S + tile) / 2 (diagonal tiles are computed in full). With a block of Bt tokens kept on
+    chip, the opposite operands are re-read once per block: about S / Bt times, causal-halved.
 
-    Backward:
-        - Matmul FLOPs: 10 * B * H * S*S * d (recomputes QK^T plus gradient matmuls)
-        - SFPU FLOPs: ~12 * B * H * S*S (recompute softmax + backward)
-        - Memory: Reads Q, K, V, O, dO; writes dQ, dK, dV
+    Forward (one kernel, Q-block outer, per Q head):
+        - FLOPs: QK^T and PV, 4 * B * Hq * M * d, plus softmax on the SFPU
+        - DRAM: Q read once; K and V re-read per Q block per Q head; O written; the log-sum-exp
+          statistic written as one fp32 32-wide tile per 32 rows
+    Backward (two kernels, run one after the other):
+        - Q kernel (Q-block outer, per Q head): Q, O, dO and the statistic read once, u = rowsum(dO * O)
+          computed in it and written as an fp32 tile; K and V re-read per Q block; dQ accumulated on
+          chip and written once. FLOPs: QK^T, dO V^T, dS K = 6 * B * Hq * M * d
+        - KV kernel (K/V-block outer, per KV head, over the g Q heads of the group): K and V read once;
+          Q, dO and the two fp32 statistic tiles re-read per K/V block per Q head; dK and dV accumulated
+          on chip and written once. FLOPs: QK^T, dO V^T, P^T dO, dS^T Q = 8 * B * Hq * M * d
+        - Total matmul FLOPs 14 * B * Hq * M * d (FlashAttention-2 recomputes less: 10)
 
     Args:
         hw: Hardware specification
         batch_size: Batch size
-        num_heads: Number of attention heads
+        num_q_heads, num_kv_heads: query and key/value heads
         seq_len: Sequence length
         head_dim: Dimension per head
         dtype: Data type for operands
@@ -403,9 +411,8 @@ def fused_attention_roofline(
         num_cores: Number of cores to use (default: all)
         operation: Base name for the operation
         phase: "forward" or "backward"
-        bwd_kv_block: Backward only. Number of K/V tokens kept on chip per pass. Q, O, dO and dQ
-            are streamed from DRAM once per K/V block, so their traffic scales with S / bwd_kv_block.
-            None (default) = one tile (tile_width tokens), the current kernel.
+        block: tokens kept on chip per block (forward and Q-kernel Q block, KV-kernel K/V block).
+            None (default) = one tile (tile_height tokens), today's kernels.
 
     Returns:
         Single RooflineEstimate for the fused operation
@@ -424,102 +431,36 @@ def fused_attention_roofline(
     Hkv = num_kv_heads
     S = seq_len
     d = head_dim
-    g = Hq // Hkv # number of groups per head
-    bytes_per_elem = dtype.value
-    Tr = S / tile_height
-    Tc = S / tile_width
-    reuse_perc = 0.0 # no reuse of k and v in the same group
-    causal_optimization = True # if True, we only read and compute under the diagonal of the attention matrix
+    bpe = dtype.value
+    Bt = block if block else tile_height
     flops_per_exp = 5
-    rescale_chance = 1.0 # how often we have to update scores and recompute softmax
-    reuse_factor = 1 + (g - 1) * (1 - reuse_perc)
-    M = S * S if not causal_optimization else S * (S + 1) // 2 # attention effective volume
+    M = S * (S + tile_height) / 2  # causal volume visited per head, tile granularity
+    # Opposite operand re-read once per block: sum over blocks i of (i + 1) * Bt rows
+    rows_reread = (S / Bt) * (S + Bt) / 2
+    stat_bytes_per_row = 32 * 4  # one fp32 tile (32 wide) per 32 rows
+    row = d * bpe  # bytes of one row of Q, K, V, O, dO, dQ
 
     if phase == "forward":
-        # Matmul FLOPs: QK^T (2*S*S*d) + AV (2*S*S*d) = 4*S*S*d per q head per batch
-        matmul_flops = 4 * B * Hq * M * d 
+        matmul_flops = 4 * B * Hq * M * d
+        sfpu_flops = (flops_per_exp + 5) * B * Hq * M + (flops_per_exp + d + 2) * B * Hq * S * (S / Bt)
 
-        # SFPU FLOPs: scale (S*S) + softmax (~(e+4)*S*S: exp (e), max (1), sub(1), sum(1), div(1)) = ~(e+5)*S*S per q head per batch
-        base_sfpu_flops = (flops_per_exp + 5) * B * Hq * M
-        rescale_sfpu_flops = (flops_per_exp + d + 2) * B * Hq * S * Tc * rescale_chance
-        sfpu_flops = base_sfpu_flops + rescale_sfpu_flops
-
-        # matmul_flops = 0
-        # sfpu_flops = 0
-        total_flops = matmul_flops + sfpu_flops
-
-        # We read Q only once
-        Rq = B * Hq * S * d * bytes_per_elem
-
-        # We reread K and V N / tile size times
-        # Also, depending on the implementation, we might reuse same k and v for the whole group or not
-        Rk = B * Hkv * Tr * d * bytes_per_elem * reuse_factor
-        Rv = B * Hkv * Tr * d * bytes_per_elem * reuse_factor
-
-        # Total memory read: Q, K, V
-        Rdram = Rq + Rk + Rv if not causal_optimization else Rq + 1/2 * (Rk + Rv)
-
-        Wo = B * Hq * S * d * bytes_per_elem
-        #   - max values per row: B * H * S
-        #   - sum(exp-max) per row: B * H * S
-        intermediate_bytes = 2 * B * Hq * S * bytes_per_elem  # max and sum values
-        Wdram = Wo + intermediate_bytes
-    
-        total_bytes = int(Rdram + Wdram)
+        reads = B * Hq * S * row + 2 * B * Hq * rows_reread * row  # Q once; K and V per Q block
+        writes = B * Hq * S * row + B * Hq * S * stat_bytes_per_row  # O, log-sum-exp
+        total_bytes = int(reads + writes)
 
     else:  # backward
-        # Backward recomputes attention on-the-fly (Flash Attention style)
-        # Matmul FLOPs:
-        #   - recompute QK^T: 2*S*S*d
-        #   - grad_V = Attn^T @ dO: 2*S*S*d
-        #   - grad_Attn = dO @ V^T: 2*S*S*d
-        #   - grad_Q = grad_scores @ K: 2*S*S*d
-        #   - grad_K = grad_scores^T @ Q: 2*S*S*d
-        # Total matmul: 10*S*S*d per head per batch
-        matmul_flops = B * Hq * 10 * S * S * d
+        matmul_flops = 14 * B * Hq * M * d
+        sfpu_flops = 2 * B * Hq * (M * (flops_per_exp + 4) + S * (2 * d - 1))  # softmax recomputed in both kernels
 
-        # TODO: elaborate
-        sfpu_flops = B * Hq * (M * (flops_per_exp + 4) + S * (2 * d  - 1))
+        # Q kernel
+        q_reads = 3 * B * Hq * S * row + B * Hq * S * stat_bytes_per_row + 2 * B * Hq * rows_reread * row
+        q_writes = B * Hq * S * row + B * Hq * S * stat_bytes_per_row  # dQ, u
+        # KV kernel
+        kv_reads = 2 * B * Hkv * S * row + B * Hq * rows_reread * (2 * row + 2 * stat_bytes_per_row)
+        kv_writes = 2 * B * Hkv * S * row  # dK, dV
+        total_bytes = int(q_reads + q_writes + kv_reads + kv_writes)
 
-        total_flops = matmul_flops + sfpu_flops
-
-        # Memory: Read Q, K, V, O, dO + intermediate values; Write dQ, dK, dV
-        # Reads intermediate values saved from forward:
-        #   - max values per row: B * H * S
-        #   - sum(exp-max) per row: B * H * S
-
-        # D reads and write (D = dO * O)
-        Rd = 2 * B * Hq * S * d * bytes_per_elem
-        Wd = B * Hq * S * d * bytes_per_elem
-
-        # Q, O, dO, the softmax statistics and dQ are streamed once per K/V block
-        Tc_bwd = max(S / bwd_kv_block, 1.0) if bwd_kv_block else Tc
-
-        # Read Q, O, dO
-        Rq = B * Hq * Tc_bwd * S * d * bytes_per_elem
-        Ro = B * Hq * Tc_bwd * S * d * bytes_per_elem
-        Rdo = B * Hq * Tc_bwd * S * d * bytes_per_elem
-
-        # Read intermediates
-        Rl = B * Hq * Tc_bwd * S * bytes_per_elem
-        Rd = B * Hq * Tc_bwd * S * bytes_per_elem
-
-        # dQ read/modify/write
-        Rdq = B * Hq * Tc_bwd * S * d * bytes_per_elem
-        Wdq = B * Hq * Tc_bwd * S * d * bytes_per_elem
-
-        # K/V streaming
-        Rk = B * Hkv * S * d * bytes_per_elem * reuse_factor
-        Rv = B * Hkv * S * d * bytes_per_elem * reuse_factor
-
-        # Writes for dK, dV
-        Wdk = B * Hkv * S * d * bytes_per_elem
-        Wdv = B * Hkv * S * d * bytes_per_elem
-
-        Rdram = Rd + Rq + Ro + Rdo + Rl + Rd + Rdq + Rk + Rv
-        Wdram = Wd + Wdq + Wdk + Wdv
-
-        total_bytes = int(Rdram + Wdram)
+    total_flops = int(matmul_flops + sfpu_flops)
 
     # Compute time: split between FPU (matmul) and SFPU (scale, softmax)
     fpu_mm_ops_per_cycle = fpu_mm_flops_per_core_per_cycle(fidelity)

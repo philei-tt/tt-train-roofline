@@ -56,8 +56,9 @@ def create_activation_tensor(
     requires_grad: bool = True,
     name: Optional[str] = None,
     num_shards: Optional[Tuple[int, ...]] = None,
+    track: bool = True,
 ) -> MockTensor:
-    """Create an activation tensor with proper ACTIVATION label.
+    """Create an activation tensor with proper ACTIVATION label (track=False: a view, no memory).
 
     Args:
         shape: Tensor shape
@@ -78,6 +79,7 @@ def create_activation_tensor(
         label=TensorLabel.ACTIVATION,
         name=name,
         num_shards=num_shards,
+        track=track,
     )
 
 
@@ -239,7 +241,7 @@ class RooflineFunction:
 
         # Create backward closure factory
         def make_backward_closure(
-            bwd_ctx, bwd_roofline_ctx, bwd_outputs, bwd_inputs, bwd_cls
+            bwd_ctx, bwd_roofline_ctx, bwd_outputs, bwd_inputs, bwd_all_inputs, bwd_cls
         ):
             def backward_fn(ctx_for_bwd: "RooflineContext"):
                 # Import here to avoid circular dependency
@@ -281,9 +283,14 @@ class RooflineFunction:
                 elif not isinstance(grad_inputs, tuple):
                     grad_inputs = (grad_inputs,)
 
+                # Pair gradients with inputs: backward returns one entry per forward input
+                # (None where there is none); a tuple with one entry per input that needs a
+                # gradient is also accepted
+                targets = bwd_all_inputs if len(grad_inputs) == len(bwd_all_inputs) else bwd_inputs
+
                 # Accumulate gradients to input tensors
-                for tensor, grad in zip(bwd_inputs, grad_inputs):
-                    if grad is not None and tensor.requires_grad:
+                for tensor, grad in zip(targets, grad_inputs):
+                    if grad is not None and isinstance(tensor, MockTensor) and tensor.requires_grad:
                         # If tensor already has a gradient, add roofline estimate for accumulation
                         if tensor.is_grad_initialized():
                             num_elements = tensor.logical_volume()
@@ -309,7 +316,7 @@ class RooflineFunction:
 
         # Create backward closure
         backward_fn = make_backward_closure(
-            ctx, roofline_ctx, outputs_tuple, input_tensors, cls
+            ctx, roofline_ctx, outputs_tuple, input_tensors, list(inputs), cls
         )
 
         # Set node on outputs (similar to ttml's multi-output handling)

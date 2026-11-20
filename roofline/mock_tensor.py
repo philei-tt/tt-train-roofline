@@ -90,6 +90,7 @@ class MockTensor:
         label: Optional[TensorLabel] = None,
         name: Optional[str] = None,
         num_shards: Optional[Tuple[int, ...]] = None,
+        track: bool = True,
     ):
         """Initialize a MockTensor.
 
@@ -102,6 +103,7 @@ class MockTensor:
             name: Optional name for tracking (default: None)
             num_shards: Per-dimension shard counts, same length as shape (default: all 1s).
                 num_shards[i] is the number of devices over which dimension i is sharded.
+            track: count the tensor in the memory tracker (False for views that alias another tensor)
         """
         self.shape = tuple(shape)
         ndim = len(self.shape)
@@ -125,7 +127,7 @@ class MockTensor:
 
         # Track allocation with global tracker
         self._tracked = False
-        if _global_memory_tracker is not None:
+        if track and _global_memory_tracker is not None:
             _global_memory_tracker.track_allocation(self)
             self._tracked = True
 

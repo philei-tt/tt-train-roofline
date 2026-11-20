@@ -78,6 +78,8 @@ class HardwareSpec:
     # Defaults at end
     mul_adds_per_cycle: int = 4096  # 8x16 × 16x16 matrix engine
     chips_per_galaxy: int = 1
+    # Selects the measured per-call CCL latency (roofline/ccl.py)
+    arch: Literal["wormhole", "blackhole"] = "wormhole"
 
     @property
     def sram_mb_per_chip(self) -> float:
@@ -185,6 +187,7 @@ BLACKHOLE_P100 = HardwareSpec(
     topology="linear",
     num_links=1,
     chips_per_galaxy=1,
+    arch="blackhole",
 )
 
 BLACKHOLE_P150 = HardwareSpec(
@@ -200,6 +203,7 @@ BLACKHOLE_P150 = HardwareSpec(
     topology="linear",
     num_links=1,
     chips_per_galaxy=1,
+    arch="blackhole",
 )
 
 BLACKHOLE_GALAXY = HardwareSpec(
@@ -215,6 +219,7 @@ BLACKHOLE_GALAXY = HardwareSpec(
     topology="linear",
     num_links=1,
     chips_per_galaxy=32,
+    arch="blackhole",
 )
 
 BLACKHOLE_QUAD = replace(

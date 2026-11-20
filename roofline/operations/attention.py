@@ -532,6 +532,7 @@ class MockScaledDotProductAttentionFusedOp(RooflineFunction):
             dtype=query.dtype,
             operation="FusedSDPA",
             phase="forward",
+            block=roofline_ctx.attn_block,
         )
         roofline_ctx.add_perf_result(estimate)
 
@@ -577,7 +578,7 @@ class MockScaledDotProductAttentionFusedOp(RooflineFunction):
             dtype=query.dtype,
             operation="FusedSDPA",
             phase="backward",
-            bwd_kv_block=roofline_ctx.attn_bwd_kv_block,
+            block=roofline_ctx.attn_block,
         )
         roofline_ctx.add_perf_result(estimate)
 
@@ -614,7 +615,7 @@ def _ring_attention_estimates(
     full = fused_attention_roofline(
         roofline_ctx.hw, batch_size, num_q_heads, key.shape[1], local_seq * cp_size, head_dim,
         dtype=query.dtype, operation="RingAttention", phase=phase,
-        bwd_kv_block=roofline_ctx.attn_bwd_kv_block if phase == "backward" else None,
+        block=roofline_ctx.attn_block,
     )
     roofline_ctx.add_perf_result(dataclasses.replace(
         full,

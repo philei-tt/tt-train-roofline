@@ -17,9 +17,9 @@ schedule is then played out with each device's own forward and backward time; se
 
 Examples (from the repository root):
     python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \\
-        --pp 16 --tp 2 --cp 4 --recompute --attn-bwd-kv-block 512
+        --pp 16 --tp 2 --cp 4 --recompute --attn-block 512
     python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \\
-        --sweep 128 --sp --attn-bwd-kv-block 512
+        --sweep 128 --sp --attn-block 512
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from roofline import (
     DataType,
     MathFidelity,
     MockAdamW,
-    MockCrossEntropyLossOp,
+    MockVocabParallelCrossEntropyLossOp,
     MockDistributedLlama,
     MockTensor,
     RooflineContext,
@@ -44,6 +44,7 @@ from roofline import (
     mock_clip_grad_norm,
     send_recv_roofline,
 )
+from roofline.operations.operation import create_grad_tensor
 from roofline.examples.training import MODEL_PRESETS, ModelType, distributed_llama_config
 from roofline.training.distributed import synchronize_gradients
 from roofline.training.pipeline import make_schedule, simulate_schedule
@@ -70,7 +71,7 @@ class StageCost:
     opt_serial_ms: float
     sync_fabric_ms: float  # CP gradient all-reduce, once per step
     sync_serial_ms: float
-    activation_bytes: int  # held from forward to backward, one micro-batch
+    activation_bytes: int  # held from forward to backward by the blocks, one micro-batch (excl. LM head)
     state_bytes: int  # parameters + gradients + optimizer state
     peak_bytes: int  # peak of the whole one-micro-batch run (incl. backward transients)
     flops_per_mb: int  # one micro-batch on one device, forward + backward
@@ -80,7 +81,7 @@ class StageCost:
 
 def run_stage(
     hw, preset: dict, seq_len: int, tp: int, cp: int, pp: int, stage_index: int, stage_blocks: int,
-    sequence_parallel: bool, vocab_parallel: bool, recompute: bool, attn_bwd_kv_block: Optional[int],
+    sequence_parallel: bool, vocab_parallel: bool, recompute: bool, attn_block: Optional[int],
 ) -> StageCost:
     """Run one micro-batch (one sequence) through one pipeline stage of `stage_blocks` blocks,
     then the optimizer step."""
@@ -90,14 +91,14 @@ def run_stage(
     gc.freeze()
     try:
         return _run_stage(hw, preset, seq_len, tp, cp, pp, stage_index, stage_blocks, sequence_parallel,
-                          vocab_parallel, recompute, attn_bwd_kv_block)
+                          vocab_parallel, recompute, attn_block)
     finally:
         gc.unfreeze()
 
 
 def _run_stage(hw, preset, seq_len, tp, cp, pp, stage_index, stage_blocks, sequence_parallel, vocab_parallel,
-               recompute, attn_bwd_kv_block) -> StageCost:
-    ctx = RooflineContext(hw, attn_bwd_kv_block=attn_bwd_kv_block)
+               recompute, attn_block) -> StageCost:
+    ctx = RooflineContext(hw, attn_block=attn_block)
     config = distributed_llama_config(
         preset, tp_size=tp, cp_size=cp, sequence_parallel=sequence_parallel,
         num_stages=pp, stage_index=stage_index, stage_num_blocks=stage_blocks, vocab_parallel=vocab_parallel,
@@ -106,6 +107,12 @@ def _run_stage(hw, preset, seq_len, tp, cp, pp, stage_index, stage_blocks, seque
     params = stage.parameters()
     optimizer = MockAdamW(params)
     local_seq = seq_len // cp
+    # Steady state: every micro-batch after the first finds all gradients already allocated, adds
+    # into them out of place (tt-train's Tensor::add_grad) and holds them next to its activations
+    for p in params.values():
+        if p.requires_grad:
+            p.add_grad(create_grad_tensor(p.shape, p.dtype, p.layout, name="accumulated_grad",
+                                          num_shards=p.num_shards))
     mem_before, _ = ctx.memory_tracker.current_memory()
 
     if stage.is_first:
@@ -115,15 +122,18 @@ def _run_stage(hw, preset, seq_len, tp, cp, pp, stage_index, stage_blocks, seque
         rows = local_seq // (tp if sequence_parallel else 1)
         x = MockTensor((1, 1, rows, config.embedding_dim), dtype=DataType.BFLOAT16, requires_grad=True,
                        label=TensorLabel.ACTIVATION, name="received_activation")
-    out, logits = stage.forward_stage(ctx, x)
+    out = stage.forward_blocks(ctx, x)
+    # The micro-batches held at once by the schedule hold only the blocks' activations: the LM head
+    # and loss run and free theirs within one micro-batch (they are in peak_bytes)
+    mem_after_blocks, _ = ctx.memory_tracker.current_memory()
+    logits = stage.forward_head(ctx, out)
     roots: List[MockTensor] = []
     if logits is not None:
         targets = MockTensor((1, 1, 1, local_seq), dtype=DataType.BFLOAT16, requires_grad=False,
                              label=TensorLabel.ACTIVATION, name="targets")
-        roots.append(MockCrossEntropyLossOp.apply(ctx, logits, targets))
+        roots.append(MockVocabParallelCrossEntropyLossOp.apply(ctx, logits, targets, tp))
     if not stage.is_last:
         roots.append(out)  # the gradient arrives from the next stage
-    mem_after_forward, _ = ctx.memory_tracker.current_memory()
     output_bytes = out.bytes()
 
     for root in roots:
@@ -157,7 +167,7 @@ def _run_stage(hw, preset, seq_len, tp, cp, pp, stage_index, stage_blocks, seque
         opt_serial_ms=serial_ms(OPTIMIZER_PHASES),
         sync_fabric_ms=ctx.network_time_ns(SYNC_PHASES) / 1e6,
         sync_serial_ms=serial_ms(SYNC_PHASES),
-        activation_bytes=mem_after_forward - mem_before,
+        activation_bytes=mem_after_blocks - mem_before,
         state_bytes=state_bytes,
         peak_bytes=peak_bytes,
         flops_per_mb=ctx.forward_flops() + ctx.backward_flops(),
@@ -180,7 +190,7 @@ def run_parallel_roofline(
     vocab_parallel: bool = False,
     recompute: bool = False,
     cut_links: int = 8,
-    attn_bwd_kv_block: Optional[int] = None,
+    attn_block: Optional[int] = None,
     num_links: Optional[int] = None,
     topology: Optional[str] = None,
     blocks_per_stage: Optional[Sequence[int]] = None,
@@ -202,7 +212,7 @@ def run_parallel_roofline(
         cut_links: Ethernet links (per direction) across the cut between two neighbouring stages.
             Quad (32 x 4 torus), stages laid along the 32-chip axis: one row of 4 chip pairs,
             2 links each = 8.
-        attn_bwd_kv_block: see fused_attention_roofline(bwd_kv_block)
+        attn_block: tokens per attention block, see fused_attention_roofline(block)
         num_links, topology: override the hardware's links per neighbour and topology
         blocks_per_stage: transformer blocks on each pipeline device (as tt-train's
             PipelineParallelConfig.blocks_per_rank); default an even split, the remainder on the
@@ -250,10 +260,10 @@ def run_parallel_roofline(
 
     def stage_cost(d: int, with_recompute: bool) -> StageCost:
         key = (model_name, seq_len, hardware, hw.num_links, hw.topology, pp, tp, cp, role(d), blocks[d],
-               sequence_parallel, vocab_parallel, with_recompute, attn_bwd_kv_block)
+               sequence_parallel, vocab_parallel, with_recompute, attn_block)
         if key not in cache:
             cache[key] = run_stage(hw, preset, seq_len, tp, cp, pp, role(d), blocks[d], sequence_parallel,
-                                   vocab_parallel, with_recompute, attn_bwd_kv_block)
+                                   vocab_parallel, with_recompute, attn_block)
         return cache[key]
 
     costs = [stage_cost(d, recompute) for d in range(pp)]
@@ -318,7 +328,7 @@ def run_parallel_roofline(
                    "num_links": hw.num_links, "topology": hw.topology, "chips": chips, "pp": pp, "tp": tp,
                    "cp": cp, "schedule": str(sched), "interleave": v, "sequence_parallel": sequence_parallel,
                    "vocab_parallel": vocab_parallel, "recompute": recompute, "cut_links": cut_links,
-                   "attn_bwd_kv_block": attn_bwd_kv_block, "blocks_per_stage": blocks},
+                   "attn_block": attn_block, "blocks_per_stage": blocks},
         "per_microbatch": {**D, "bound": bound, "handoff_ms": hand},
         "bubble": bubble,
         "overlapped": throughput(step_overlapped),
@@ -381,8 +391,9 @@ def main():
     parser.add_argument("--vocab-parallel", action="store_true", help="Split the LM head across stages")
     parser.add_argument("--recompute", action="store_true", help="Recompute block forward in backward")
     parser.add_argument("--cut-links", type=int, default=8, help="Links across a stage boundary (default: 8)")
-    parser.add_argument("--attn-bwd-kv-block", type=int, default=None,
-                        help="K/V tokens per pass in the attention backward (default: one 32-token tile)")
+    parser.add_argument("--attn-block", type=int, default=None,
+                        help="Tokens kept on chip per attention block, forward and backward "
+                             "(default: one 32-token tile, today's kernels)")
     parser.add_argument("--blocks-per-stage", default=None, metavar="N,N,...",
                         help="Transformer blocks on each pipeline device (default: even split, remainder first)")
     parser.add_argument("--links", type=int, default=None, help="Override links per neighbouring chip pair")
@@ -395,7 +406,7 @@ def main():
 
     common = dict(model_name=args.model, seq_len=args.seq, num_microbatches=args.microbatches,
                   hardware=args.hardware, sequence_parallel=args.sp, vocab_parallel=args.vocab_parallel,
-                  cut_links=args.cut_links, attn_bwd_kv_block=args.attn_bwd_kv_block,
+                  cut_links=args.cut_links, attn_block=args.attn_block,
                   num_links=args.links, topology=args.topology)
     if args.sweep:
         results = sweep(args.sweep, **common)

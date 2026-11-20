@@ -166,9 +166,9 @@ class RooflineContext:
     hw: HardwareSpec
     estimates: List[RooflineEstimate] = field(default_factory=list)
 
-    # Fused attention backward: K/V block (tokens) kept on chip per pass. None = one tile (32),
-    # i.e. Q, O, dO and dQ are re-read from DRAM for every 32-token K/V tile.
-    attn_bwd_kv_block: Optional[int] = None
+    # Fused attention: tokens kept on chip per block (forward Q block, backward Q and K/V blocks).
+    # None = one 32-token tile, today's tt-train kernels; see fused_attention_roofline(block).
+    attn_block: Optional[int] = None
 
     # Memory tracker for detailed allocation tracking
     memory_tracker: Optional[MemoryTracker] = field(default=None)

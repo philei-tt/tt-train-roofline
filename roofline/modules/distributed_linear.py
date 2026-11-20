@@ -95,13 +95,18 @@ class MockColumnParallelLinear(MockModule):
         else:
             self.bias = None
 
-    def forward(self, ctx: "RooflineContext", x: MockTensor) -> MockTensor:
+    def gather_input(self, ctx: "RooflineContext", x: MockTensor) -> MockTensor:
+        """The input this layer multiplies: with SP the all-gathered sequence (reduce-scatter in
+        backward), else a broadcast (noop in forward, all-reduce in backward)."""
         if self.sequence_parallel and self.tp_size > 1:
-            # All-gather the sequence shards: all-gather in forward, reduce-scatter in backward
-            x = MockAllGatherOp.apply(ctx, x, SEQ_DIM, self.tp_size)
-        else:
-            # Broadcast: noop in forward, all-reduce in backward
-            x = MockBroadcastOp.apply(ctx, x, self.tp_size)
+            return MockAllGatherOp.apply(ctx, x, SEQ_DIM, self.tp_size)
+        return MockBroadcastOp.apply(ctx, x, self.tp_size)
+
+    def forward(self, ctx: "RooflineContext", x: MockTensor, input_gathered: bool = False) -> MockTensor:
+        """input_gathered: x is already gather_input's output, shared with another column-parallel
+        layer reading the same tensor (one all-gather, one reduce-scatter for both)."""
+        if not input_gathered:
+            x = self.gather_input(ctx, x)
 
         bias_tensor = self.bias.tensor if self.bias is not None else None
         x = MockLinearOp.apply(ctx, x, self.weight.tensor, bias_tensor)

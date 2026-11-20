@@ -120,8 +120,14 @@ class MockDistributedGroupedQueryAttention(MockModule):
         x: MockTensor,
         mask: Optional[MockTensor] = None,
     ) -> MockTensor:
-        q = self.q_linear(ctx, x)
-        kv = self.kv_linear(ctx, x)
+        if self.q_linear.sequence_parallel:
+            # Sequence parallelism: gather the norm output once for both projections (Megatron)
+            x = self.q_linear.gather_input(ctx, x)
+            q = self.q_linear(ctx, x, input_gathered=True)
+            kv = self.kv_linear(ctx, x, input_gathered=True)
+        else:
+            q = self.q_linear(ctx, x)
+            kv = self.kv_linear(ctx, x)
 
         query, key, value = MockGroupedHeadsCreationOp.apply(
             ctx, q, kv, self.num_local_heads, self.num_local_groups

@@ -30,7 +30,7 @@ from .attention import (
     MockRingAttentionOp,
 )
 from .rope import MockRoPEOp
-from .cross_entropy import MockCrossEntropyLossOp
+from .cross_entropy import MockCrossEntropyLossOp, MockVocabParallelCrossEntropyLossOp
 from .swiglu_fused import MockSwiGLUFusedOp, SwiGLUFusedImpl
 from .comm_ops import (
     MockAllReduceOp,
@@ -73,6 +73,7 @@ __all__ = [
     "MockRoPEOp",
     # Loss
     "MockCrossEntropyLossOp",
+    "MockVocabParallelCrossEntropyLossOp",
     # Fused SwiGLU
     "MockSwiGLUFusedOp",
     "SwiGLUFusedImpl",

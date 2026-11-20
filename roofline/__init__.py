@@ -197,6 +197,7 @@ from .operations import (
     MockRoPEOp,
     # Loss
     MockCrossEntropyLossOp,
+    MockVocabParallelCrossEntropyLossOp,
     # CCL operations
     MockAllReduceOp,
     MockReduceScatterOp,
@@ -317,6 +318,7 @@ __all__ = [
     "MockRingAttentionOp",
     "MockRoPEOp",
     "MockCrossEntropyLossOp",
+    "MockVocabParallelCrossEntropyLossOp",
     # CCL operations
     "MockAllReduceOp",
     "MockReduceScatterOp",

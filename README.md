@@ -196,11 +196,11 @@ python3 -m roofline.examples.matmuls
 ```bash
 # One configuration: Llama 70B, 8K sequences, 2048 sequences per step, on a quad galaxy (128 chips)
 python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \
-    --pp 16 --tp 2 --cp 4 --recompute --vocab-parallel --attn-bwd-kv-block 512
+    --pp 16 --tp 2 --cp 4 --recompute --vocab-parallel --attn-block 512
 
 # Every PP x TP x CP split of 128 chips, best ones that fit in memory
 python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \
-    --sweep 128 --sp --vocab-parallel --attn-bwd-kv-block 512
+    --sweep 128 --sp --vocab-parallel --attn-block 512
 
 # Uneven layer split (as tt-train's PipelineParallelConfig.blocks_per_rank): fewer blocks on the LM-head stage
 python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \
@@ -239,16 +239,17 @@ Supporting changes:
 
 | Where | What |
 |---|---|
-| `RooflineEstimate.ideal_network_ns` | Collectives put their time on the fabric instead of DRAM; `theoretical_time_ns = max(compute, memory, network)`, so existing totals are unchanged |
+| `RooflineEstimate.ideal_network_ns`, `roofline/roofline/ccl.py` | Collectives put their link time and a fixed per-call latency (fitted to measured ttnn collectives, tt-metal `tech_reports/CCLs/CCL_bandwidth.md`) on the fabric, and their input read and output write on DRAM; `theoretical_time_ns = max(compute, memory, network)` |
 | `RooflineContext.compute_time_ns / dram_time_ns / network_time_ns / overlapped_time_ns` | Per-resource sums and their max |
-| `fused_attention_roofline(..., bwd_kv_block)`, `RooflineContext.attn_bwd_kv_block` | Backward re-reads Q, O, dO and dQ once per K/V block; default one 32-token tile (current kernel). 512 makes the backward compute-bound |
+| `fused_attention_roofline(..., block)`, `RooflineContext.attn_block` (`--attn-block`) | Follows tt-train's `sdpa_fw` and split `sdpa_bw` (Q and KV kernels): causal, K/V re-read per Q block in the forward and the Q kernel, Q, dO and the fp32 statistics re-read per K/V block in the KV kernel; backward matmul FLOPs 14 · B · Hq · M · d. Default block: one 32-token tile, today's kernels; 512 makes attention compute-bound |
 | `ring_shift_roofline`, `send_recv_roofline` | CP ring shifts (both ring directions) and stage hand-offs over the links across a stage cut |
 | `MockRingAttentionOp`, `cp_size` on the distributed block | Ring attention: attention of the full sequence divided by `cp`, K/V (bf16) shifts forward, K/V + dK/dV (fp32) backward, fp32 accumulator read + write per ring step |
 | `sequence_parallel` on the parallel linears, attention, MLP, block and `MockDistributedLlamaConfig` | All-gather / reduce-scatter along the sequence instead of broadcast / all-reduce; norms and residual adds hold `S / tp` tokens |
 | `num_stages`, `stage_index`, `stage_num_blocks`, `vocab_parallel` on `MockDistributedLlamaConfig`; `training/pipeline.py` | The model as one pipeline stage (`forward_stage`); schedule classes (`NaiveSchedule`, `GPipeSchedule`, `OneFOneBSchedule`, `InterleavedOneFOneBSchedule`) and a schedule simulator |
+| Embedding, LM head, gradients | Embedding untilizes its whole table each forward and returns a dense table gradient (tt-train `embedding_op`); LM head keeps logits sharded over the vocabulary with `MockVocabParallelCrossEntropyLossOp` (tt-train `vocab_parallel_cross_entropy_loss`); each stage run starts with every gradient allocated, as after the first micro-batch, so the out-of-place gradient add and the resident gradients are in the step time and the memory peak; the micro-batches held at once count only the blocks' activations |
 | `BLACKHOLE_QUAD`, `HARDWARE_PRESETS` | 4 galaxies, 128 chips, 32 x 4 torus, 2 links per neighbouring chip pair; one name-to-spec map used by both examples (`--hardware bh_quad`) |
 
-Limitations: TP must divide the number of KV heads (as in tt-train). With `--sp` each column-parallel linear keeps its all-gathered input for backward (Megatron keeps the shard and re-gathers), so memory is higher than Megatron's. The communication of vocabulary parallelism is not modelled. `--cut-links` (default 8) assumes stages laid along the 32-chip axis of a quad.
+Limitations: TP must divide the number of KV heads (as in tt-train). With `--sp` the attention and MLP gather the norm output once and keep the gathered copy for backward (Megatron keeps the shard and re-gathers), so memory is higher than Megatron's. The communication of vocabulary parallelism is not modelled. `--cut-links` (default 8) assumes stages laid along the 32-chip axis of a quad.
 
 ## Dependencies
 

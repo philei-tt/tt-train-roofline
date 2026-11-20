@@ -260,9 +260,10 @@ class MockBroadcastOp(RooflineFunction):
         ctx.save_for_backward(tensor)
         ctx._num_devices = num_devices
 
+        # The output aliases the input (ttml's broadcast returns it): no new memory
         return create_activation_tensor(
             tensor.shape, tensor.dtype, tensor.layout,
-            num_shards=tensor.num_shards,
+            num_shards=tensor.num_shards, track=False,
         )
 
     @staticmethod

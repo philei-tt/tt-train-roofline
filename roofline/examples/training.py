@@ -213,13 +213,13 @@ MODEL_PRESETS: Dict[str, dict] = {
     },
     "llama-8b": {
         "model_type": ModelType.LLAMA,
-        "vocab_size": 32000,
+        "vocab_size": 128256,
         "max_sequence_length": 131072,
         "embedding_dim": 4096,
         "intermediate_dim": 14336,
         "num_heads": 32,
         "num_groups": 8,  # GQA with 8 KV heads (32/8 = 4 queries per KV)
-        "num_blocks": 8,
+        "num_blocks": 32,
         "dropout": 0.0,
         "theta": 500000.0,
         "weight_tying": False,
@@ -542,6 +542,7 @@ def run_model_roofline(
         MockAdamW,
         mock_clip_grad_norm,
         MockCrossEntropyLossOp,
+        MockVocabParallelCrossEntropyLossOp,
         TensorLabel,
     )
     from roofline.training.distributed import shard_batch, synchronize_gradients
@@ -750,7 +751,11 @@ def run_model_roofline(
     logits = model(ctx, indices)
 
     # Compute loss
-    loss = MockCrossEntropyLossOp.apply(ctx, logits, targets)
+    if isinstance(model, MockDistributedLlama):
+        # logits are sharded over the vocabulary across the TP devices (as tt-train)
+        loss = MockVocabParallelCrossEntropyLossOp.apply(ctx, logits, targets, model.config.tp_size)
+    else:
+        loss = MockCrossEntropyLossOp.apply(ctx, logits, targets)
 
     # Snapshot after forward pass
     print_memory_snapshot("AFTER_FORWARD_PASS")

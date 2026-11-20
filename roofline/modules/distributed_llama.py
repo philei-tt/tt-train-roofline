@@ -62,7 +62,8 @@ class MockDistributedLlama(MockModule):
     - tok_emb: same as Llama (replicated); first pipeline stage only
     - blocks: MockDistributedLlamaBlock (col/row linear inside)
     - ln_fc: RMSNorm (replicated); stages holding the LM head only
-    - fc: ColumnParallelLinear(embedding_dim, vocab_size, gather_output=True)
+    - fc: ColumnParallelLinear(embedding_dim, vocab_size, gather_output=False): logits stay sharded
+      over the vocabulary for MockVocabParallelCrossEntropyLossOp (as tt-train)
     """
 
     def __init__(
@@ -128,7 +129,7 @@ class MockDistributedLlama(MockModule):
                 config.embedding_dim,
                 head_vocab,
                 has_bias=False,
-                gather_output=True,
+                gather_output=False,
                 tp_size=tp_size,
                 dtype=dtype,
                 sequence_parallel=config.sequence_parallel,
@@ -144,6 +145,16 @@ class MockDistributedLlama(MockModule):
 
         Returns (activation sent to the next stage, logits or None).
         """
+        out = self.forward_blocks(ctx, x, mask)
+        return out, self.forward_head(ctx, out)
+
+    def forward_blocks(
+        self,
+        ctx: "RooflineContext",
+        x: MockTensor,
+        mask: Optional[MockTensor] = None,
+    ) -> MockTensor:
+        """Embedding (first stage) and this stage's blocks: the activation sent to the next stage."""
         out = x
         if self.tok_emb is not None:
             out = self.tok_emb(ctx, x)
@@ -154,8 +165,12 @@ class MockDistributedLlama(MockModule):
                 out = memory_efficient_runner(block, ctx, out, mask)
             else:
                 out = block(ctx, out, mask)
+        return out
+
+    def forward_head(self, ctx: "RooflineContext", out: MockTensor) -> Optional[MockTensor]:
+        """Final norm and LM head (shard) on the stages that hold it: the logits, else None."""
         if not self.has_head:
-            return out, None
+            return None
         head_in = out
         if not self.is_last:
             # Vocabulary parallelism: the last stage's final hidden state, broadcast to every
@@ -164,7 +179,7 @@ class MockDistributedLlama(MockModule):
                 out.shape, out.dtype, out.layout, requires_grad=True,
                 label=out.label, name="final_hidden", num_shards=out.num_shards,
             )
-        return out, self.fc(ctx, self.ln_fc(ctx, head_in))
+        return self.fc(ctx, self.ln_fc(ctx, head_in))
 
     def forward(
         self,
