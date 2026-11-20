@@ -18,23 +18,14 @@ activations a device holds at once:
 
 `simulate_schedule` plays any order out op by op on a common clock and checks these.
 
-Two options apply on top of a schedule (`make_schedule(..., pairing=, wgrad_deferral=)`); with
-either one the bubble and the activations held come from `simulate_schedule` with each pass's
-resource times. A pass takes the largest of its FLOP, DRAM and fabric time:
-
-- pairing: each steady-state forward and backward (two different micro-batches) run as one
-  unit that takes the largest of their summed resources, so one pass's DRAM or fabric time
-  runs under the other's compute (DeepSeek-V3's DualPipe overlaps "a pair of individual forward
-  and backward chunks", DeepSeek-AI, 2024). 1F1B and interleaved 1F1B only. A pair hands both
-  outputs on when it ends, so a micro-batch crosses one device per pair in each direction; to keep every device busy,
-  the warm-up has to shrink by two forwards per device and the last device needs one, as
-  interleaved 1F1B's already does (+1 forward). For 1F1B that is 2 (P - d - 1) + 1 warm-up
-  forwards instead of P - d - 1: nearly twice the activations on device 0.
-- wgrad_deferral: the backward is split into the input gradient (B) and the weight gradient
-  (W), and W runs later, in gaps it fits in (Zero Bubble Pipeline Parallelism, Qi et al., 2024).
-  Between B and W a micro-batch keeps only the weight gradients' operands. No device may hold
-  more activations than device 0 does without deferral (ZB-H1's limit): later devices, which
-  hold fewer in 1F1B, hold up to that many; on 1F1B this gives ZB-H1's bubble, (P - 1)(F + B - W).
+With `make_schedule(..., wgrad_deferral=True)` the backward is split into the input gradient (B)
+and the weight gradient (W), and W runs later, in gaps it fits in (Zero Bubble Pipeline
+Parallelism, Qi et al., 2024). Between B and W a micro-batch keeps only the weight gradients'
+operands. No device may hold more activations than device 0 does without deferral (ZB-H1's
+limit): later devices, which hold fewer in 1F1B, hold up to that many; on 1F1B this gives ZB-H1's
+bubble, (P - 1)(F + B - W). The bubble and the activations held then come from
+`simulate_schedule` with each pass's resource times; a pass takes the largest of its FLOP, DRAM
+and fabric time.
 """
 
 from __future__ import annotations
@@ -97,16 +88,11 @@ class PipelineSchedule:
 
     name = "base"
     interleave = 1  # model chunks per device
-    pairing = False  # run adjacent forward / backward ops of two micro-batches as one unit
     wgrad_deferral = False  # split the backward into B and W, run W in idle time
 
     def order(self, num_stages: int, num_microbatches: int) -> List[List[Op]]:
         """Ordered ops of each device."""
-        return [[op for unit in u for op in unit] for u in self.units(num_stages, num_microbatches)]
-
-    def units(self, num_stages: int, num_microbatches: int) -> List[List[Tuple[Op, ...]]]:
-        """Ordered run units of each device: one op, or a forward / backward pair with pairing."""
-        return [[(op,) for op in o] for o in self.order(num_stages, num_microbatches)]
+        raise NotImplementedError
 
     def slots(self, num_stages: int, num_microbatches: int) -> float:
         """Step length in units of T (one micro-batch's forward + backward through one stage)."""
@@ -126,8 +112,7 @@ class PipelineSchedule:
         return ""
 
     def _options(self) -> str:
-        opts = [o for o, on in (("pairing", self.pairing), ("wgrad deferral", self.wgrad_deferral)) if on]
-        return f" + {', '.join(opts)}" if opts else ""
+        return " + wgrad deferral" if self.wgrad_deferral else ""
 
     def __repr__(self) -> str:
         return self.name + self._options()
@@ -170,16 +155,15 @@ class OneFOneBSchedule(PipelineSchedule):
 
     name = "1f1b"
 
-    def units(self, num_stages, num_microbatches):
+    def order(self, num_stages, num_microbatches):
         P, m = num_stages, num_microbatches
         orders = []
         for d in range(P):
-            warmup = min(2 * (P - d - 1) + 1 if self.pairing else P - d - 1, m)
-            seq = [(("F", j, 0),) for j in range(warmup)]
+            warmup = min(P - d - 1, m)
+            seq = [("F", j, 0) for j in range(warmup)]
             for j in range(m - warmup):
-                f, b = ("F", warmup + j, 0), ("B", j, 0)
-                seq += [(f, b)] if self.pairing else [(f,), (b,)]
-            seq += [(("B", j, 0),) for j in range(m - warmup, m)]
+                seq += [("F", warmup + j, 0), ("B", j, 0)]
+            seq += [("B", j, 0) for j in range(m - warmup, m)]
             orders.append(seq)
         return orders
 
@@ -187,8 +171,6 @@ class OneFOneBSchedule(PipelineSchedule):
         return num_microbatches + num_stages - 1
 
     def peak_activations(self, num_stages, num_microbatches):
-        if self.pairing:
-            return simulate_schedule(self, num_stages, num_microbatches)[1]
         return [float(min(num_stages - d, num_microbatches)) for d in range(num_stages)]
 
 
@@ -204,18 +186,17 @@ class InterleavedOneFOneBSchedule(PipelineSchedule):
     def __init__(self, interleave: int = 2):
         self.interleave = interleave
 
-    def units(self, num_stages, num_microbatches):
+    def order(self, num_stages, num_microbatches):
         P, m, v = num_stages, num_microbatches, self.interleave
         forwards = [(g * P + j, c) for g in range(m // P) for c in range(v) for j in range(P)]
         backwards = [(j, v - 1 - c) for (j, c) in forwards]
         orders = []
         for d in range(P):
-            warmup = min((P - d - 1) * 2 + (v - 1) * P + self.pairing, m * v)
-            seq = [(("F",) + f,) for f in forwards[:warmup]]
+            warmup = min((P - d - 1) * 2 + (v - 1) * P, m * v)
+            seq = [("F",) + f for f in forwards[:warmup]]
             for k in range(m * v - warmup):
-                f, b = ("F",) + forwards[warmup + k], ("B",) + backwards[k]
-                seq += [(f, b)] if self.pairing else [(f,), (b,)]
-            seq += [(("B",) + b,) for b in backwards[m * v - warmup:]]
+                seq += [("F",) + forwards[warmup + k], ("B",) + backwards[k]]
+            seq += [("B",) + b for b in backwards[m * v - warmup:]]
             orders.append(seq)
         return orders
 
@@ -238,11 +219,10 @@ class InterleavedOneFOneBSchedule(PipelineSchedule):
         return f"interleaved(v={self.interleave})" + self._options()
 
 
-def make_schedule(name: str, interleave: int = 1, pairing: bool = False,
-                  wgrad_deferral: bool = False) -> PipelineSchedule:
+def make_schedule(name: str, interleave: int = 1, wgrad_deferral: bool = False) -> PipelineSchedule:
     """Schedule by name: naive, gpipe, 1f1b, interleaved (with interleave = v chunks per device).
 
-    pairing, wgrad_deferral: see the module docstring.
+    wgrad_deferral: see the module docstring.
     """
     if name == "interleaved":
         if interleave < 2:
@@ -253,9 +233,7 @@ def make_schedule(name: str, interleave: int = 1, pairing: bool = False,
         if name not in schedules:
             raise ValueError(f"Unknown schedule: {name}. Available: naive, gpipe, 1f1b, interleaved")
         schedule = schedules[name]()
-    if pairing and name not in ("1f1b", "interleaved"):
-        raise ValueError("pairing needs a steady state of alternating forwards and backwards: 1f1b or interleaved")
-    schedule.pairing, schedule.wgrad_deferral = pairing, wgrad_deferral
+    schedule.wgrad_deferral = wgrad_deferral
     return schedule
 
 
@@ -263,16 +241,14 @@ def simulate_schedule(
     schedule: PipelineSchedule, num_stages: int, num_microbatches: int,
     costs: StageCosts = UNIT_COSTS, wgrad_cap: Optional[Sequence[float]] = None,
 ) -> SimResult:
-    """Play a schedule out unit by unit on a common clock.
+    """Play a schedule out op by op on a common clock.
 
-    Each device runs its units in order; a unit starts when the device is free and the inputs of
-    its ops are ready (forward: the previous virtual stage's forward of the same micro-batch;
-    backward: the next virtual stage's backward, or its own forward on the last stage); its
-    outputs are ready when it ends. Hand-offs take no time beyond the fabric time in `costs`.
-    An op takes PassCost.time(), a pair the time of the two summed. With
-    wgrad deferral, a device runs its oldest pending W when the W fits before its next unit's
-    inputs are ready, or when the unit's forward would hold more than wgrad_cap[device]
-    micro-batches (default on every device: the pipeline's peak without deferral, device 0's);
+    Each device runs its ops in order; an op starts when the device is free and its input is ready
+    (forward: the previous virtual stage's forward of the same micro-batch; backward: the next
+    virtual stage's backward, or its own forward on the last stage) and takes PassCost.time().
+    Hand-offs take no time beyond the fabric time in `costs`. With wgrad deferral, a device runs
+    its oldest pending W when the W fits before its next op's input is ready, or when a forward
+    would hold more than wgrad_cap[device] micro-batches (default on every device: the pipeline's peak without deferral, device 0's);
     a backward that would itself go above the cap runs its W right after it. The rest run at
     the end.
 
@@ -298,11 +274,7 @@ def simulate_schedule(
         base.wgrad_deferral = False
         wgrad_cap = [max(simulate_schedule(base, P, m, costs).peak)] * P
 
-    def unit_time(unit) -> float:
-        passes = [f if op[0] == "F" else b for op in unit]
-        return sum(passes, PassCost()).time()
-
-    units = schedule.units(P, m)
+    orders = schedule.order(P, m)
     last = P * v - 1
     done: Dict[Tuple[str, int, int], float] = {}
     pos = [0] * P
@@ -312,19 +284,16 @@ def simulate_schedule(
     peak = [0.0] * P
     pending = [deque() for _ in range(P)]
 
-    def ready_time(d: int, unit) -> float:
-        t = free[d]
-        for kind, mb, chunk in unit:
-            stage = chunk * P + d
-            if kind == "F":
-                dep = ("F", mb, stage - 1) if stage > 0 else None
-            else:
-                dep = ("B", mb, stage + 1) if stage < last else ("F", mb, stage)
-            if dep is not None:
-                if dep not in done:
-                    return float("inf")
-                t = max(t, done[dep])
-        return t
+    def ready_time(d: int, op: Op) -> float:
+        kind, mb, chunk = op
+        stage = chunk * P + d
+        if kind == "F":
+            dep = ("F", mb, stage - 1) if stage > 0 else None
+        else:
+            dep = ("B", mb, stage + 1) if stage < last else ("F", mb, stage)
+        if dep is None:
+            return free[d]
+        return max(free[d], done[dep]) if dep in done else float("inf")
 
     def run_w(d: int) -> None:
         pending[d].popleft()
@@ -333,43 +302,40 @@ def simulate_schedule(
         live[d] -= held
 
     # A device's actions change only its own timeline and the ready times of the ops it runs,
-    # so each device can be advanced as soon as the inputs of its next unit are known.
+    # so each device can be advanced as soon as the input of its next op is known.
     progress = True
     while progress:
         progress = False
         for d in range(P):
-            while pos[d] < len(units[d]):
-                unit = units[d][pos[d]]
-                start = ready_time(d, unit)
-                n_fwd = sum(op[0] == "F" for op in unit)
-                over = split and live[d] + n_fwd / v > wgrad_cap[d] + 1e-9
+            while pos[d] < len(orders[d]):
+                kind, mb, chunk = orders[d][pos[d]]
+                start = ready_time(d, orders[d][pos[d]])
+                over = split and kind == "F" and live[d] + 1.0 / v > wgrad_cap[d] + 1e-9
                 if pending[d] and (over or free[d] + w.time() <= start + 1e-12 < float("inf")):
                     run_w(d)
                     progress = True
                     continue
                 if start == float("inf"):
-                    break  # wait until the inputs' time is known
-                dt = unit_time(unit)
+                    break  # wait until the input's time is known
+                dt = (f if kind == "F" else b).time()
                 free[d] = start + dt
                 busy[d] += dt
-                peak[d] = max(peak[d], live[d] + n_fwd / v)
-                for kind, mb, chunk in unit:
-                    done[(kind, mb, chunk * P + d)] = free[d]
-                    if kind == "F":
-                        live[d] += 1.0 / v
-                    else:
-                        live[d] += held - 1.0 / v
-                        if split:
-                            pending[d].append((mb, chunk))
-                while split and pending[d] and live[d] > wgrad_cap[d] + 1e-9:
-                    run_w(d)  # no room to defer: the W runs as part of the backward
+                done[(kind, mb, chunk * P + d)] = free[d]
+                if kind == "F":
+                    live[d] += 1.0 / v
+                else:
+                    live[d] += held - 1.0 / v
+                    if split:
+                        pending[d].append((mb, chunk))
+                    while split and pending[d] and live[d] > wgrad_cap[d] + 1e-9:
+                        run_w(d)  # no room to defer: the W runs as part of the backward
                 peak[d] = max(peak[d], live[d])
                 pos[d] += 1
                 progress = True
     for d in range(P):
         while pending[d]:
             run_w(d)
-    if any(pos[d] != len(units[d]) for d in range(P)):
+    if any(pos[d] != len(orders[d]) for d in range(P)):
         raise RuntimeError(f"{schedule} deadlocked")
     step = max(free)
     return SimResult(1.0 - sum(busy) / (P * step), peak, step)

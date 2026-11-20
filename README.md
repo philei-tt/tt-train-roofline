@@ -226,16 +226,13 @@ MFU     = model FLOPs / T_step / (chips * peak)
 
 `simulate_schedule` plays any schedule out op by op on a common clock; every closed form above matches it.
 
-Two options apply on top of `1f1b` and `interleaved` (`--wgrad-deferral` on any schedule):
+`--wgrad-deferral` (any schedule) splits the backward into the input gradient (B) and the weight gradient (W: `Linear.backward.grad_weight`, `Embedding.backward`); W runs later, in gaps it fits in (Zero Bubble Pipeline Parallelism, Qi et al., 2024). Between B and W a micro-batch keeps only the W operands (each linear's input and output gradient, `RooflineEstimate.wgrad_operand_bytes`). No device holds more than device 0 does without deferral (ZB-H1's limit); on `1f1b` this reproduces ZB-H1's bubble (P - 1)(F + B - W). With `--recompute` the W operands are the recomputed block's linear inputs, many times the checkpoint, so deferral has little memory room.
 
-- `--pairing`: in the steady state, a forward and a backward of two different micro-batches run as one unit that takes the largest of their summed FLOP, DRAM and fabric time (DualPipe's forward/backward chunk pairs, DeepSeek-V3 report, 2024). A pair hands both outputs on when it ends, so the warm-up must shrink by two forwards per device: 1F1B runs 2 (P - d - 1) + 1 warm-up forwards on device d, nearly 2P micro-batches held on device 0; interleaved 1F1B, whose warm-up already shrinks by two, runs one more.
-- `--wgrad-deferral`: the backward is split into the input gradient (B) and the weight gradient (W: `Linear.backward.grad_weight`, `Embedding.backward`); W runs later, in gaps it fits in (Zero Bubble Pipeline Parallelism, Qi et al., 2024). Between B and W a micro-batch keeps only the W operands (each linear's input and output gradient, `RooflineEstimate.wgrad_operand_bytes`). No device holds more than device 0 does without deferral (ZB-H1's limit); on `1f1b` this reproduces ZB-H1's bubble (P - 1)(F + B - W). With `--recompute` the W operands are the recomputed block's linear inputs, many times the checkpoint, so deferral has little memory room.
-
-With either option, the bubble and the activations held come from `simulate_schedule`: every device runs the slowest stage's forward, backward and weight-gradient passes, each taking the largest of its FLOP, DRAM and fabric time (stage hand-offs split evenly between forward and backward); the step is `slots * D` as above, with `slots = m / (1 - bubble)`.
+The bubble and the activations held then come from `simulate_schedule`: every device runs the slowest stage's forward, backward and weight-gradient passes, each taking the largest of its FLOP, DRAM and fabric time (stage hand-offs split evenly between forward and backward); the step is `slots * D` as above, with `slots = m / (1 - bubble)`.
 
 ```bash
 python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 64 \
-    --pp 8 --tp 4 --cp 4 --sp --attn-bwd-kv-block 512 --pairing --wgrad-deferral
+    --pp 8 --tp 4 --cp 4 --sp --attn-bwd-kv-block 512 --wgrad-deferral
 ```
 
 The per-op serial time (sum of `max(compute, DRAM, network)` over ops, as in `training.py`) is reported next to it.

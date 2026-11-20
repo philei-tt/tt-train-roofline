@@ -187,7 +187,6 @@ def run_parallel_roofline(
     cp: int = 1,
     schedule: str = "1f1b",
     interleave: int = 1,
-    pairing: bool = False,
     wgrad_deferral: bool = False,
     sequence_parallel: bool = False,
     vocab_parallel: bool = False,
@@ -208,7 +207,6 @@ def run_parallel_roofline(
         pp, tp, cp: pipeline, tensor and context parallel degrees
         schedule: pipeline schedule: "naive", "gpipe", "1f1b" or "interleaved"
         interleave: v, model chunks per pipeline device (interleaved schedule only)
-        pairing: run a forward and a backward of two micro-batches as one unit (1f1b, interleaved)
         wgrad_deferral: split the backward into input and weight gradient, run the weight
             gradient in idle time (see training/pipeline.py)
         sequence_parallel: Megatron sequence parallelism inside TP
@@ -236,7 +234,7 @@ def run_parallel_roofline(
     chips = pp * tp * cp
     L = preset["num_blocks"]
     try:
-        sched = make_schedule(schedule, interleave, pairing, wgrad_deferral)
+        sched = make_schedule(schedule, interleave, wgrad_deferral)
     except ValueError as exc:
         return {"error": str(exc)}
     schedule_error = sched.validate(pp, num_microbatches, L // pp) if pp > 1 else ""
@@ -292,12 +290,12 @@ def run_parallel_roofline(
     opt = max(max(c.opt_flop_ms, c.opt_dram_ms) for c in costs)
     link_total = max(m * p["fabric_ms"] + c.sync_fabric_ms for p, c in zip(per_stage, costs))
 
-    # Bubble and activations held: closed forms; with pairing or wgrad deferral, the schedule
+    # Bubble and activations held: closed forms; with wgrad deferral, the schedule
     # played out with the slowest stage's forward, backward and weight-gradient roofline times on
     # every device (training/pipeline.py), hand-offs split evenly between forward and backward
     bubble = sched.bubble(pp, m)
     peak_activations = sched.peak_activations(pp, m)
-    if pairing or wgrad_deferral:
+    if wgrad_deferral:
         passes = costs[per_stage.index(D)].passes
         hand_pass = PassCost(fabric=hand_per_mb / 2)
         passes = dataclasses.replace(passes, forward=passes.forward + hand_pass,
@@ -327,7 +325,7 @@ def run_parallel_roofline(
     return {
         "config": {"model": model_name, "seq_len": seq_len, "num_microbatches": m, "hardware": hw.name,
                    "num_links": hw.num_links, "topology": hw.topology, "chips": chips, "pp": pp, "tp": tp,
-                   "cp": cp, "schedule": str(sched), "interleave": v, "pairing": pairing,
+                   "cp": cp, "schedule": str(sched), "interleave": v,
                    "wgrad_deferral": wgrad_deferral, "sequence_parallel": sequence_parallel,
                    "vocab_parallel": vocab_parallel, "recompute": recompute, "cut_links": cut_links,
                    "attn_bwd_kv_block": attn_bwd_kv_block},
@@ -383,8 +381,6 @@ def main():
                         help="Pipeline schedule (default: 1f1b)")
     parser.add_argument("--interleave", type=int, default=2,
                         help="Chunks per pipeline device for --schedule interleaved (default: 2)")
-    parser.add_argument("--pairing", action="store_true",
-                        help="Run a forward and a backward of two micro-batches as one unit (1f1b, interleaved)")
     parser.add_argument("--wgrad-deferral", action="store_true",
                         help="Split the backward into input and weight gradient; run weight gradients in idle time")
     parser.add_argument("--sp", action="store_true", help="Sequence parallelism inside TP")
@@ -402,7 +398,7 @@ def main():
     args = parser.parse_args()
 
     common = dict(model_name=args.model, seq_len=args.seq, num_microbatches=args.microbatches,
-                  hardware=args.hardware, pairing=args.pairing, wgrad_deferral=args.wgrad_deferral,
+                  hardware=args.hardware, wgrad_deferral=args.wgrad_deferral,
                   sequence_parallel=args.sp, vocab_parallel=args.vocab_parallel,
                   cut_links=args.cut_links, attn_bwd_kv_block=args.attn_bwd_kv_block,
                   num_links=args.links, topology=args.topology)
@@ -410,9 +406,9 @@ def main():
         results = sweep(args.sweep, **common)
         fits = sorted((r for r in results if r["memory"]["fits"]), key=lambda r: -r["overlapped"]["tokens_per_second"])
         print(f"{len(fits)} of {len(results)} configurations fit in memory")
-        print(f"{'configuration':72s} {'tokens/s':>10s} {'MFU':>7s} {'bound':>7s} {'bubble':>7s} {'mem GB':>7s}")
+        print(f"{'configuration':64s} {'tokens/s':>10s} {'MFU':>7s} {'bound':>7s} {'bubble':>7s} {'mem GB':>7s}")
         for r in fits[: args.top]:
-            print(f"{_describe(r):72s} {r['overlapped']['tokens_per_second']:10,.0f} {r['overlapped']['mfu']:7.1%} "
+            print(f"{_describe(r):64s} {r['overlapped']['tokens_per_second']:10,.0f} {r['overlapped']['mfu']:7.1%} "
                   f"{r['per_microbatch']['bound']:>7s} {r['bubble']:7.1%} {r['memory']['peak_gb']:7.1f}")
         out = results
     else:
