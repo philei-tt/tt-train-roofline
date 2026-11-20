@@ -90,6 +90,7 @@ class MockTensor:
         label: Optional[TensorLabel] = None,
         name: Optional[str] = None,
         num_shards: Optional[Tuple[int, ...]] = None,
+        track: bool = True,
     ):
         """Initialize a MockTensor.
 
@@ -102,6 +103,7 @@ class MockTensor:
             name: Optional name for tracking (default: None)
             num_shards: Per-dimension shard counts, same length as shape (default: all 1s).
                 num_shards[i] is the number of devices over which dimension i is sharded.
+            track: count the tensor in the memory tracker (False for views that alias another tensor)
         """
         self.shape = tuple(shape)
         ndim = len(self.shape)
@@ -123,11 +125,20 @@ class MockTensor:
         self._grad: Optional[MockTensor] = None
         self._node: Optional[BackwardNode] = None
 
+        # Selective recompute: not held from forward to backward, rebuilt when a backward reads it
+        self.recomputed = False
+
         # Track allocation with global tracker
         self._tracked = False
-        if _global_memory_tracker is not None:
+        if track and _global_memory_tracker is not None:
             _global_memory_tracker.track_allocation(self)
             self._tracked = True
+
+    def untrack(self) -> None:
+        """Stop counting this tensor in the memory tracker (it is recomputed, not held)."""
+        if self._tracked and _global_memory_tracker is not None:
+            _global_memory_tracker.track_deallocation(self)
+        self._tracked = False
 
     def __del__(self):
         """Track deallocation when tensor is garbage collected."""
@@ -166,13 +177,13 @@ class MockTensor:
         """Accumulate gradient (for backward pass).
 
         In a real implementation this would add gradients together.
-        For roofline estimation, we just track the latest gradient shape.
+        For roofline estimation, we just track the latest gradient, in the accumulator's dtype.
         """
-        if self._grad is None:
-            self._grad = grad
-        else:
-            # In real impl would add, here just track latest
-            self._grad = grad
+        if self._grad is not None and self._grad.dtype != grad.dtype:
+            # the sum keeps the accumulator's dtype (fp32 gradient accumulation)
+            grad = MockTensor(grad.shape, self._grad.dtype, grad.layout, requires_grad=False,
+                              label=TensorLabel.GRADIENT, name=self._grad.name, num_shards=grad.num_shards)
+        self._grad = grad
 
     # =========================================================================
     # Size/memory calculations
@@ -349,7 +360,14 @@ def memory_efficient_runner(
             num_shards=saved_input.num_shards,
         )
 
+        # The recomputed forward is part of the backward pass
+        first = len(bwd_ctx.estimates)
         recomputed_out = block(bwd_ctx, input_detached, mask)
+        for e in bwd_ctx.estimates[first:]:
+            if e.phase == "forward":
+                e.phase = "backward"
+                if e.fusion is not None:  # its own op, not part of the layer's backward op
+                    e.fusion = f"{e.fusion}.recompute"
 
         recomputed_out._grad = saved_out._grad
 

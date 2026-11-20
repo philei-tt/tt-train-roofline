@@ -9,9 +9,9 @@ without ttml/ttnn dependencies.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Literal
+from typing import Literal, Tuple
 
 
 class MathFidelity(Enum):
@@ -41,6 +41,7 @@ class BottleneckType(Enum):
     COMPUTE = "COMPUTE"
     DRAM = "DRAM"
     NOC = "NOC"
+    FABRIC = "FABRIC"  # Ethernet links between chips
     L1_CAPACITY = "L1_CAPACITY"
     BOTH = "BOTH"  # Both compute and memory bound (>65% each)
     SLOW = "SLOW"  # Neither bound (<65% both) - needs optimization
@@ -77,6 +78,11 @@ class HardwareSpec:
     # Defaults at end
     mul_adds_per_cycle: int = 4096  # 8x16 × 16x16 matrix engine
     chips_per_galaxy: int = 1
+    # Selects the measured per-call CCL latency (roofline/ccl.py)
+    arch: Literal["wormhole", "blackhole"] = "wormhole"
+    # Chips of a multi-chip system as a 2D mesh, and which mesh axes wrap around (torus)
+    mesh_shape: Tuple[int, int] = (1, 1)
+    mesh_wrap: Tuple[bool, bool] = (False, False)
 
     @property
     def sram_mb_per_chip(self) -> float:
@@ -184,6 +190,7 @@ BLACKHOLE_P100 = HardwareSpec(
     topology="linear",
     num_links=1,
     chips_per_galaxy=1,
+    arch="blackhole",
 )
 
 BLACKHOLE_P150 = HardwareSpec(
@@ -199,19 +206,42 @@ BLACKHOLE_P150 = HardwareSpec(
     topology="linear",
     num_links=1,
     chips_per_galaxy=1,
+    arch="blackhole",
 )
 
 BLACKHOLE_GALAXY = HardwareSpec(
     name="Blackhole Galaxy",
-    tensix_cores_per_chip=120,
+    tensix_cores_per_chip=130,  # 13 x 10 compute grid
     clock_ghz=1.35,
     dram_gb_per_chip=32,
     dram_bw_gb_s=512,
     sram_mb_per_core=1.5,
     noc_bw_tb_s=1.4,
     noc_link_bw_gb_s=200,
-    eth_bw_gb_s_per_link=48,
-    topology="linear",
-    num_links=1,
+    eth_bw_gb_s_per_link=25,  # galaxy links run at half their rated 50 GB/s today (tech_reports/CCLs)
+    topology="ring",  # per-group ring or line is derived from mesh_shape / mesh_wrap where groups are placed
+    num_links=2,  # links per neighbouring chip pair
     chips_per_galaxy=32,
+    arch="blackhole",
+    mesh_shape=(8, 4),
+    mesh_wrap=(True, True),
 )
+
+BLACKHOLE_QUAD = replace(
+    BLACKHOLE_GALAXY,
+    name="Blackhole Quad Galaxy",
+    num_links=2,  # links per neighbouring chip pair
+    chips_per_galaxy=128,
+    mesh_shape=(32, 4),  # 32 x 4 torus
+    mesh_wrap=(True, True),
+)
+
+# Hardware presets by CLI name
+HARDWARE_PRESETS = {
+    "n150": WORMHOLE_N150,
+    "n300": WORMHOLE_N300,
+    "p100": BLACKHOLE_P100,
+    "p150": BLACKHOLE_P150,
+    "bh_glx": BLACKHOLE_GALAXY,
+    "bh_quad": BLACKHOLE_QUAD,
+}

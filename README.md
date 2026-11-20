@@ -184,6 +184,97 @@ Minimal example — a 5-layer linear model showing per-layer roofline breakdown:
 python3 -m roofline.examples.matmuls
 ```
 
+### Parallel training: pipeline, tensor, sequence, context and data parallelism
+
+`roofline.examples.parallel_training` models one optimizer step of a Llama on `dp * pp * tp * cp` chips:
+
+- **PP** with a choice of schedule (`--schedule naive | gpipe | 1f1b | interleaved`, `--interleave v` chunks per device for interleaved), optional vocabulary parallelism across stages (`--vocab-parallel`, target only)
+- **TP** inside a stage, optionally with Megatron sequence parallelism (`--sp`)
+- **CP** inside a stage: ring attention, today's or the target one (below)
+- **DP**: `--dp` copies of the whole pipeline, each running m / dp micro-batches; `--zero1` shards the optimizer state over the CP x DP replicas (target only)
+- activation recompute: `--recompute none | selective | full`. Selective (target only) recomputes norms, SiLU and the gating multiply, the head split / RoPE / merge and attention in backward and holds the matmul outputs (ops with `recompute = True`); full recomputes each block's forward (the memory-efficient runner)
+- precision: `--master-dtype bf16 | fp32` (tt-train's `precision.master_dtype`: stored weights, m and v; fp32 keeps a bf16 copy for compute, 16 B per parameter instead of 8) and `--grad-dtype bf16 | fp32` (gradient accumulation across micro-batches, +2 B per parameter)
+
+`--mode` says whose kernels and features are modelled; a single run reports both:
+
+| | `current`: tt-train today | `target` (default): planned |
+|---|---|---|
+| attention block (`--attn-block`) | one 32-token tile | 512 tokens |
+| ring attention (CP) | contiguous split: the last device runs half a block then cp - 1 full ones; each step resets and slices the statistics, merges with 12 fp32 ops on them, a cast and 3 fp32 passes over the output; backward zeroes, casts and adds three step buffers; shifts are socket transfers on one link in one direction, in two phases (`ttnn_fixed::distributed::ring_shift`); every ttnn call is its own op | load-balanced split, merge fused into the kernel, shifts in both ring directions overlapped with attention (one op) |
+| vocabulary parallelism across stages, ZeRO-1, selective recompute | not available (error; tt-train's runners are default and memory-efficient) | allowed |
+
+Host synchronizations in today's ring attention and ring shift are not modelled (a roofline has no host).
+
+```bash
+# One configuration: Llama 70B, 8K sequences, 2048 sequences per step, on a quad galaxy (128 chips)
+python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \
+    --pp 16 --tp 4 --cp 2 --sp --recompute full
+
+# Data parallelism with ZeRO-1 and fp32 master weights
+python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \
+    --dp 2 --pp 8 --tp 4 --cp 2 --sp --recompute full --zero1 --master-dtype fp32
+
+# Every DP x PP x TP x CP split of 128 chips (each schedule and recompute level), best ones that fit
+python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 --sweep 128 --sp --mode current
+
+# Uneven layer split (as tt-train's PipelineParallelConfig.blocks_per_rank): fewer blocks on the LM-head stage
+python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \
+    --pp 8 --tp 4 --cp 4 --recompute full --blocks-per-stage 11,11,10,10,10,10,10,8
+```
+
+Layers are split evenly across pipeline devices by default, the remainder going to the first devices; `--blocks-per-stage` sets any split. Every distinct stage (first, middle, last, each block count) is run for one micro-batch in its own `RooflineContext`. The roofline is per op: every op takes max(FLOP, DRAM, fabric) time and the ops of a stage run one after another. A matmul and its collective are one op (column-parallel linear with its all-gather or broadcast, row-parallel linear with its reduce-scatter or all-reduce; with `--sp` one all-gather feeds q/kv or w1/w3), and so are ring attention and its K/V shifts:
+
+```
+op time = max(sum FLOP time, sum DRAM time, sum fabric time) over the op's estimates
+F_d, B_d = sum of op times of one micro-batch's forward / backward on device d,
+          each + v stage hand-offs (each its own op)
+T_pipe  = the schedule played out op by op (simulate_schedule) with device d taking F_d and B_d
+        = slots * (F + B) when all devices are equal
+T_step  = T_pipe + gradient sync over CP and DP + optimizer (per-op sums, slowest stage)
+bubble  = idle share of the step over all devices = (slots - m) / slots when all devices are equal
+upper bound: the same with every resource summed over the micro-batch and only the largest counted
+MFU     = ideal time / T_step,  ideal time = model FLOPs / (chips * peak)
+          model FLOPs per token = 6 N + 6 L E S (closed form; N counted as tt-train's models/llama/flops.py,
+          attention over the causal half; flops.py counts the full square, 12 L E S)
+          peak: HiFi4, the fidelity the roofline times matmuls at (printed with the result)
+```
+
+`slots` is the step length in micro-batch times and comes from the schedule (`roofline/training/pipeline.py`). Each schedule also gives the micro-batches whose activations a device holds at once, which sets memory:
+
+| Schedule | slots | bubble | held on device 0 |
+|---|---|---|---|
+| `naive`: one micro-batch at a time | m P | (P - 1) / P | 1 |
+| `gpipe`: all forwards, then all backwards (Huang et al., 2019) | m + P - 1 | (P - 1) / (m + P - 1) | m |
+| `1f1b` (Narayanan et al., 2021) | m + P - 1 | (P - 1) / (m + P - 1) | P |
+| `interleaved`, v chunks per device (same paper) | m + (P - 1) / v | (P - 1) / (v m + P - 1) | simulated |
+
+`simulate_schedule` plays any schedule out op by op on a common clock; with equal devices every closed form above matches it. With uneven devices the slowest one sets the pace and the fill and drain take the sum of the devices' times; the held counts it reports set each device's memory.
+
+Vocabulary parallelism across stages (Yeung et al., 2024) adds a pass H(j) per micro-batch on every device: its LM-head shard and loss, the broadcast of the final hidden state and the reduce of its gradient (about one hand-off each), and three cross-entropy all-reduces over the stages. H(j) needs the last stage's forward of j, and the last stage's backward of j needs H(j) from every device. `simulate_schedule(..., vocab=...)` places H(j) on each device at the first op of its order that starts after the last stage's forward of j, and plays the dependencies out: plain 1F1B pays for them in bubble (PP16 x TP4 x CP2 with SP, full recompute: 8.9% without the dependency, 34.4% with it). The modified schedules of the paper that hide it are not modelled.
+
+Gradient sync: without ZeRO-1 one all-reduce of every gradient per group (CP, then DP), as tt-train's `synchronize_gradients_along`; with ZeRO-1 a reduce-scatter per group, the optimizer on 1/(cp dp) of each parameter (its fp32 master copy, m and v sharded too), and an all-gather of the updated bf16 parameters. DP copies of the pipeline sit one after another along the rows, so each DP group's members are a pipeline apart and all DP groups of a column share its links (`RooflineContext.group_link_share`); DP needs stages of whole rows.
+
+The per-op serial time (sum of `max(compute, DRAM, network)` over ops, as in `training.py`) is reported next to it.
+
+Supporting changes:
+
+| Where | What |
+|---|---|
+| `RooflineEstimate.ideal_network_ns`, `roofline/roofline/ccl.py` | Collectives put their link time and a fixed per-call latency (fitted to measured ttnn collectives, tt-metal `tech_reports/CCLs/CCL_bandwidth.md`) on the fabric, and their input read and output write on DRAM; `theoretical_time_ns = max(compute, memory, network)` |
+| `RooflineContext.op_time_ns`, `fused()`, `RooflineEstimate.fusion` | Per-op roofline with fused ops (a matmul and its collective); `compute_time_ns / dram_time_ns / network_time_ns / overlapped_time_ns` give the per-resource sums and the upper bound |
+| `place_stages`, `RooflineContext.group_topology` / `hw_for(group)` | Stages are blocks of whole rows of the mesh (or parts of a row); TP and CP each take one axis of the block, as tt-train's whole-axis collectives require; a group's collectives run as a ring only when it fills a whole wrapped mesh axis with more than 2 chips, else as a line; links across a stage cut = chip pairs on the boundary x links per pair |
+| `fused_attention_roofline(..., block)`, `RooflineContext.attn_block` (`--attn-block`) | Follows tt-train's `sdpa_fw` and split `sdpa_bw` (Q and KV kernels): causal, K/V re-read per Q block in the forward and the Q kernel, Q, dO and the fp32 statistics re-read per K/V block in the KV kernel; backward matmul FLOPs 14 · B · Hq · M · d. Default block: one 32-token tile, today's kernels; 512 makes attention compute-bound |
+| `ring_shift_roofline`, `send_recv_roofline` | CP ring shifts (both ring directions) and stage hand-offs over the links across a stage cut |
+| `MockRingAttentionOp`, `cp_size` on the distributed block, `RooflineContext.cp_mode`, `socket_ring_shift_roofline` | Ring attention, target: attention of the full sequence divided by `cp`, K/V (bf16) shifts forward, K/V + dK/dV (fp32) backward, fp32 accumulator read + write per ring step; current: tt-train's `ring_attention_sdpa` call by call (table above); `fused_attention_roofline(causal=False)` for a full off-diagonal block |
+| `sequence_parallel` on the parallel linears, attention, MLP, block and `MockDistributedLlamaConfig` | All-gather / reduce-scatter along the sequence instead of broadcast / all-reduce; norms and residual adds hold `S / tp` tokens |
+| `num_stages`, `stage_index`, `stage_num_blocks`, `vocab_parallel` on `MockDistributedLlamaConfig`; `training/pipeline.py` | The model as one pipeline stage (`forward_stage`); schedule classes (`NaiveSchedule`, `GPipeSchedule`, `OneFOneBSchedule`, `InterleavedOneFOneBSchedule`) and a schedule simulator |
+| `RooflineFunction.recompute`, `RooflineContext.selective_recompute`, `MockTensor.untrack` | Selective recompute: the op's outputs and saved tensors are not held; its forward estimates run again in backward, and the recomputed tensors are live through the op's backward (and through the backward of every op that reads them); in the forward they are not counted while the next op uses them, a transient left out |
+| `MockAdamW(master_dtype, num_shards)`, `synchronize_replica_gradients` | fp32 master copy with fp32 m and v, ZeRO-1 sharding; gradient sync over CP and DP; fp32 gradient accumulation keeps the accumulator's dtype |
+| Embedding, LM head, gradients | Embedding untilizes its whole table each forward and returns a dense table gradient (tt-train `embedding_op`); LM head keeps logits sharded over the vocabulary with `MockVocabParallelCrossEntropyLossOp` (tt-train `vocab_parallel_cross_entropy_loss`); each stage run starts with every gradient allocated, as after the first micro-batch, so the out-of-place gradient add and the resident gradients are in the step time and the memory peak; the micro-batches held at once count only the blocks' activations |
+| `BLACKHOLE_GALAXY`, `BLACKHOLE_QUAD`, `HARDWARE_PRESETS` | Galaxy chips: 130 compute cores (13 x 10), 25 GB/s per Ethernet link per direction (galaxy links run at half their rated speed, tt-metal `tech_reports/CCLs/CCL_bandwidth.md`), 2 links per neighbouring chip pair; galaxy 8 x 4 torus, quad 4 galaxies as a 32 x 4 torus (`HardwareSpec.mesh_shape`, `mesh_wrap`); one name-to-spec map used by both examples (`--hardware bh_quad`) |
+
+Limitations: TP must divide the number of KV heads (as in tt-train). With `--sp` the attention and MLP gather the norm output once and keep the gathered copy for backward (Megatron keeps the shard and re-gathers), so memory is higher than Megatron's. Pipelines with DP that interleave, and stages that are neither whole rows nor parts of one row (e.g. 2 x 2), are not placed. Links between galaxies are assumed to be the same as inside a galaxy. Overlap between ops that the hardware or a schedule could provide (other than a matmul with its own collective) is not credited; the upper bound credits all of it.
+
 ## Dependencies
 
 Python 3.10+ with only standard-library dependencies. `matplotlib` is optional (used for memory usage plots).

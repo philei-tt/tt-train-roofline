@@ -53,17 +53,16 @@ def embedding_roofline(
     bytes_per_elem = dtype.value
 
     if phase == "forward":
-        # Forward: Read embeddings for each token index
-        # Read batch_seq embeddings, each of size embedding_dim
-        # In worst case, may read from scattered locations in the embedding table
-        total_bytes = int(batch_seq * embedding_dim * bytes_per_elem)
+        # Forward (tt-train embedding_op): untilize the whole [V, E] table (read + write it), then
+        # gather batch_seq rows from the untilized copy
+        table_bytes = vocab_size * embedding_dim * bytes_per_elem
+        total_bytes = int(2 * table_bytes + batch_seq * embedding_dim * bytes_per_elem)
         total_flops = 0  # Pure gather, no compute
     else:
-        # Backward: Scatter-add gradients to embedding table
-        # Read grad_output, scatter-add to grad_weight
-        # Grad output: batch_seq * embedding_dim
-        # Grad weight (sparse update): batch_seq * embedding_dim (in practice may be more due to atomics)
-        total_bytes = int(2 * batch_seq * embedding_dim * bytes_per_elem)
+        # Backward (ttnn::embedding_bw): a dense [V, E] gradient is written, and batch_seq rows of
+        # grad_output are read and scattered into it
+        table_bytes = vocab_size * embedding_dim * bytes_per_elem
+        total_bytes = int(table_bytes + 2 * batch_seq * embedding_dim * bytes_per_elem)
         total_flops = batch_seq * embedding_dim  # Addition for accumulation
 
     # Compute time (minimal for forward, some for backward accumulation)

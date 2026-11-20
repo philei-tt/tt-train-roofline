@@ -42,6 +42,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Dict, Any
 
+from roofline.hardware import HARDWARE_PRESETS
+
 
 class ModelType(Enum):
     """Type of transformer model."""
@@ -211,13 +213,13 @@ MODEL_PRESETS: Dict[str, dict] = {
     },
     "llama-8b": {
         "model_type": ModelType.LLAMA,
-        "vocab_size": 32000,
+        "vocab_size": 128256,
         "max_sequence_length": 131072,
         "embedding_dim": 4096,
         "intermediate_dim": 14336,
         "num_heads": 32,
         "num_groups": 8,  # GQA with 8 KV heads (32/8 = 4 queries per KV)
-        "num_blocks": 8,
+        "num_blocks": 32,
         "dropout": 0.0,
         "theta": 500000.0,
         "weight_tying": False,
@@ -252,6 +254,24 @@ MODEL_PRESETS: Dict[str, dict] = {
         "description": "Llama 3.1 405B (128K context)",
     },
 }
+
+
+def distributed_llama_config(preset: dict, **parallel) -> "MockDistributedLlamaConfig":
+    """MockDistributedLlamaConfig for a Llama preset; `parallel` sets tp_size, cp_size, stages, ..."""
+    from roofline import MockDistributedLlamaConfig
+
+    return MockDistributedLlamaConfig(
+        vocab_size=preset["vocab_size"],
+        max_sequence_length=preset["max_sequence_length"],
+        embedding_dim=preset["embedding_dim"],
+        intermediate_dim=preset.get("intermediate_dim"),
+        num_heads=preset["num_heads"],
+        num_groups=preset["num_groups"],
+        num_blocks=preset["num_blocks"],
+        dropout_prob=preset["dropout"],
+        theta=preset["theta"],
+        **parallel,
+    )
 
 
 def _resolve_model_config_path(model_config_rel: str, training_config_path: str) -> str:
@@ -522,18 +542,12 @@ def run_model_roofline(
         MockAdamW,
         mock_clip_grad_norm,
         MockCrossEntropyLossOp,
+        MockVocabParallelCrossEntropyLossOp,
         TensorLabel,
     )
     from roofline.training.distributed import shard_batch, synchronize_gradients
 
-    # Hardware mapping
-    hardware_map = {
-        "n150": WORMHOLE_N150,
-        "n300": WORMHOLE_N300,
-        "p100": BLACKHOLE_P100,
-        "p150": BLACKHOLE_P150,
-        "bh_glx": BLACKHOLE_GALAXY,
-    }
+    hardware_map = HARDWARE_PRESETS
 
     if hardware not in hardware_map:
         return {
@@ -626,18 +640,7 @@ def run_model_roofline(
                     )
                 }
         if use_distributed_llama:
-            config = MockDistributedLlamaConfig(
-                vocab_size=preset["vocab_size"],
-                max_sequence_length=preset["max_sequence_length"],
-                embedding_dim=preset["embedding_dim"],
-                intermediate_dim=preset.get("intermediate_dim"),
-                num_heads=preset["num_heads"],
-                num_groups=preset["num_groups"],
-                num_blocks=preset["num_blocks"],
-                dropout_prob=preset["dropout"],
-                theta=preset["theta"],
-                tp_size=tp_size,
-            )
+            config = distributed_llama_config(preset, tp_size=tp_size)
             model = MockDistributedLlama(config, runner=runner)
         else:
             config = MockLlamaConfig(
@@ -748,7 +751,11 @@ def run_model_roofline(
     logits = model(ctx, indices)
 
     # Compute loss
-    loss = MockCrossEntropyLossOp.apply(ctx, logits, targets)
+    if isinstance(model, MockDistributedLlama):
+        # logits are sharded over the vocabulary across the TP devices (as tt-train)
+        loss = MockVocabParallelCrossEntropyLossOp.apply(ctx, logits, targets, model.config.tp_size)
+    else:
+        loss = MockCrossEntropyLossOp.apply(ctx, logits, targets)
 
     # Snapshot after forward pass
     print_memory_snapshot("AFTER_FORWARD_PASS")
@@ -1109,7 +1116,7 @@ Examples:
         "--hardware",
         "-hw",
         type=str,
-        choices=["n150", "n300", "p100", "p150", "bh_glx"],
+        choices=list(HARDWARE_PRESETS),
         default="n150",
         help="Hardware configuration (default: n150)",
     )

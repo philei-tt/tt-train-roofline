@@ -66,6 +66,10 @@ class MockEmbeddingOp(RooflineFunction):
             phase="forward",
         )
         roofline_ctx.add_perf_result(estimate)
+        # The untilized copy of the table lives while the gather runs
+        untilized = create_activation_tensor(weight.shape, weight.dtype, "ROW_MAJOR", requires_grad=False,
+                                             name="untilized_embedding")
+        del untilized
 
         # Output shape: indices shape with last dim replaced by embedding_dim
         # [batch, 1, 1, seq_len] -> [batch, 1, seq_len, embedding_dim]

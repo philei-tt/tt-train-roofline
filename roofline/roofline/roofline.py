@@ -77,10 +77,11 @@ class RooflineEstimate:
         - operation, phase: metadata
         - total_flops, total_bytes: raw counts
         - ideal_compute_ns, ideal_memory_ns: roofline bounds
+        - ideal_network_ns: Ethernet (fabric) time for collectives and point-to-point transfers
         - hw: hardware spec (for computing derived metrics)
 
     Derived (properties):
-        - theoretical_time_ns: max(compute, memory)
+        - theoretical_time_ns: max(compute, memory, network)
         - bottleneck: which bound dominates
         - arithmetic_intensity, achieved_tflops, etc.
     """
@@ -92,15 +93,20 @@ class RooflineEstimate:
     ideal_compute_ns: float
     ideal_memory_ns: float
     hw: HardwareSpec
+    ideal_network_ns: float = 0.0
+    # Estimates sharing a fusion id form one op: a matmul and its collective (RooflineContext.fused)
+    fusion: Optional[str] = None
 
     @property
     def theoretical_time_ns(self) -> float:
-        """Roofline time = max(compute, memory)."""
-        return max(self.ideal_compute_ns, self.ideal_memory_ns)
+        """Roofline time = max(compute, memory, network)."""
+        return max(self.ideal_compute_ns, self.ideal_memory_ns, self.ideal_network_ns)
 
     @property
     def bottleneck(self) -> BottleneckType:
         """Classification based on which bound dominates."""
+        if self.ideal_network_ns > max(self.ideal_compute_ns, self.ideal_memory_ns):
+            return BottleneckType.FABRIC
         if self.ideal_compute_ns > self.ideal_memory_ns * 1.5:
             return BottleneckType.COMPUTE
         elif self.ideal_memory_ns > self.ideal_compute_ns * 1.5:
@@ -162,6 +168,30 @@ class RooflineContext:
     hw: HardwareSpec
     estimates: List[RooflineEstimate] = field(default_factory=list)
 
+    # Fused attention: tokens kept on chip per block (forward Q block, backward Q and K/V blocks).
+    # None = one 32-token tile, today's tt-train kernels; see fused_attention_roofline(block).
+    attn_block: Optional[int] = None
+
+    # Ring attention (context parallelism): "target" (load-balanced, fused merge, shifts overlapped)
+    # or "current" (tt-train's ring_attention_sdpa today); see operations/attention.py
+    cp_mode: str = "target"
+
+    # Selective recompute: ops with recompute = True (norms, activations, attention) do not hold
+    # their outputs until backward; their forward runs again in backward (operation.py, apply)
+    selective_recompute: bool = False
+
+    # Ring or line for the collectives of each parallel group ("tp", "cp"), set from where the
+    # group sits on the mesh; groups not listed use hw.topology. See hw_for().
+    group_topology: Dict[str, str] = field(default_factory=dict)
+
+    # Groups of one kind that share the same links (default 1); see hw_for()
+    group_link_share: Dict[str, int] = field(default_factory=dict)
+
+    # Current fusion id (see fused()) and a counter for new ones
+    current_fusion: Optional[str] = None
+    _fusion_count: int = 0
+    _group_hw: Dict[Tuple[str, int], HardwareSpec] = field(default_factory=dict)  # hw_for() cache
+
     # Memory tracker for detailed allocation tracking
     memory_tracker: Optional[MemoryTracker] = field(default=None)
 
@@ -188,11 +218,62 @@ class RooflineContext:
         self.estimates.append(estimate)
 
     def add_perf_result(self, result: RooflineEstimate) -> None:
-        """Add a RooflineEstimate to the context.
-
-        This method exists for backwards compatibility and is equivalent to add().
-        """
+        """Add a RooflineEstimate to the context, tagged with the current fusion id if any."""
+        if self.current_fusion is not None and result.fusion is None:
+            result.fusion = self.current_fusion
         self.add(result)
+
+    def hw_for(self, group: str) -> HardwareSpec:
+        """Hardware spec for the collectives of a parallel group: its own ring or line topology, and
+        its share of each link when several groups of the same kind cross the same links (DP groups
+        whose members are whole pipelines apart)."""
+        key = (self.group_topology.get(group, self.hw.topology), self.group_link_share.get(group, 1))
+        if key not in self._group_hw:
+            import dataclasses
+
+            topology, share = key
+            self._group_hw[key] = (self.hw if topology == self.hw.topology and share == 1 else dataclasses.replace(
+                self.hw, topology=topology, eth_bw_gb_s_per_link=self.hw.eth_bw_gb_s_per_link / share))
+        return self._group_hw[key]
+
+    def new_fusion(self, label: str) -> str:
+        """A fresh fusion id."""
+        self._fusion_count += 1
+        return f"{label}#{self._fusion_count}"
+
+    def fused(self, fusion: Optional[str]):
+        """Context manager: estimates added inside (forward, and the backward of ops applied inside)
+        belong to one op whose time is max(sum compute, sum DRAM, sum fabric) of its estimates."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def scope():
+            previous = self.current_fusion
+            self.current_fusion = fusion
+            try:
+                yield fusion
+            finally:
+                self.current_fusion = previous
+
+        return scope()
+
+    def op_time_ns(self, phases: Optional[Tuple[str, ...]] = None) -> float:
+        """Per-op roofline: sum over ops of max(compute, DRAM, fabric). Estimates with the same
+        fusion id and phase are one op (a matmul with its collective; ring attention with its
+        shifts)."""
+        total = 0.0
+        groups: Dict[Tuple[str, str], List[float]] = {}
+        for e in self.estimates:
+            if phases is not None and e.phase not in phases:
+                continue
+            if e.fusion is None:
+                total += max(e.ideal_compute_ns, e.ideal_memory_ns, e.ideal_network_ns)
+            else:
+                g = groups.setdefault((e.fusion, e.phase), [0.0, 0.0, 0.0])
+                g[0] += e.ideal_compute_ns
+                g[1] += e.ideal_memory_ns
+                g[2] += e.ideal_network_ns
+        return total + sum(max(g) for g in groups.values())
 
     # =========================================================================
     # Aggregate metrics
@@ -213,6 +294,30 @@ class RooflineContext:
     def total_bytes(self) -> int:
         """Total bytes transferred across all operations."""
         return sum(e.total_bytes for e in self.estimates)
+
+    def compute_time_ns(self, phases: Optional[Tuple[str, ...]] = None) -> float:
+        """Sum of ideal compute time (FLOPs / peak) over operations, optionally filtered by phase."""
+        return sum(e.ideal_compute_ns for e in self.estimates if phases is None or e.phase in phases)
+
+    def dram_time_ns(self, phases: Optional[Tuple[str, ...]] = None) -> float:
+        """Sum of ideal DRAM time (bytes / DRAM bandwidth) over operations."""
+        return sum(e.ideal_memory_ns for e in self.estimates if phases is None or e.phase in phases)
+
+    def network_time_ns(self, phases: Optional[Tuple[str, ...]] = None) -> float:
+        """Sum of ideal Ethernet (fabric) time over operations."""
+        return sum(e.ideal_network_ns for e in self.estimates if phases is None or e.phase in phases)
+
+    def overlapped_time_ns(self, phases: Optional[Tuple[str, ...]] = None) -> float:
+        """Resource-level roofline: max(sum of compute, sum of DRAM, sum of fabric time).
+
+        Unlike total_time_ns (sum of per-op max(compute, memory)), this lets compute-bound
+        ops, DRAM-bound ops and collectives overlap perfectly across the whole range.
+        """
+        return max(
+            self.compute_time_ns(phases),
+            self.dram_time_ns(phases),
+            self.network_time_ns(phases),
+        )
 
     def forward_time_ns(self) -> float:
         """Total time for forward pass operations."""

@@ -108,3 +108,54 @@ class MockCrossEntropyLossOp(RooflineFunction):
         )
 
         return grad_logits, None
+
+
+class MockVocabParallelCrossEntropyLossOp(RooflineFunction):
+    """Cross-entropy on logits sharded over the vocabulary across tp_size devices.
+
+    Mirrors tt-train's ttml::ops::distributed::vocab_parallel_cross_entropy_loss
+    (ops/distributed/losses.cpp): each device works on its vocabulary shard; the forward
+    all-gathers the per-token local maxima and all-reduces the per-token sums and the target
+    logit (fp32); the backward (softmax - one_hot on the shard) is local.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: RooflineFunctionContext,
+        roofline_ctx: "RooflineContext",
+        logits: MockTensor,
+        targets: MockTensor,
+        tp_size: int,
+    ) -> MockTensor:
+        from ..roofline import all_gather_roofline, all_reduce_roofline
+
+        ctx.save_for_backward(logits, targets)
+        batch_seq = targets.logical_volume()
+        roofline_ctx.add_perf_result(cross_entropy_roofline(
+            roofline_ctx.hw, batch_seq, logits.shape[-1], dtype=logits.dtype,
+            operation="VocabParallelCrossEntropy.forward", phase="forward",
+        ))
+        if tp_size > 1:
+            roofline_ctx.add_perf_result(all_gather_roofline(
+                roofline_ctx.hw_for("tp"), batch_seq * logits.dtype.value, tp_size,
+                operation="VocabParallelCrossEntropy.max_gather", phase="forward",
+            ))
+            for name in ("sum_all_reduce", "target_all_reduce"):
+                roofline_ctx.add_perf_result(all_reduce_roofline(
+                    roofline_ctx.hw_for("tp"), batch_seq * 4, tp_size,
+                    operation=f"VocabParallelCrossEntropy.{name}", phase="forward",
+                ))
+        return create_activation_tensor((1,), logits.dtype, logits.layout)
+
+    @staticmethod
+    def backward(
+        ctx: RooflineFunctionContext,
+        roofline_ctx: "RooflineContext",
+        grad_output: MockTensor,
+    ) -> Tuple[MockTensor, None, None]:
+        logits, targets = ctx.saved_tensors
+        roofline_ctx.add_perf_result(cross_entropy_roofline(
+            roofline_ctx.hw, targets.logical_volume(), logits.shape[-1], dtype=logits.dtype,
+            operation="VocabParallelCrossEntropy.backward", phase="backward",
+        ))
+        return create_grad_tensor(logits.shape, logits.dtype, logits.layout, name="grad_logits"), None, None

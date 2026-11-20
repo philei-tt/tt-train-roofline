@@ -30,6 +30,8 @@ class MockDistributedLlamaBlock(MockModule):
 
     Mirrors ttml::modules::distributed::DistributedLlamaBlock.
     Pre-norm + attention (distributed GQA) + residual; pre-norm + MLP (distributed) + residual.
+    With sequence_parallel the residual stream, norms and residual adds hold S/tp_size tokens.
+    With cp_size > 1 the block holds S/cp_size tokens and attention runs as ring attention.
     """
 
     def __init__(
@@ -42,6 +44,8 @@ class MockDistributedLlamaBlock(MockModule):
         intermediate_dim: Optional[int] = None,
         tp_size: int = 1,
         dtype: DataType = DataType.BFLOAT16,
+        sequence_parallel: bool = False,
+        cp_size: int = 1,
     ):
         super().__init__()
 
@@ -59,6 +63,8 @@ class MockDistributedLlamaBlock(MockModule):
             rope_params=rope_params,
             tp_size=tp_size,
             dtype=dtype,
+            sequence_parallel=sequence_parallel,
+            cp_size=cp_size,
         )
         self.mlp_norm = MockRMSNormLayer(embedding_size, dtype=dtype)
         self.mlp = MockDistributedLlamaMLP(
@@ -67,6 +73,7 @@ class MockDistributedLlamaBlock(MockModule):
             intermediate_dim=intermediate_dim,
             tp_size=tp_size,
             dtype=dtype,
+            sequence_parallel=sequence_parallel,
         )
 
     def forward(

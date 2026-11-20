@@ -9,6 +9,7 @@ base classes for defining roofline-aware operations.
 """
 
 from __future__ import annotations
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 
@@ -56,8 +57,9 @@ def create_activation_tensor(
     requires_grad: bool = True,
     name: Optional[str] = None,
     num_shards: Optional[Tuple[int, ...]] = None,
+    track: bool = True,
 ) -> MockTensor:
-    """Create an activation tensor with proper ACTIVATION label.
+    """Create an activation tensor with proper ACTIVATION label (track=False: a view, no memory).
 
     Args:
         shape: Tensor shape
@@ -78,6 +80,7 @@ def create_activation_tensor(
         label=TensorLabel.ACTIVATION,
         name=name,
         num_shards=num_shards,
+        track=track,
     )
 
 
@@ -163,6 +166,10 @@ class RooflineFunction:
         ...         pass
     """
 
+    # Selective recompute (RooflineContext.selective_recompute) recomputes this op in backward
+    # instead of holding its outputs: cheap ops and attention, not matmuls
+    recompute: bool = False
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -218,8 +225,11 @@ class RooflineFunction:
             Output MockTensor(s) from forward()
         """
         ctx = RooflineFunctionContext()
+        # The op's backward estimates belong to the same fused op as its forward ones
+        fusion = roofline_ctx.current_fusion
 
         # Call forward
+        first_estimate = len(roofline_ctx.estimates)
         outputs = cls.forward(ctx, roofline_ctx, *inputs)
 
         # Normalize outputs to tuple for consistent handling
@@ -227,6 +237,19 @@ class RooflineFunction:
             outputs_tuple = (outputs,)
         else:
             outputs_tuple = outputs
+
+        # Selective recompute: the op's outputs and the tensors it saved are not held until
+        # backward; its forward runs again at the start of its backward
+        recompute: list = []
+        if roofline_ctx.selective_recompute and cls.recompute:
+            recompute = [dataclasses.replace(e, phase="backward", operation=f"{e.operation}.recompute",
+                                             fusion=f"{e.fusion}.recompute" if e.fusion is not None else None)
+                         for e in roofline_ctx.estimates[first_estimate:] if e.phase == "forward"]
+            input_ids = {id(t) for t in inputs}
+            for t in (*outputs_tuple, *ctx.saved_tensors):
+                if isinstance(t, MockTensor) and id(t) not in input_ids and t.label != TensorLabel.PARAMETER:
+                    t.untrack()
+                    t.recomputed = True
 
         # Note: Activations are now labeled in save_for_backward()
         # Output tensors that aren't saved for backward will remain unlabeled
@@ -239,7 +262,7 @@ class RooflineFunction:
 
         # Create backward closure factory
         def make_backward_closure(
-            bwd_ctx, bwd_roofline_ctx, bwd_outputs, bwd_inputs, bwd_cls
+            bwd_ctx, bwd_roofline_ctx, bwd_outputs, bwd_inputs, bwd_all_inputs, bwd_cls
         ):
             def backward_fn(ctx_for_bwd: "RooflineContext"):
                 # Import here to avoid circular dependency
@@ -265,15 +288,25 @@ class RooflineFunction:
                         grad_outputs.append(None)
                 grad_outputs = tuple(grad_outputs)
 
+                # Selective recompute: the op's forward runs again (charged here), and every
+                # recomputed tensor this backward reads (its own, or a producer's it saved) is live
+                # while it runs
+                for estimate in recompute:
+                    bwd_roofline_ctx.add_perf_result(dataclasses.replace(estimate))
+                live = [create_activation_tensor(t.shape, t.dtype, t.layout, requires_grad=False,
+                                                 num_shards=t.num_shards)
+                        for t in bwd_ctx.saved_tensors if isinstance(t, MockTensor) and t.recomputed]
+
                 # Call backward - single grad for single output, multiple for multi-output
-                if len(grad_outputs) == 1:
-                    grad_inputs = bwd_cls.backward(
-                        bwd_ctx, bwd_roofline_ctx, grad_outputs[0]
-                    )
-                else:
-                    grad_inputs = bwd_cls.backward(
-                        bwd_ctx, bwd_roofline_ctx, *grad_outputs
-                    )
+                with bwd_roofline_ctx.fused(fusion):
+                    if len(grad_outputs) == 1:
+                        grad_inputs = bwd_cls.backward(
+                            bwd_ctx, bwd_roofline_ctx, grad_outputs[0]
+                        )
+                    else:
+                        grad_inputs = bwd_cls.backward(
+                            bwd_ctx, bwd_roofline_ctx, *grad_outputs
+                        )
 
                 # Normalize to tuple
                 if grad_inputs is None:
@@ -281,35 +314,46 @@ class RooflineFunction:
                 elif not isinstance(grad_inputs, tuple):
                     grad_inputs = (grad_inputs,)
 
+                # Pair gradients with inputs: backward returns one entry per forward input
+                # (None where there is none); a tuple with one entry per input that needs a
+                # gradient is also accepted
+                targets = bwd_all_inputs if len(grad_inputs) == len(bwd_all_inputs) else bwd_inputs
+
                 # Accumulate gradients to input tensors
-                for tensor, grad in zip(bwd_inputs, grad_inputs):
-                    if grad is not None and tensor.requires_grad:
+                for tensor, grad in zip(targets, grad_inputs):
+                    if grad is not None and isinstance(tensor, MockTensor) and tensor.requires_grad:
                         # If tensor already has a gradient, add roofline estimate for accumulation
                         if tensor.is_grad_initialized():
                             num_elements = tensor.logical_volume()
+                            accumulator = tensor.get_grad().dtype
                             estimate = elementwise_roofline(
                                 bwd_roofline_ctx.hw,
                                 num_elements,
-                                num_inputs=2,  # read existing grad + new grad
+                                num_inputs=1,  # the new gradient; the accumulator is the other input
                                 sfpu_ops_per_element=0.0,
                                 fpu_ops_per_element=1.0,  # addition
-                                dtype=tensor.dtype,
+                                dtype=grad.dtype,
+                                out_dtype=accumulator,
                                 operation="GradAccum",
                                 phase="backward",
                             )
-                            bwd_roofline_ctx.add_perf_result(estimate)
+                            # read the accumulator too (fp32 accumulation: 4 + 2 + 4 bytes per element)
+                            nbytes = estimate.total_bytes + num_elements * accumulator.value
+                            bwd_roofline_ctx.add_perf_result(dataclasses.replace(
+                                estimate, total_bytes=nbytes, ideal_memory_ns=nbytes / bwd_roofline_ctx.hw.dram_bw_gb_s))
                         tensor.add_grad(grad)
 
                 # Clear saved tensors to allow early deallocation of activations
                 # This happens after backward computes gradients but before
                 # MockTensor.backward() clears the entire backward_fn
                 bwd_ctx.clear_saved_tensors()
+                del live
 
             return backward_fn
 
         # Create backward closure
         backward_fn = make_backward_closure(
-            ctx, roofline_ctx, outputs_tuple, input_tensors, cls
+            ctx, roofline_ctx, outputs_tuple, input_tensors, list(inputs), cls
         )
 
         # Set node on outputs (similar to ttml's multi-output handling)

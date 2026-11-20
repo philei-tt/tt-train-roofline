@@ -34,6 +34,8 @@ class MockRoPEOp(RooflineFunction):
     Backward: grad_input = grad_output * cos + rotate_half(grad_output) * (-sin)
     """
 
+    recompute = True
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
