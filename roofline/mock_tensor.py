@@ -174,13 +174,13 @@ class MockTensor:
         """Accumulate gradient (for backward pass).
 
         In a real implementation this would add gradients together.
-        For roofline estimation, we just track the latest gradient shape.
+        For roofline estimation, we just track the latest gradient, in the accumulator's dtype.
         """
-        if self._grad is None:
-            self._grad = grad
-        else:
-            # In real impl would add, here just track latest
-            self._grad = grad
+        if self._grad is not None and self._grad.dtype != grad.dtype:
+            # the sum keeps the accumulator's dtype (fp32 gradient accumulation)
+            grad = MockTensor(grad.shape, self._grad.dtype, grad.layout, requires_grad=False,
+                              label=TensorLabel.GRADIENT, name=self._grad.name, num_shards=grad.num_shards)
+        self._grad = grad
 
     # =========================================================================
     # Size/memory calculations

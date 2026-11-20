@@ -644,7 +644,8 @@ def _current_ring_attention(roofline_ctx, query, key, cp_size, phase) -> None:
       cast each step gradient to fp32 and add it into its accumulator; then shift K, V (bf16) and
       the dK, dV accumulators (fp32).
     - Shifts: socket_ring_shift_roofline (one link, one direction, two phases).
-    - Each ttnn call is its own op: nothing overlaps.
+    - Each ttnn call is its own op: nothing overlaps. Identical calls (every step but the diagonal
+      one, the three gradients' casts and adds) are added once, scaled by their count.
     """
     hw = roofline_ctx.hw
     batch_size, num_q_heads, local_seq, head_dim = query.shape
@@ -654,63 +655,56 @@ def _current_ring_attention(roofline_ctx, query, key, cp_size, phase) -> None:
     q_elems = batch_size * num_q_heads * local_seq * head_dim
     kv_elems = batch_size * num_kv_heads * local_seq * head_dim
     k_bytes = kv_elems * query.dtype.value  # one of K, V
+    steps, shifts = cp_size, cp_size - 1
 
-    def op(estimate) -> None:
+    def op(estimate, count=1) -> None:
+        """`count` identical ops: their sum of per-op max is count times one."""
+        if count == 0:
+            return
+        if count > 1:
+            estimate = dataclasses.replace(
+                estimate, total_flops=estimate.total_flops * count, total_bytes=estimate.total_bytes * count,
+                ideal_compute_ns=estimate.ideal_compute_ns * count, ideal_memory_ns=estimate.ideal_memory_ns * count,
+                ideal_network_ns=estimate.ideal_network_ns * count)
         estimate.fusion = roofline_ctx.new_fusion(estimate.operation)
         roofline_ctx.add_perf_result(estimate)
 
-    def eltwise(name, elements, inputs, sfpu=0.0, dtype=f32) -> None:
+    def eltwise(name, elements, inputs, count=1, sfpu=0.0, dtype=f32, out_dtype=None) -> None:
         op(elementwise_roofline(hw, elements, num_inputs=inputs, sfpu_ops_per_element=sfpu, dtype=dtype,
-                                operation=f"RingAttention.{name}", phase=phase))
+                                out_dtype=out_dtype, operation=f"RingAttention.{name}", phase=phase), count)
 
-    def typecast(name, elements, src, dst) -> None:
-        est = elementwise_roofline(hw, elements, num_inputs=1, sfpu_ops_per_element=0.0, dtype=dst,
-                                   operation=f"RingAttention.{name}", phase=phase)
-        nbytes = elements * (src.value + dst.value)
-        op(dataclasses.replace(est, total_bytes=nbytes, ideal_memory_ns=nbytes / hw.dram_bw_gb_s))
-
-    def attention(step) -> None:
+    def attention(causal, count) -> None:
         op(fused_attention_roofline(
             hw, batch_size, num_q_heads, num_kv_heads, local_seq, head_dim, dtype=query.dtype,
-            operation="RingAttention.sdpa", phase=phase, block=roofline_ctx.attn_block, causal=step == 0,
-        ))
+            operation="RingAttention.sdpa", phase=phase, block=roofline_ctx.attn_block, causal=causal,
+        ), count)
 
     def shift(name, nbytes) -> None:
         op(socket_ring_shift_roofline(roofline_ctx.hw_for("cp"), nbytes, operation=f"RingAttention.{name}",
-                                      phase=phase))
+                                      phase=phase), shifts)
 
+    attention(causal=True, count=1)  # the diagonal shard
+    attention(causal=False, count=steps - 1)
+    shift("shift_k", k_bytes)
+    shift("shift_v", k_bytes)
     if phase == "forward":
         eltwise("init_accumulator", q_elems, 0)
-        for step in range(cp_size):
-            eltwise("reset_stats", stat, 1)
-            attention(step)
-            eltwise("slice_lse", stat, 1)
-            for inputs, sfpu in [(2, 1)] * 7 + [(1, 1)] * 5:  # max, sub, exp, ..., log
-                eltwise("merge_lse", stat, inputs, sfpu)
-            typecast("cast_out", q_elems, query.dtype, f32)
-            eltwise("rescale_accumulator", q_elems, 1, 1)
-            eltwise("rescale_out", q_elems, 1, 1)
-            eltwise("add_out", q_elems, 2, 1)
-            if step < cp_size - 1:
-                shift("shift_k", k_bytes)
-                shift("shift_v", k_bytes)
-        typecast("cast_result", q_elems, f32, query.dtype)
+        eltwise("reset_stats", stat, 1, steps)
+        eltwise("slice_lse", stat, 1, steps)
+        eltwise("merge_lse_binary", stat, 2, 7 * steps, sfpu=1)  # max, 4 sub, 2 add
+        eltwise("merge_lse_unary", stat, 1, 5 * steps, sfpu=1)  # 4 exp, log
+        eltwise("cast_out", q_elems, 1, steps, dtype=query.dtype, out_dtype=f32)
+        eltwise("rescale", q_elems, 1, 2 * steps, sfpu=1)  # accumulator and step output
+        eltwise("add_out", q_elems, 2, steps, sfpu=1)
+        eltwise("cast_result", q_elems, 1, out_dtype=query.dtype)
         return
-
+    shift("shift_dk", 2 * k_bytes)  # fp32 accumulators: twice the bytes of K in bf16
+    shift("shift_dv", 2 * k_bytes)
     eltwise("init_accumulators", q_elems + 2 * kv_elems, 0)
-    for step in range(cp_size):
-        eltwise("zero_step_buffers", q_elems + 2 * kv_elems, 1, dtype=query.dtype)
-        attention(step)
-        for name, elements in (("dq", q_elems), ("dk", kv_elems), ("dv", kv_elems)):
-            typecast(f"cast_{name}", elements, query.dtype, f32)
-            eltwise(f"add_{name}", elements, 2, 1)
-        if step > 0:
-            shift("shift_k", k_bytes)
-            shift("shift_v", k_bytes)
-            shift("shift_dk", 2 * k_bytes)  # fp32 accumulators: twice the bytes of K in bf16
-            shift("shift_dv", 2 * k_bytes)
-    for name, elements in (("dq", q_elems), ("dk", kv_elems), ("dv", kv_elems)):
-        typecast(f"cast_{name}_result", elements, f32, query.dtype)
+    eltwise("zero_step_buffers", q_elems + 2 * kv_elems, 1, steps, dtype=query.dtype)
+    eltwise("cast_grads", q_elems + 2 * kv_elems, 1, steps, dtype=query.dtype, out_dtype=f32)
+    eltwise("add_grads", q_elems + 2 * kv_elems, 2, steps, sfpu=1)
+    eltwise("cast_grad_results", q_elems + 2 * kv_elems, 1, out_dtype=query.dtype)
 
 
 def _ring_attention_parts(roofline_ctx, query, key, cp_size, phase, accumulator_elements, kv_bytes) -> None:

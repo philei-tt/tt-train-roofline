@@ -9,11 +9,12 @@ optimizer weight update operations.
 """
 
 from __future__ import annotations
+import dataclasses
 from typing import Dict, List, Optional, TYPE_CHECKING
 
 from ..hardware import DataType
 from ..mock_tensor import MockTensor, TensorLabel
-from ..roofline import RooflineEstimate, elementwise_roofline
+from ..roofline import elementwise_roofline
 
 if TYPE_CHECKING:
     from ..roofline import RooflineContext
@@ -112,15 +113,8 @@ class MockAdamW:
                 phase="optimizer",
             )
             total_bytes = int(per_element * num_elements)
-            ctx.add_perf_result(RooflineEstimate(
-                operation=estimate.operation,
-                phase=estimate.phase,
-                total_flops=estimate.total_flops,
-                total_bytes=total_bytes,
-                ideal_compute_ns=estimate.ideal_compute_ns,
-                ideal_memory_ns=total_bytes / ctx.hw.dram_bw_gb_s,
-                hw=ctx.hw,
-            ))
+            ctx.add_perf_result(dataclasses.replace(
+                estimate, total_bytes=total_bytes, ideal_memory_ns=total_bytes / ctx.hw.dram_bw_gb_s))
 
     def estimate_memory(self) -> int:
         """Optimizer state memory of this replica in bytes (m, v and any master copy)."""

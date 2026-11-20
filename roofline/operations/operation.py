@@ -232,6 +232,12 @@ class RooflineFunction:
         first_estimate = len(roofline_ctx.estimates)
         outputs = cls.forward(ctx, roofline_ctx, *inputs)
 
+        # Normalize outputs to tuple for consistent handling
+        if not isinstance(outputs, tuple):
+            outputs_tuple = (outputs,)
+        else:
+            outputs_tuple = outputs
+
         # Selective recompute: the op's outputs and the tensors it saved are not held until
         # backward; its forward runs again at the start of its backward
         recompute: list = []
@@ -239,16 +245,9 @@ class RooflineFunction:
             recompute = [dataclasses.replace(e, phase="backward", operation=f"{e.operation}.recompute")
                          for e in roofline_ctx.estimates[first_estimate:] if e.phase == "forward"]
             input_ids = {id(t) for t in inputs}
-            produced = outputs if isinstance(outputs, tuple) else (outputs,)
-            for t in (*produced, *ctx.saved_tensors):
+            for t in (*outputs_tuple, *ctx.saved_tensors):
                 if isinstance(t, MockTensor) and id(t) not in input_ids and t.label != TensorLabel.PARAMETER:
                     t.untrack()
-
-        # Normalize outputs to tuple for consistent handling
-        if not isinstance(outputs, tuple):
-            outputs_tuple = (outputs,)
-        else:
-            outputs_tuple = outputs
 
         # Note: Activations are now labeled in save_for_backward()
         # Output tensors that aren't saved for backward will remain unlabeled
@@ -318,22 +317,17 @@ class RooflineFunction:
                         # If tensor already has a gradient, add roofline estimate for accumulation
                         if tensor.is_grad_initialized():
                             num_elements = tensor.logical_volume()
-                            accumulated = tensor.get_grad()
                             estimate = elementwise_roofline(
                                 bwd_roofline_ctx.hw,
                                 num_elements,
                                 num_inputs=2,  # read existing grad + new grad
                                 sfpu_ops_per_element=0.0,
                                 fpu_ops_per_element=1.0,  # addition
-                                dtype=accumulated.dtype,
+                                dtype=tensor.get_grad().dtype,  # the accumulator's
                                 operation="GradAccum",
                                 phase="backward",
                             )
                             bwd_roofline_ctx.add_perf_result(estimate)
-                            if accumulated.dtype != grad.dtype:
-                                # the sum keeps the accumulator's dtype (fp32 gradient accumulation)
-                                grad = create_grad_tensor(grad.shape, accumulated.dtype, grad.layout,
-                                                          name=accumulated.name, num_shards=grad.num_shards)
                         tensor.add_grad(grad)
 
                 # Clear saved tensors to allow early deallocation of activations

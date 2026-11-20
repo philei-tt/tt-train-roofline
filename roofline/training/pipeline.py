@@ -216,7 +216,7 @@ def simulate_schedule(
     orders = schedule.order(P, m)
     last = P * v - 1
     if vocab is not None:
-        starts = _play(orders, P, m, v, f, b, last, None)[2]
+        starts = _play(orders, P, v, f, b, None)[2]
         for d in range(P):
             begin = [starts[op_key(op, d, P)][0] for op in orders[d]]  # increasing: a device runs in order
             placed = [(bisect.bisect_left(begin, starts[("F", j, last)][1]), j) for j in range(m)]
@@ -224,7 +224,7 @@ def simulate_schedule(
             for pos, j in sorted(placed, reverse=True):
                 new.insert(pos, ("H", j, 0))
             orders[d] = new
-    free, peak, _ = _play(orders, P, m, v, f, b, last, vocab)
+    free, peak, _ = _play(orders, P, v, f, b, vocab)
     end = max(free)
     busy = m * sum(f[d] + b[d] + (vocab[d] if vocab is not None else 0.0) for d in range(P))
     return 1.0 - busy / (P * end), peak, end
@@ -236,9 +236,10 @@ def op_key(op: Tuple[str, int, int], device: int, num_stages: int) -> Tuple[str,
     return kind, mb, chunk * num_stages + device
 
 
-def _play(orders, P, m, v, f, b, last, vocab):
+def _play(orders, P, v, f, b, vocab):
     """Run the orders on a common clock. Returns (free time per device, peak held per device,
     {op key: (start, end)})."""
+    last = P * v - 1
     done = {}
     pos = [0] * P
     free = [0.0] * P
@@ -250,7 +251,7 @@ def _play(orders, P, m, v, f, b, last, vocab):
         for d in range(P):
             order, fd, bd = orders[d], f[d] / v, b[d] / v
             while pos[d] < len(order):
-                kind, mb, chunk = order[pos[d]]
+                kind, mb, stage = op_key(order[pos[d]], d, P)
                 if kind == "H":
                     dep = ("F", mb, last)
                     if dep not in done:
@@ -259,7 +260,6 @@ def _play(orders, P, m, v, f, b, last, vocab):
                     end = start + vocab[d]
                     key = ("H", mb, d)
                 else:
-                    stage = chunk * P + d
                     if kind == "F":
                         dep = ("F", mb, stage - 1) if stage > 0 else None
                     else:

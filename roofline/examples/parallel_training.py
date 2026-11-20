@@ -38,6 +38,7 @@ import argparse
 import dataclasses
 import gc
 import itertools
+import math
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
@@ -66,8 +67,7 @@ OPTIMIZER_PHASES = ("optimizer", "grad_clip")
 SYNC_PHASES = ("ccl",)  # gradient sync across the CP and DP groups
 
 # What --mode sets (see the module docstring); features only the target mode allows
-MODES = {"current": {"attn_block": None, "cp_mode": "current"},
-         "target": {"attn_block": 512, "cp_mode": "target"}}
+ATTN_BLOCK = {"current": None, "target": 512}  # per mode; the mode is also the ring-attention model
 TARGET_ONLY = {"vocab_parallel": "vocabulary parallelism across pipeline stages", "zero1": "ZeRO-1"}
 RECOMPUTE = ("none", "selective", "full")
 DTYPES = {"bf16": DataType.BFLOAT16, "fp32": DataType.FLOAT32}
@@ -144,8 +144,9 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
     stage = MockDistributedLlama(config, runner="mem_eff" if opts.recompute == "full" else "default")
     params = stage.parameters()
     master = DTYPES[opts.master_dtype]
+    replica_groups = [("cp", cp), ("dp", dp)]  # weights are replicated across CP and the DP copies
     optimizer = MockAdamW(params, master_dtype=master if master != DataType.BFLOAT16 else None,
-                          num_shards=cp * dp if opts.zero1 else 1)
+                          num_shards=math.prod(n for _, n in replica_groups) if opts.zero1 else 1)
     local_seq = seq_len // cp
     # Steady state: every micro-batch after the first finds all gradients already allocated, adds
     # into them out of place (tt-train's Tensor::add_grad) and holds them next to its activations
@@ -178,8 +179,7 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
 
     for root in roots:
         root.backward(ctx, retain_graph=False)
-    # weights are replicated across the CP group and the DP copies of the pipeline
-    synchronize_replica_gradients(ctx, params, [("cp", cp), ("dp", dp)], zero1=opts.zero1)
+    synchronize_replica_gradients(ctx, params, replica_groups, zero1=opts.zero1)
     optimizer.step(ctx)
     mock_clip_grad_norm(ctx, params, max_norm=1.0)
     del x, out, logits, roots  # release the micro-batch's tensors before reading the state
@@ -189,7 +189,7 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
     ctx.disable_memory_tracking()
 
     head_forward_ms = head_backward_ms = 0.0
-    if opts.vocab_parallel and pp > 1:
+    if opts.vocab_parallel:
         # The LM-head shard and loss alone, for the schedule's separate vocabulary pass
         head = _context(hw, opts, group_topology, link_share)
         head.disable_memory_tracking()
@@ -268,7 +268,7 @@ def run_parallel_roofline(
         pp, tp, cp, dp: pipeline, tensor, context and data parallel degrees
         schedule: pipeline schedule: "naive", "gpipe", "1f1b" or "interleaved"
         interleave: v, model chunks per pipeline device (interleaved schedule only)
-        mode: "current" (tt-train today) or "target" (planned kernels and features); see MODES
+        mode: "current" (tt-train today) or "target" (planned kernels and features); see ATTN_BLOCK
         sequence_parallel: Megatron sequence parallelism inside TP
         vocab_parallel: split the LM head across all pipeline stages (target only)
         recompute: "none", "selective" (norms, activations and attention recomputed in backward;
@@ -294,8 +294,8 @@ def run_parallel_roofline(
         return {"error": f"Unknown Llama preset: {model_name}"}
     if hardware not in HARDWARE_PRESETS:
         return {"error": f"Unknown hardware: {hardware}. Available: {', '.join(HARDWARE_PRESETS)}"}
-    if mode not in MODES:
-        return {"error": f"mode must be one of {', '.join(MODES)}"}
+    if mode not in ATTN_BLOCK:
+        return {"error": f"mode must be one of {', '.join(ATTN_BLOCK)}"}
     hw = HARDWARE_PRESETS[hardware]
     overrides = {k: v for k, v in (("num_links", num_links), ("topology", topology)) if v is not None}
     if overrides:
@@ -309,7 +309,8 @@ def run_parallel_roofline(
     blocks = list(blocks_per_stage) if blocks_per_stage is not None else even_split(L, pp)
     m = num_microbatches // dp if num_microbatches % dp == 0 else 0
     schedule_error = sched.validate(pp, m, blocks) if pp > 1 and m else ""
-    target_only = [TARGET_ONLY[k] for k, on in (("vocab_parallel", vocab_parallel and pp > 1), ("zero1", zero1)) if on]
+    vocab_parallel = vocab_parallel and pp > 1
+    target_only = [TARGET_ONLY[k] for k, on in (("vocab_parallel", vocab_parallel), ("zero1", zero1)) if on]
     checks = [
         (not (mode == "current" and target_only),
          f"{' and '.join(target_only)}: not in tt-train today, only with mode target"),
@@ -333,9 +334,9 @@ def run_parallel_roofline(
     group_topology = placement["topology"] if topology is None else {g: topology for g in ("tp", "cp", "dp")}
     if cut_links is None:
         cut_links = placement["cut_links"]
-    opts = Options(sequence_parallel=sequence_parallel, vocab_parallel=vocab_parallel and pp > 1,
-                   recompute=recompute, cp_mode=MODES[mode]["cp_mode"],
-                   attn_block=attn_block if attn_block is not None else MODES[mode]["attn_block"],
+    opts = Options(sequence_parallel=sequence_parallel, vocab_parallel=vocab_parallel,
+                   recompute=recompute, cp_mode=mode,
+                   attn_block=attn_block if attn_block is not None else ATTN_BLOCK[mode],
                    master_dtype=master_dtype, grad_dtype=grad_dtype, zero1=zero1)
 
     cache = stage_cache if stage_cache is not None else {}
@@ -575,7 +576,7 @@ def main():
     parser.add_argument("--tp", type=int, default=1, help="Tensor parallel degree")
     parser.add_argument("--cp", type=int, default=1, help="Context parallel degree (ring attention)")
     parser.add_argument("--dp", type=int, default=1, help="Data parallel copies of the pipeline")
-    parser.add_argument("--mode", default="target", choices=list(MODES),
+    parser.add_argument("--mode", default="target", choices=list(ATTN_BLOCK),
                         help="current: tt-train today; target: planned kernels and features (default)")
     parser.add_argument("--schedule", default="1f1b", choices=("naive", "gpipe", "1f1b", "interleaved"),
                         help="Pipeline schedule (default: 1f1b)")
@@ -630,9 +631,9 @@ def main():
         _print(out, args)
         # The other mode, for comparison; current drops the target-only features
         other = "current" if args.mode == "target" else "target"
-        dropped = [TARGET_ONLY[k] for k in TARGET_ONLY if single[k] and other == "current"]
-        alt = run_parallel_roofline(**{**single, "mode": other,
-                                       **({k: False for k in TARGET_ONLY} if other == "current" else {})})
+        overrides = {k: False for k in TARGET_ONLY} if other == "current" else {}
+        dropped = [TARGET_ONLY[k] for k in overrides if single[k]]
+        alt = run_parallel_roofline(**{**single, "mode": other, **overrides})
         if "error" in alt:
             print(f"  {other}: {alt['error']}")
         else:

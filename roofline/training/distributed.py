@@ -12,9 +12,10 @@ Mirrors ttml::core::distributed (distributed.cpp).
 """
 
 from __future__ import annotations
+import math
 from typing import Dict, Sequence, Tuple, TYPE_CHECKING
 
-from ..mock_tensor import MockTensor, TensorLabel
+from ..mock_tensor import MockTensor
 from ..roofline import all_gather_roofline, all_reduce_roofline, elementwise_roofline, reduce_scatter_roofline
 
 if TYPE_CHECKING:
@@ -72,9 +73,7 @@ def synchronize_gradients(
 ) -> None:
     """Synchronize (all-reduce + average) parameter gradients across DDP devices.
 
-    Mirrors ttml::core::distributed::synchronize_gradients:
-      1. all_reduce each parameter gradient
-      2. multiply by 1/N to average
+    Mirrors ttml::core::distributed::synchronize_gradients; one group of synchronize_replica_gradients.
 
     Args:
         ctx: Roofline context for accumulating estimates
@@ -83,39 +82,7 @@ def synchronize_gradients(
         group: parallel group the replicas form ("dp", or "cp" for context-parallel replicas);
             picks its ring or line topology (RooflineContext.hw_for)
     """
-    if num_devices <= 1:
-        return
-
-    for name, param in parameters.items():
-        if not param.is_grad_initialized():
-            continue
-
-        grad = param.get_grad()
-        tensor_bytes = grad.bytes() if grad is not None else param.bytes()
-
-        # all-reduce
-        estimate = all_reduce_roofline(
-            ctx.hw_for(group),
-            tensor_bytes,
-            num_devices,
-            operation=f"SyncGrad.AllReduce.{name}",
-            phase="ccl",
-        )
-        ctx.add_perf_result(estimate)
-
-        # divide by N (elementwise multiply by 1/N)
-        num_elements = grad.logical_volume() if grad is not None else param.logical_volume()
-        estimate = elementwise_roofline(
-            ctx.hw,
-            num_elements,
-            num_inputs=1,
-            sfpu_ops_per_element=0.0,
-            fpu_ops_per_element=1.0,
-            dtype=param.dtype,
-            operation=f"SyncGrad.Scale.{name}",
-            phase="ccl",
-        )
-        ctx.add_perf_result(estimate)
+    synchronize_replica_gradients(ctx, parameters, [(group, num_devices)])
 
 
 def synchronize_replica_gradients(
@@ -138,13 +105,11 @@ def synchronize_replica_gradients(
     groups = [(g, n) for g, n in groups if n > 1]
     if not groups:
         return
+    replicas = math.prod(n for _, n in groups)
     for name, param in parameters.items():
         if not param.is_grad_initialized():
             continue
         grad = param.get_grad()
-        replicas = 1
-        for _, n in groups:
-            replicas *= n
         # average: multiply by 1/N, on the full gradient or this replica's shard
         ctx.add_perf_result(elementwise_roofline(
             ctx.hw, grad.logical_volume() // (replicas if zero1 else 1), num_inputs=1, sfpu_ops_per_element=0.0,
@@ -159,9 +124,7 @@ def synchronize_replica_gradients(
             ctx.add_perf_result(reduce_scatter_roofline(
                 ctx.hw_for(g), size, n, operation=f"SyncGrad.ReduceScatter.{g}.{name}", phase="ccl"))
             size //= n
-        size = param.bytes()
-        for g, n in groups:
-            size //= n
+        size = param.bytes() // replicas
         for g, n in reversed(groups):
             ctx.add_perf_result(all_gather_roofline(
                 ctx.hw_for(g), size, n, operation=f"ZeRO1.AllGather.{g}.{name}", phase="ccl"))
