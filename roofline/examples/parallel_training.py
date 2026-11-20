@@ -181,7 +181,7 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
         root.backward(ctx, retain_graph=False)
     synchronize_replica_gradients(ctx, params, replica_groups, zero1=opts.zero1)
     optimizer.step(ctx)
-    mock_clip_grad_norm(ctx, params, max_norm=1.0)
+    mock_clip_grad_norm(ctx, params, max_norm=1.0, num_shards=optimizer.num_shards)
     del x, out, logits, roots  # release the micro-batch's tensors before reading the state
     gc.collect()
     state_bytes, _ = ctx.memory_tracker.current_memory()
@@ -617,6 +617,9 @@ def main():
                   master_dtype=args.master_dtype, grad_dtype=args.grad_dtype, zero1=args.zero1, mode=args.mode,
                   cut_links=args.cut_links, attn_block=args.attn_block, num_links=args.links, topology=args.topology)
     if args.sweep:
+        target_only = [TARGET_ONLY[k] for k in TARGET_ONLY if common[k]]
+        if args.mode == "current" and target_only:
+            raise SystemExit(f"{' and '.join(target_only)}: not in tt-train today, only with mode target")
         results = sweep(args.sweep, **common)
         fits = sorted((r for r in results if r["memory"]["fits"]), key=lambda r: -r["roofline"]["tokens_per_second"])
         print(f"mode {args.mode}: {len(fits)} of {len(results)} configurations fit in memory")

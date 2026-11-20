@@ -190,7 +190,7 @@ class RooflineContext:
     # Current fusion id (see fused()) and a counter for new ones
     current_fusion: Optional[str] = None
     _fusion_count: int = 0
-    _group_hw: Dict[str, HardwareSpec] = field(default_factory=dict)  # hw_for() cache
+    _group_hw: Dict[Tuple[str, int], HardwareSpec] = field(default_factory=dict)  # hw_for() cache
 
     # Memory tracker for detailed allocation tracking
     memory_tracker: Optional[MemoryTracker] = field(default=None)
@@ -227,14 +227,14 @@ class RooflineContext:
         """Hardware spec for the collectives of a parallel group: its own ring or line topology, and
         its share of each link when several groups of the same kind cross the same links (DP groups
         whose members are whole pipelines apart)."""
-        if group not in self._group_hw:
+        key = (self.group_topology.get(group, self.hw.topology), self.group_link_share.get(group, 1))
+        if key not in self._group_hw:
             import dataclasses
 
-            topology = self.group_topology.get(group, self.hw.topology)
-            share = self.group_link_share.get(group, 1)
-            self._group_hw[group] = (self.hw if topology == self.hw.topology and share == 1 else dataclasses.replace(
+            topology, share = key
+            self._group_hw[key] = (self.hw if topology == self.hw.topology and share == 1 else dataclasses.replace(
                 self.hw, topology=topology, eth_bw_gb_s_per_link=self.hw.eth_bw_gb_s_per_link / share))
-        return self._group_hw[group]
+        return self._group_hw[key]
 
     def new_fusion(self, label: str) -> str:
         """A fresh fusion id."""

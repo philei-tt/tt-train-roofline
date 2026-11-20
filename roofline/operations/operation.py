@@ -241,7 +241,6 @@ class RooflineFunction:
         # Selective recompute: the op's outputs and the tensors it saved are not held until
         # backward; its forward runs again at the start of its backward
         recompute: list = []
-        rebuilt: list = []  # (shape, dtype, layout, num_shards) of what the recompute allocates again
         if roofline_ctx.selective_recompute and cls.recompute:
             recompute = [dataclasses.replace(e, phase="backward", operation=f"{e.operation}.recompute")
                          for e in roofline_ctx.estimates[first_estimate:] if e.phase == "forward"]
@@ -249,7 +248,7 @@ class RooflineFunction:
             for t in (*outputs_tuple, *ctx.saved_tensors):
                 if isinstance(t, MockTensor) and id(t) not in input_ids and t.label != TensorLabel.PARAMETER:
                     t.untrack()
-                    rebuilt.append((t.shape, t.dtype, t.layout, t.num_shards))
+                    t.recomputed = True
 
         # Note: Activations are now labeled in save_for_backward()
         # Output tensors that aren't saved for backward will remain unlabeled
@@ -288,12 +287,14 @@ class RooflineFunction:
                         grad_outputs.append(None)
                 grad_outputs = tuple(grad_outputs)
 
-                # Selective recompute: the forward runs again, and its tensors are live through
-                # this op's backward (charged here, not before the consumer's backward)
+                # Selective recompute: the op's forward runs again (charged here), and every
+                # recomputed tensor this backward reads (its own, or a producer's it saved) is live
+                # while it runs
                 for estimate in recompute:
                     bwd_roofline_ctx.add_perf_result(dataclasses.replace(estimate))
-                live = [create_activation_tensor(shape, dtype, layout, requires_grad=False, num_shards=shards)
-                        for shape, dtype, layout, shards in rebuilt]
+                live = [create_activation_tensor(t.shape, t.dtype, t.layout, requires_grad=False,
+                                                 num_shards=t.num_shards)
+                        for t in bwd_ctx.saved_tensors if isinstance(t, MockTensor) and t.recomputed]
 
                 # Call backward - single grad for single output, multiple for multi-output
                 with bwd_roofline_ctx.fused(fusion):

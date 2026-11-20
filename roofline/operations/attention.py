@@ -689,7 +689,7 @@ def _current_ring_attention(roofline_ctx, query, key, cp_size, phase) -> None:
     shift("shift_v", k_bytes)
     if phase == "forward":
         eltwise("init_accumulator", q_elems, 0)
-        eltwise("reset_stats", stat, 1, steps)
+        eltwise("reset_stats", stat, 1, steps)  # ttnn::copy from a pre-filled tensor: read + write
         eltwise("slice_lse", stat, 1, steps)
         eltwise("merge_lse_binary", stat, 2, 7 * steps, sfpu=1)  # max, 4 sub, 2 add
         eltwise("merge_lse_unary", stat, 1, 5 * steps, sfpu=1)  # 4 exp, log
@@ -701,7 +701,7 @@ def _current_ring_attention(roofline_ctx, query, key, cp_size, phase) -> None:
     shift("shift_dk", 2 * k_bytes)  # fp32 accumulators: twice the bytes of K in bf16
     shift("shift_dv", 2 * k_bytes)
     eltwise("init_accumulators", q_elems + 2 * kv_elems, 0)
-    eltwise("zero_step_buffers", q_elems + 2 * kv_elems, 1, steps, dtype=query.dtype)
+    eltwise("zero_step_buffers", q_elems + 2 * kv_elems, 1, steps, dtype=query.dtype)  # ttnn::copy of zeros
     eltwise("cast_grads", q_elems + 2 * kv_elems, 1, steps, dtype=query.dtype, out_dtype=f32)
     eltwise("add_grads", q_elems + 2 * kv_elems, 2, steps, sfpu=1)
     eltwise("cast_grad_results", q_elems + 2 * kv_elems, 1, out_dtype=query.dtype)

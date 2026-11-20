@@ -125,6 +125,9 @@ class MockTensor:
         self._grad: Optional[MockTensor] = None
         self._node: Optional[BackwardNode] = None
 
+        # Selective recompute: not held from forward to backward, rebuilt when a backward reads it
+        self.recomputed = False
+
         # Track allocation with global tracker
         self._tracked = False
         if track and _global_memory_tracker is not None:
@@ -357,7 +360,12 @@ def memory_efficient_runner(
             num_shards=saved_input.num_shards,
         )
 
+        # The recomputed forward is part of the backward pass
+        first = len(bwd_ctx.estimates)
         recomputed_out = block(bwd_ctx, input_detached, mask)
+        for e in bwd_ctx.estimates[first:]:
+            if e.phase == "forward":
+                e.phase = "backward"
 
         recomputed_out._grad = saved_out._grad
 

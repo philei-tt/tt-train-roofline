@@ -212,11 +212,11 @@ def simulate_schedule(
     f = list(forward) if forward is not None else [1.0] * P
     b = list(backward) if backward is not None else [2.0] * P
     if P <= 1:
-        return 0.0, [1.0], m * (f[0] + b[0])
+        return 0.0, [1.0], m * (f[0] + b[0] + (vocab[0] if vocab is not None else 0.0))
     orders = schedule.order(P, m)
     last = P * v - 1
     if vocab is not None:
-        starts = _play(orders, P, v, f, b, None)[2]
+        starts = _play(orders, P, v, f, b, None, schedule)[2]
         for d in range(P):
             begin = [starts[op_key(op, d, P)][0] for op in orders[d]]  # increasing: a device runs in order
             placed = [(bisect.bisect_left(begin, starts[("F", j, last)][1]), j) for j in range(m)]
@@ -224,7 +224,7 @@ def simulate_schedule(
             for pos, j in sorted(placed, reverse=True):
                 new.insert(pos, ("H", j, 0))
             orders[d] = new
-    free, peak, _ = _play(orders, P, v, f, b, vocab)
+    free, peak, _ = _play(orders, P, v, f, b, vocab, schedule)
     end = max(free)
     busy = m * sum(f[d] + b[d] + (vocab[d] if vocab is not None else 0.0) for d in range(P))
     return 1.0 - busy / (P * end), peak, end
@@ -236,7 +236,7 @@ def op_key(op: Tuple[str, int, int], device: int, num_stages: int) -> Tuple[str,
     return kind, mb, chunk * num_stages + device
 
 
-def _play(orders, P, v, f, b, vocab):
+def _play(orders, P, v, f, b, vocab, schedule):
     """Run the orders on a common clock. Returns (free time per device, peak held per device,
     {op key: (start, end)})."""
     last = P * v - 1
@@ -282,5 +282,5 @@ def _play(orders, P, v, f, b, vocab):
                 pos[d] += 1
                 progress = True
     if any(pos[d] != len(orders[d]) for d in range(P)):
-        raise RuntimeError("schedule deadlocked")
+        raise RuntimeError(f"{schedule} deadlocked")
     return free, peak, done
