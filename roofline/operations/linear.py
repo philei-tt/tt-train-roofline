@@ -129,6 +129,7 @@ class MockLinearOp(RooflineFunction):
             operation="Linear.backward.grad_weight",
             phase="backward",
         )
+        estimate.wgrad_operand_bytes = input.bytes() + grad_output.bytes()
         roofline_ctx.add_perf_result(estimate)
         grad_weight = create_grad_tensor(
             weight.shape, weight.dtype, weight.layout, name="grad_weight"

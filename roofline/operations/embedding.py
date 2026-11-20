@@ -103,6 +103,7 @@ class MockEmbeddingOp(RooflineFunction):
             operation="Embedding.backward",
             phase="backward",
         )
+        estimate.wgrad_operand_bytes = indices.bytes() + grad_output.bytes()
         roofline_ctx.add_perf_result(estimate)
 
         # Gradient has same shape as weight

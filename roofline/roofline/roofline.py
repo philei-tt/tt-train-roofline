@@ -94,6 +94,9 @@ class RooflineEstimate:
     ideal_memory_ns: float
     hw: HardwareSpec
     ideal_network_ns: float = 0.0
+    # Weight-gradient estimates only: bytes of the activation and output gradient the weight
+    # gradient reads, which stay allocated while the weight gradient is deferred
+    wgrad_operand_bytes: int = 0
 
     @property
     def theoretical_time_ns(self) -> float:

@@ -226,6 +226,18 @@ MFU     = model FLOPs / T_step / (chips * peak)
 
 `simulate_schedule` plays any schedule out op by op on a common clock; every closed form above matches it.
 
+Two options apply on top of `1f1b` and `interleaved` (`--wgrad-deferral` on any schedule):
+
+- `--pairing`: in the steady state, a forward and a backward of two different micro-batches run as one unit, so one's TP collectives run under the other's compute (DualPipe's forward/backward chunk pairs, DeepSeek-V3 report, 2024). A pair hands both outputs on when it ends, so the warm-up must shrink by two forwards per device: 1F1B runs 2 (P - d - 1) + 1 warm-up forwards on device d, nearly 2P micro-batches held on device 0; interleaved 1F1B, whose warm-up already shrinks by two, runs one more.
+- `--wgrad-deferral`: the backward is split into the input gradient (B) and the weight gradient (W: `Linear.backward.grad_weight`, `Embedding.backward`); W runs later, in gaps it fits in (Zero Bubble Pipeline Parallelism, Qi et al., 2024). Between B and W a micro-batch keeps only the W operands (each linear's input and output gradient, `RooflineEstimate.wgrad_operand_bytes`). No device holds more than device 0 does without deferral (ZB-H1's limit); on `1f1b` this reproduces ZB-H1's bubble (P - 1)(F + B - W). With `--recompute` the W operands are the recomputed block's linear inputs, many times the checkpoint, so deferral has little memory room.
+
+The schedule played out by the simulator gives a third step time, **scheduled**: every device runs the slowest stage's forward, backward and weight-gradient passes, each with its own FLOP, DRAM and fabric time. A pass run alone takes `max(FLOP, DRAM, ring-shift + hand-off fabric) + TP collective time`; a pair takes the largest of the summed resources. Without either option it shows what exposed TP collectives cost; with `--pairing` it approaches the overlapped roofline. With an option on, the overlapped roofline takes its bubble from the same simulation with all fabric time hidden.
+
+```bash
+python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 64 \
+    --pp 8 --tp 4 --cp 4 --sp --attn-bwd-kv-block 512 --pairing --wgrad-deferral
+```
+
 The per-op serial time (sum of `max(compute, DRAM, network)` over ops, as in `training.py`) is reported next to it.
 
 Supporting changes:
@@ -239,6 +251,7 @@ Supporting changes:
 | `MockRingAttentionOp`, `cp_size` on the distributed block | Ring attention: attention of the full sequence divided by `cp`, K/V (bf16) shifts forward, K/V + dK/dV (fp32) backward, fp32 accumulator read + write per ring step |
 | `sequence_parallel` on the parallel linears, attention, MLP, block and `MockDistributedLlamaConfig` | All-gather / reduce-scatter along the sequence instead of broadcast / all-reduce; norms and residual adds hold `S / tp` tokens |
 | `num_stages`, `stage_index`, `vocab_parallel` on `MockDistributedLlamaConfig`; `training/pipeline.py` | The model as one pipeline stage (`forward_stage`); schedule classes (`NaiveSchedule`, `GPipeSchedule`, `OneFOneBSchedule`, `InterleavedOneFOneBSchedule`) and a schedule simulator |
+| `RooflineEstimate.wgrad_operand_bytes` | Set on weight-gradient estimates: bytes of the input and output gradient they read, held while W is deferred |
 | `BLACKHOLE_QUAD`, `HARDWARE_PRESETS` | 4 galaxies, 128 chips, 32 x 4 torus, 2 links per neighbouring chip pair; one name-to-spec map used by both examples (`--hardware bh_quad`) |
 
 Limitations: TP must divide the number of KV heads (as in tt-train). With `--sp` each column-parallel linear keeps its all-gathered input for backward (Megatron keeps the shard and re-gathers), so memory is higher than Megatron's. The communication of vocabulary parallelism is not modelled. `--cut-links` (default 8) assumes stages laid along the 32-chip axis of a quad.
