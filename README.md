@@ -218,9 +218,10 @@ T_pipe  = the schedule played out op by op (simulate_schedule) with device d tak
 T_step  = T_pipe + CP gradient all-reduce + optimizer (per-op sums, slowest stage)
 bubble  = idle share of the step over all devices = (slots - m) / slots when all devices are equal
 upper bound: the same with every resource summed over the micro-batch and only the largest counted
-MFU     = model FLOPs / T_step / (chips * peak)
-          model FLOPs: counted by the mock run over all stages, forward + backward without recompute
-          (as tt-train's tools/profiling/results_json/add_roofline.py)
+MFU     = ideal time / T_step,  ideal time = model FLOPs / (chips * peak)
+          model FLOPs per token = 6 N + 6 L E S (closed form; N counted as tt-train's models/llama/flops.py,
+          attention over the causal half; flops.py counts the full square, 12 L E S)
+          peak: HiFi4, the fidelity the roofline times matmuls at (printed with the result)
 ```
 
 `slots` is the step length in micro-batch times and comes from the schedule (`roofline/training/pipeline.py`). Each schedule also gives the micro-batches whose activations a device holds at once, which sets memory:

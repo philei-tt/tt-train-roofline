@@ -75,8 +75,6 @@ class StageCost:
     activation_bytes: int  # held from forward to backward by the blocks, one micro-batch (excl. LM head)
     state_bytes: int  # parameters + gradients + optimizer state
     peak_bytes: int  # peak of the whole one-micro-batch run (incl. backward transients)
-    flops_per_mb: int  # one micro-batch on one device, forward + backward
-    embedding_flops_per_mb: int
     output_bytes: int  # activation sent to the next stage, per device
 
 
@@ -171,8 +169,6 @@ def _run_stage(hw, preset, seq_len, tp, cp, pp, stage_index, stage_blocks, seque
         activation_bytes=mem_after_blocks - mem_before,
         state_bytes=state_bytes,
         peak_bytes=peak_bytes,
-        flops_per_mb=ctx.forward_flops() + ctx.backward_flops(),
-        embedding_flops_per_mb=sum(e.total_flops for e in ctx.estimates if e.operation.startswith("Embedding.")),
         output_bytes=output_bytes,
     )
 
@@ -276,10 +272,6 @@ def run_parallel_roofline(
 
     costs = [stage_cost(d, recompute) for d in range(pp)]
 
-    # Model FLOPs for MFU: FLOPs the mock run counts for one micro-batch through every stage,
-    # without recompute (as tt-train's tools/profiling/results_json/add_roofline.py does).
-    # Counts are per device: x tp * cp.
-    model_flops_per_mb = sum(stage_cost(d, False).flops_per_mb for d in range(pp)) * tp * cp
 
     # Stage hand-off: every device of the stage sends its part of the activation (forward) or its
     # gradient (backward) across the cut; without SP every TP chip holds the full activation.
@@ -327,12 +319,14 @@ def run_parallel_roofline(
     memory = device_memory[worst]
 
     tokens = m * seq_len
+    # MFU = ideal time / step time: the ideal time runs the model's FLOPs (closed form, causal
+    # attention) on every chip at peak, the fidelity the roofline times matmuls at (HiFi4)
     peak = hw.tflops_per_chip(MathFidelity.HiFi4) * 1e12
-    model_flops = model_flops_per_mb * m
+    model_flops = model_flops_per_token(preset, seq_len) * tokens
+    ideal_ms = model_flops / (chips * peak) * 1e3
 
     def throughput(step_ms: float) -> Dict[str, float]:
-        return {"step_ms": step_ms, "tokens_per_second": tokens / (step_ms / 1e3),
-                "mfu": model_flops / (step_ms / 1e3) / (chips * peak)}
+        return {"step_ms": step_ms, "tokens_per_second": tokens / (step_ms / 1e3), "mfu": ideal_ms / step_ms}
 
     bound = max(("flop", "dram", "fabric"), key=lambda k: D[f"{k}_ms"])
     return {
@@ -344,12 +338,33 @@ def run_parallel_roofline(
                    "attn_block": attn_block, "blocks_per_stage": blocks},
         "per_microbatch": {**D, "bound": bound, "handoff_ms": hand},
         "bubble": bubble,
+        "ideal_ms": ideal_ms,
+        "peak": {"tflops_per_chip": peak / 1e12, "fidelity": "HiFi4", "cores": hw.tensix_cores_per_chip,
+                 "clock_ghz": hw.clock_ghz},
         "roofline": throughput(step_roofline),
         "upper_bound": throughput(step_bound),
         "memory": {"peak_gb": memory / 1e9, "fits": memory <= hw.dram_gb_per_chip * 1e9, "device": worst,
                    "activation_gb_per_mb": costs[worst].activation_bytes / 1e9,
                    "peak_activations": held[worst], "state_gb": costs[worst].state_bytes / 1e9},
     }
+
+
+def model_flops_per_token(preset: dict, seq_len: int) -> float:
+    """Training FLOPs per token in closed form: 6 * N + 6 * L * E * S.
+
+    N counts the matmul weights as tt-train's ttml/models/llama/flops.py does (per block q, k, v, o,
+    gate, up, down and the norms; plus the LM head; the embedding lookup does no matmul). Attention
+    (QK^T and AV, forward and backward) is counted over the causal half, 6 * L * H * d * S with
+    H * d = E; tt-train's flops.py counts the full square, 12 * L * H * d * S.
+    """
+    E, L, V = preset["embedding_dim"], preset["num_blocks"], preset["vocab_size"]
+    head_dim = E // preset["num_heads"]
+    kv = preset["num_groups"] * head_dim
+    ff = preset.get("intermediate_dim")
+    if ff is None:  # as tt-train's LlamaMLP: 8E/3 rounded up to a multiple of 256
+        ff = ((4 * E * 2) // 3 + 255) // 256 * 256
+    n = L * (2 * E * E + 2 * E * kv + E + 3 * E * ff + E) + V * E + E
+    return 6 * n + 6 * L * E * seq_len
 
 
 def place_stages(hw, pp: int, tp: int, cp: int, interleaved: bool = False) -> Dict[str, Any]:
@@ -505,8 +520,11 @@ def main():
         if len(set(out["config"]["blocks_per_stage"])) > 1:
             print(f"  blocks per stage: {out['config']['blocks_per_stage']}")
         print(f"  bubble {out['bubble']:.2%}")
-        print(f"  roofline (sum of per-op max): {o['tokens_per_second']:,.0f} tokens/s, MFU {o['mfu']:.1%}, "
-              f"step {o['step_ms']/1e3:.2f} s")
+        pk = out["peak"]
+        print(f"  roofline (sum of per-op max): {o['tokens_per_second']:,.0f} tokens/s, step {o['step_ms']/1e3:.2f} s")
+        print(f"  MFU {o['mfu']:.1%} = ideal {out['ideal_ms']/1e3:.2f} s / roofline {o['step_ms']/1e3:.2f} s; ideal: "
+              f"6N + causal attention at {pk['tflops_per_chip']:.1f} TFLOP/s per chip "
+              f"({pk['fidelity']}, {pk['cores']} cores, {pk['clock_ghz']} GHz) x {out['config']['chips']} chips")
         print(f"  upper bound (max of summed resources): {ub['tokens_per_second']:,.0f} tokens/s, MFU {ub['mfu']:.1%}")
         print(f"  memory per chip: {mem['peak_gb']:.1f} GB on device {mem['device']} "
               f"({'fits' if mem['fits'] else 'does not fit'}; state {mem['state_gb']:.1f} GB + "
