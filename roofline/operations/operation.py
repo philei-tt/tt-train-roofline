@@ -241,6 +241,7 @@ class RooflineFunction:
         # Selective recompute: the op's outputs and the tensors it saved are not held until
         # backward; its forward runs again at the start of its backward
         recompute: list = []
+        rebuilt: list = []  # (shape, dtype, layout, num_shards) of what the recompute allocates again
         if roofline_ctx.selective_recompute and cls.recompute:
             recompute = [dataclasses.replace(e, phase="backward", operation=f"{e.operation}.recompute")
                          for e in roofline_ctx.estimates[first_estimate:] if e.phase == "forward"]
@@ -248,6 +249,7 @@ class RooflineFunction:
             for t in (*outputs_tuple, *ctx.saved_tensors):
                 if isinstance(t, MockTensor) and id(t) not in input_ids and t.label != TensorLabel.PARAMETER:
                     t.untrack()
+                    rebuilt.append((t.shape, t.dtype, t.layout, t.num_shards))
 
         # Note: Activations are now labeled in save_for_backward()
         # Output tensors that aren't saved for backward will remain unlabeled
@@ -286,8 +288,12 @@ class RooflineFunction:
                         grad_outputs.append(None)
                 grad_outputs = tuple(grad_outputs)
 
+                # Selective recompute: the forward runs again, and its tensors are live through
+                # this op's backward (charged here, not before the consumer's backward)
                 for estimate in recompute:
                     bwd_roofline_ctx.add_perf_result(dataclasses.replace(estimate))
+                live = [create_activation_tensor(shape, dtype, layout, requires_grad=False, num_shards=shards)
+                        for shape, dtype, layout, shards in rebuilt]
 
                 # Call backward - single grad for single output, multiple for multi-output
                 with bwd_roofline_ctx.fused(fusion):
@@ -317,23 +323,29 @@ class RooflineFunction:
                         # If tensor already has a gradient, add roofline estimate for accumulation
                         if tensor.is_grad_initialized():
                             num_elements = tensor.logical_volume()
+                            accumulator = tensor.get_grad().dtype
                             estimate = elementwise_roofline(
                                 bwd_roofline_ctx.hw,
                                 num_elements,
-                                num_inputs=2,  # read existing grad + new grad
+                                num_inputs=1,  # the new gradient; the accumulator is the other input
                                 sfpu_ops_per_element=0.0,
                                 fpu_ops_per_element=1.0,  # addition
-                                dtype=tensor.get_grad().dtype,  # the accumulator's
+                                dtype=grad.dtype,
+                                out_dtype=accumulator,
                                 operation="GradAccum",
                                 phase="backward",
                             )
-                            bwd_roofline_ctx.add_perf_result(estimate)
+                            # read the accumulator too (fp32 accumulation: 4 + 2 + 4 bytes per element)
+                            nbytes = estimate.total_bytes + num_elements * accumulator.value
+                            bwd_roofline_ctx.add_perf_result(dataclasses.replace(
+                                estimate, total_bytes=nbytes, ideal_memory_ns=nbytes / bwd_roofline_ctx.hw.dram_bw_gb_s))
                         tensor.add_grad(grad)
 
                 # Clear saved tensors to allow early deallocation of activations
                 # This happens after backward computes gradients but before
                 # MockTensor.backward() clears the entire backward_fn
                 bwd_ctx.clear_saved_tensors()
+                del live
 
             return backward_fn
 

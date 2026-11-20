@@ -289,6 +289,8 @@ def run_parallel_roofline(
     Returns:
         Result dict, or {"error": str}
     """
+    if min(dp, pp, tp, cp, interleave, num_microbatches) < 1:
+        return {"error": "dp, pp, tp, cp, interleave and the number of micro-batches must be >= 1"}
     preset = MODEL_PRESETS.get(model_name)
     if preset is None or preset["model_type"] != ModelType.LLAMA:
         return {"error": f"Unknown Llama preset: {model_name}"}
@@ -399,12 +401,14 @@ def run_parallel_roofline(
         return total * r, total * (1 - r)
 
     ub_f, ub_b, ub_v = [], [], []
-    for p, c, h in zip(per_stage, costs, head):
-        share = h / (c.mb_forward_ms + c.mb_backward_ms)
+    for p, h in zip(per_stage, head):
+        # the vocabulary pass's share of the device's roofline time (its communication is in fabric_ms)
+        share = (h + vocab_comm) / p["roofline_ms"] if opts.vocab_parallel else 0.0
+        c = costs[len(ub_f)]
         f, b = split(p["upper_bound_ms"] * (1 - share), c.mb_forward_bound_ms, c.mb_backward_bound_ms)
         ub_f.append(f)
         ub_b.append(b)
-        ub_v.append(p["upper_bound_ms"] * share + vocab_comm)
+        ub_v.append(p["upper_bound_ms"] * share)
     _, _, pipeline_bound_ms = simulate_schedule(sched, pp, m, ub_f, ub_b, ub_v if opts.vocab_parallel else None)
 
     # The gradient sync (CP, DP) and the optimizer run after the last backward, one after the other;
@@ -604,7 +608,8 @@ def main():
     parser.add_argument("--sweep", type=int, default=None, metavar="CHIPS",
                         help="Evaluate every DP x PP x TP x CP split of CHIPS chips and print the best that fit")
     parser.add_argument("--top", type=int, default=10, help="Rows to print with --sweep")
-    parser.add_argument("--output", default=None, help="Write the result (or sweep) as JSON")
+    parser.add_argument("--output", default=None,
+                        help="Write the result (with the other mode's under 'other_mode'), or the sweep, as JSON")
     args = parser.parse_args()
 
     common = dict(model_name=args.model, seq_len=args.seq, num_microbatches=args.microbatches,
@@ -631,8 +636,9 @@ def main():
         _print(out, args)
         # The other mode, for comparison; current drops the target-only features
         other = "current" if args.mode == "target" else "target"
-        overrides = {k: False for k in TARGET_ONLY} if other == "current" else {}
-        dropped = [TARGET_ONLY[k] for k in overrides if single[k]]
+        # the other mode's own attention block; current drops the target-only features
+        overrides = {"attn_block": None, **({k: False for k in TARGET_ONLY} if other == "current" else {})}
+        dropped = [TARGET_ONLY[k] for k in TARGET_ONLY if k in overrides and out["config"][k]]
         alt = run_parallel_roofline(**{**single, "mode": other, **overrides})
         if "error" in alt:
             print(f"  {other}: {alt['error']}")
@@ -641,7 +647,7 @@ def main():
             print(f"  {other}{' without ' + ' and '.join(dropped) if dropped else ''}: "
                   f"{a['tokens_per_second']:,.0f} tokens/s, MFU {a['mfu']:.1%}, "
                   f"memory {alt['memory']['peak_gb']:.1f} GB{'' if alt['memory']['fits'] else ' (does not fit)'}")
-        out = {args.mode: out, other: alt}
+        out["other_mode"] = alt  # the comparison run, same shape
     if args.output:
         with open(args.output, "w") as f:
             json.dump(out, f, indent=2, default=str)
