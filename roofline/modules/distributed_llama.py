@@ -8,8 +8,8 @@ Mirrors ttml::models::distributed::llama::DistributedLlama.
 Same as MockLlama but uses ColumnParallelLinear for the output projection (fc)
 and MockDistributedLlamaBlock for each transformer block.
 
-Optionally the model is one stage of a pipeline (num_stages > 1): it holds blocks
-[stage_index * L/P, (stage_index + 1) * L/P), the first stage the token embedding,
+Optionally the model is one stage of a pipeline (num_stages > 1): it holds stage_num_blocks
+blocks (L/P by default; splits may be uneven), the first stage the token embedding,
 the last stage the final norm and LM head. With vocab_parallel (Yeung et al., 2024,
 "Balancing Pipeline Parallelism with Vocabulary Parallelism") every stage holds 1/P of
 the LM head instead.
@@ -51,6 +51,7 @@ class MockDistributedLlamaConfig:
     cp_size: int = 1  # context parallelism: S / cp_size tokens per device, ring attention
     num_stages: int = 1  # pipeline stages
     stage_index: int = 0
+    stage_num_blocks: Optional[int] = None  # blocks on this stage; default num_blocks // num_stages
     vocab_parallel: bool = False  # LM head split across all pipeline stages
 
 
@@ -72,10 +73,13 @@ class MockDistributedLlama(MockModule):
     ):
         super().__init__()
 
-        if config.num_blocks % config.num_stages != 0:
+        if config.stage_num_blocks is None and config.num_blocks % config.num_stages != 0:
             raise ValueError(
-                f"num_blocks ({config.num_blocks}) must be divisible by num_stages ({config.num_stages})"
+                f"num_blocks ({config.num_blocks}) must be divisible by num_stages ({config.num_stages}) "
+                "unless stage_num_blocks is set"
             )
+        stage_blocks = (config.stage_num_blocks if config.stage_num_blocks is not None
+                        else config.num_blocks // config.num_stages)
         self.config = config
         self.dtype = dtype
         self.runner = runner
@@ -109,7 +113,7 @@ class MockDistributedLlama(MockModule):
                     sequence_parallel=config.sequence_parallel,
                     cp_size=config.cp_size,
                 )
-                for _ in range(config.num_blocks // config.num_stages)
+                for _ in range(stage_blocks)
             ]
         )
         self.ln_fc = None

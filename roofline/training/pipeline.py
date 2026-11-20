@@ -16,11 +16,13 @@ activations a device holds at once:
     1F1B (Narayanan et al., 2021)      m + P - 1           (P - 1) / (m + P - 1)      P
     interleaved 1F1B (same paper)      m + (P - 1) / v     (P - 1) / (v m + P - 1)    simulated
 
-`simulate_schedule` plays any order out op by op on a common clock and checks these.
+`simulate_schedule` plays any order out op by op on a common clock and checks these. Given each
+device's own forward and backward time it also gives the step length when stages differ
+(uneven layer splits, the embedding and LM-head stages).
 """
 
 from __future__ import annotations
-from typing import List, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 Op = Tuple[str, int, int]  # ("F" | "B", micro-batch, chunk)
 
@@ -48,7 +50,7 @@ class PipelineSchedule:
         """Peak micro-batches (of a full stage) whose activations each device holds."""
         return simulate_schedule(self, num_stages, num_microbatches)[1]
 
-    def validate(self, num_stages: int, num_microbatches: int, blocks_per_stage: int) -> str:
+    def validate(self, num_stages: int, num_microbatches: int, blocks_per_stage: Sequence[int]) -> str:
         """Empty string if the schedule applies, else the reason it does not."""
         return ""
 
@@ -149,8 +151,9 @@ class InterleavedOneFOneBSchedule(PipelineSchedule):
     def validate(self, num_stages, num_microbatches, blocks_per_stage):
         if num_microbatches % num_stages:
             return f"interleaved 1F1B needs num_microbatches ({num_microbatches}) to be a multiple of pp ({num_stages})"
-        if blocks_per_stage % self.interleave:
-            return f"blocks per stage ({blocks_per_stage}) not divisible by interleave ({self.interleave})"
+        uneven = [b for b in blocks_per_stage if b % self.interleave]
+        if uneven:
+            return f"blocks per stage ({uneven[0]}) not divisible by interleave ({self.interleave})"
         return ""
 
     def __repr__(self):
@@ -170,26 +173,36 @@ def make_schedule(name: str, interleave: int = 1) -> PipelineSchedule:
 
 
 def simulate_schedule(
-    schedule: PipelineSchedule, num_stages: int, num_microbatches: int
-) -> Tuple[float, List[float]]:
+    schedule: PipelineSchedule,
+    num_stages: int,
+    num_microbatches: int,
+    forward: Optional[Sequence[float]] = None,
+    backward: Optional[Sequence[float]] = None,
+) -> Tuple[float, List[float], float]:
     """Play a schedule out op by op on a common clock.
 
     Each device runs its ops in order; an op starts when the device is free and its input is ready
     (forward: the previous virtual stage's forward of the same micro-batch; backward: the next
     virtual stage's backward, or its own forward on the last stage). Hand-offs take no time.
-    A full-stage forward takes 1 time unit and a backward 2; the bubble does not depend on the ratio.
 
     Args:
         schedule: the schedule
         num_stages: P
         num_microbatches: m
+        forward, backward: per device, the time of one micro-batch's forward / backward through the
+            device's whole share of the model (each of its v chunks takes 1/v of it). Default 1 and 2
+            on every device; with equal devices the bubble does not depend on these times.
 
     Returns:
-        (bubble fraction, peak activations held per device in full-stage micro-batches)
+        (bubble = idle fraction of the step over all devices,
+         peak activations held per device in full-stage micro-batches,
+         step length in the units of forward / backward)
     """
     P, m, v = num_stages, num_microbatches, schedule.interleave
+    f = list(forward) if forward is not None else [1.0] * P
+    b = list(backward) if backward is not None else [2.0] * P
     if P <= 1:
-        return 0.0, [1.0]
+        return 0.0, [1.0], m * (f[0] + b[0])
     orders = schedule.order(P, m)
     last = P * v - 1
     done = {}
@@ -211,7 +224,7 @@ def simulate_schedule(
                 if dep is not None and dep not in done:
                     break
                 start = max(free[d], done[dep] if dep is not None else 0.0)
-                free[d] = start + (1.0 if kind == "F" else 2.0) / v
+                free[d] = start + (f[d] if kind == "F" else b[d]) / v
                 done[(kind, mb, stage)] = free[d]
                 live[d] += (1.0 if kind == "F" else -1.0) / v
                 peak[d] = max(peak[d], live[d])
@@ -219,4 +232,6 @@ def simulate_schedule(
                 progress = True
     if any(pos[d] != len(orders[d]) for d in range(P)):
         raise RuntimeError(f"{schedule} deadlocked")
-    return 1.0 - 3.0 * m / max(free), peak
+    end = max(free)
+    busy = m * sum(f[d] + b[d] for d in range(P))
+    return 1.0 - busy / (P * end), peak, end

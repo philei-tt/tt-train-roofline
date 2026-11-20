@@ -201,15 +201,22 @@ python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048
 # Every PP x TP x CP split of 128 chips, best ones that fit in memory
 python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \
     --sweep 128 --sp --vocab-parallel --attn-bwd-kv-block 512
+
+# Uneven layer split (as tt-train's PipelineParallelConfig.blocks_per_rank): fewer blocks on the LM-head stage
+python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \
+    --pp 8 --tp 4 --cp 4 --recompute --blocks-per-stage 11,11,10,10,10,10,10,8
 ```
 
-The first and the last pipeline stage are each run for one micro-batch in their own `RooflineContext`. Step time is a resource-level roofline: compute, DRAM and fabric (Ethernet) time are summed separately and the largest one sets the time, so the three overlap:
+Layers are split evenly across pipeline devices by default, the remainder going to the first devices; `--blocks-per-stage` sets any split. Every distinct stage (first, middle, last, each block count) is run for one micro-batch in its own `RooflineContext`. A stage's time per micro-batch is a resource-level roofline: compute, DRAM and fabric (Ethernet) time are summed separately and the largest one sets the time, so the three overlap:
 
 ```
-D       = max(FLOP, DRAM, fabric) for one micro-batch on the slowest stage
-          (fabric includes 2v stage hand-offs per micro-batch)
-T_step  = max( slots * D + max(optimizer FLOP, optimizer DRAM),  m * fabric + CP gradient sync )
-bubble  = (slots - m) / slots
+D_d     = max(FLOP, DRAM, fabric) for one micro-batch on device d
+          (fabric includes v stage hand-offs per micro-batch)
+T_pipe  = the schedule played out op by op (simulate_schedule), device d taking D_d per micro-batch,
+          split into forward and backward in the proportion of its own forward and backward phases
+        = slots * D when all devices are equal
+T_step  = max( T_pipe + max(optimizer FLOP, optimizer DRAM),  m * fabric + CP gradient sync )
+bubble  = idle share of the step over all devices = (slots - m) / slots when all devices are equal
 MFU     = model FLOPs / T_step / (chips * peak)
           model FLOPs: counted by the mock run over all stages, forward + backward without recompute
           (as tt-train's tools/profiling/results_json/add_roofline.py)
@@ -224,7 +231,7 @@ MFU     = model FLOPs / T_step / (chips * peak)
 | `1f1b` (Narayanan et al., 2021) | m + P - 1 | (P - 1) / (m + P - 1) | P |
 | `interleaved`, v chunks per device (same paper) | m + (P - 1) / v | (P - 1) / (v m + P - 1) | simulated |
 
-`simulate_schedule` plays any schedule out op by op on a common clock; every closed form above matches it.
+`simulate_schedule` plays any schedule out op by op on a common clock; with equal devices every closed form above matches it. With uneven devices the slowest one sets the pace and the fill and drain take the sum of the devices' times; the held counts it reports set each device's memory.
 
 The per-op serial time (sum of `max(compute, DRAM, network)` over ops, as in `training.py`) is reported next to it.
 
@@ -238,7 +245,7 @@ Supporting changes:
 | `ring_shift_roofline`, `send_recv_roofline` | CP ring shifts (both ring directions) and stage hand-offs over the links across a stage cut |
 | `MockRingAttentionOp`, `cp_size` on the distributed block | Ring attention: attention of the full sequence divided by `cp`, K/V (bf16) shifts forward, K/V + dK/dV (fp32) backward, fp32 accumulator read + write per ring step |
 | `sequence_parallel` on the parallel linears, attention, MLP, block and `MockDistributedLlamaConfig` | All-gather / reduce-scatter along the sequence instead of broadcast / all-reduce; norms and residual adds hold `S / tp` tokens |
-| `num_stages`, `stage_index`, `vocab_parallel` on `MockDistributedLlamaConfig`; `training/pipeline.py` | The model as one pipeline stage (`forward_stage`); schedule classes (`NaiveSchedule`, `GPipeSchedule`, `OneFOneBSchedule`, `InterleavedOneFOneBSchedule`) and a schedule simulator |
+| `num_stages`, `stage_index`, `stage_num_blocks`, `vocab_parallel` on `MockDistributedLlamaConfig`; `training/pipeline.py` | The model as one pipeline stage (`forward_stage`); schedule classes (`NaiveSchedule`, `GPipeSchedule`, `OneFOneBSchedule`, `InterleavedOneFOneBSchedule`) and a schedule simulator |
 | `BLACKHOLE_QUAD`, `HARDWARE_PRESETS` | 4 galaxies, 128 chips, 32 x 4 torus, 2 links per neighbouring chip pair; one name-to-spec map used by both examples (`--hardware bh_quad`) |
 
 Limitations: TP must divide the number of KV heads (as in tt-train). With `--sp` each column-parallel linear keeps its all-gathered input for backward (Megatron keeps the shard and re-gathers), so memory is higher than Megatron's. The communication of vocabulary parallelism is not modelled. `--cut-links` (default 8) assumes stages laid along the 32-chip axis of a quad.
