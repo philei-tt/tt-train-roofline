@@ -325,7 +325,9 @@ def run_parallel_roofline(
          f"blocks_per_stage {blocks} must be >= 1 each and sum to num_blocks ({L})"),
         (not schedule_error, schedule_error),
         (preset["num_groups"] % tp == 0, f"num_groups ({preset['num_groups']}) not divisible by tp ({tp})"),
-        (seq_len % (2 * cp * (tp if sequence_parallel else 1)) == 0, "seq_len not divisible by 2 * cp (* tp with SP)"),
+        # target's load-balanced ring attention gives each device two chunks; current is contiguous
+        (seq_len % ((2 if mode == "target" else 1) * cp * (tp if sequence_parallel else 1)) == 0,
+         f"seq_len not divisible by {'2 * ' if mode == 'target' else ''}cp (* tp with SP)"),
     ]
     for ok, msg in checks:
         if not ok:
@@ -637,9 +639,9 @@ def main():
         if "error" in out:
             raise SystemExit(out["error"])
         _print(out, args)
-        # The other mode, for comparison; current drops the target-only features
+        # The other mode, for comparison, with that mode's own attention block (a given
+        # --attn-block applies to the chosen mode only); current drops the target-only features
         other = "current" if args.mode == "target" else "target"
-        # the other mode's own attention block; current drops the target-only features
         overrides = {"attn_block": None, **({k: False for k in TARGET_ONLY} if other == "current" else {})}
         dropped = [TARGET_ONLY[k] for k in TARGET_ONLY if k in overrides and out["config"][k]]
         alt = run_parallel_roofline(**{**single, "mode": other, **overrides})
@@ -647,7 +649,8 @@ def main():
             print(f"  {other}: {alt['error']}")
         else:
             a = alt["roofline"]
-            print(f"  {other}{' without ' + ' and '.join(dropped) if dropped else ''}: "
+            print(f"  {other} (attention block {alt['config']['attn_block'] or 32})"
+                  f"{' without ' + ' and '.join(dropped) if dropped else ''}: "
                   f"{a['tokens_per_second']:,.0f} tokens/s, MFU {a['mfu']:.1%}, "
                   f"memory {alt['memory']['peak_gb']:.1f} GB{'' if alt['memory']['fits'] else ' (does not fit)'}")
         out["other_mode"] = alt  # the comparison run, same shape
@@ -661,7 +664,7 @@ def _print(out: Dict[str, Any], args) -> None:
     print(f"{_describe(out)} on {cfg['chips']} chips ({cfg['hardware']}), {args.microbatches} x {args.seq} "
           f"tokens per step, mode {cfg['mode']}")
     print(f"  stage mesh {cfg['stage_mesh'][0]} x {cfg['stage_mesh'][1]}, "
-          + ", ".join(f"{g.upper()} {t}" for g, t in cfg["topology"].items()) + f", {cfg['cut_links']} links across a stage cut")
+          + ", ".join(f"{g.upper()} {t}" for g, t in cfg["topology"].items() if cfg[g] > 1) + f", {cfg['cut_links']} links across a stage cut")
     print(f"  precision: {cfg['master_dtype']} master, {cfg['grad_dtype']} gradient accumulation"
           f"{', ZeRO-1' if cfg['zero1'] else ''}; attention block {cfg['attn_block'] or 32}, ring attention {cfg['cp_mode']}")
     print(f"  per micro-batch, slowest stage: {pm['roofline_ms']:.2f} ms (sum of FLOP {pm['flop_ms']:.2f}, "

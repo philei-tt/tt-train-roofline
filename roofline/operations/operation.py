@@ -242,7 +242,8 @@ class RooflineFunction:
         # backward; its forward runs again at the start of its backward
         recompute: list = []
         if roofline_ctx.selective_recompute and cls.recompute:
-            recompute = [dataclasses.replace(e, phase="backward", operation=f"{e.operation}.recompute")
+            recompute = [dataclasses.replace(e, phase="backward", operation=f"{e.operation}.recompute",
+                                             fusion=f"{e.fusion}.recompute" if e.fusion is not None else None)
                          for e in roofline_ctx.estimates[first_estimate:] if e.phase == "forward"]
             input_ids = {id(t) for t in inputs}
             for t in (*outputs_tuple, *ctx.saved_tensors):

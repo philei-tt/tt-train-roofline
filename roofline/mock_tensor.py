@@ -366,6 +366,8 @@ def memory_efficient_runner(
         for e in bwd_ctx.estimates[first:]:
             if e.phase == "forward":
                 e.phase = "backward"
+                if e.fusion is not None:  # its own op, not part of the layer's backward op
+                    e.fusion = f"{e.fusion}.recompute"
 
         recomputed_out._grad = saved_out._grad
 

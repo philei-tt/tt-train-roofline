@@ -174,7 +174,8 @@ class MockDistributedLlama(MockModule):
         head_in = out
         if not self.is_last:
             # Vocabulary parallelism: the last stage's final hidden state, broadcast to every
-            # stage (the broadcast is not modelled)
+            # stage (the broadcast, gradient reduce and loss all-reduces across stages are costed
+            # in parallel_training.run_parallel_roofline, vocab_comm)
             head_in = MockTensor(
                 out.shape, out.dtype, out.layout, requires_grad=True,
                 label=out.label, name="final_hidden", num_shards=out.num_shards,
