@@ -271,6 +271,30 @@ def ring_shift_roofline(
     )
 
 
+def socket_ring_shift_roofline(
+    hw: HardwareSpec,
+    tensor_bytes: int,
+    operation: str = "RingShift",
+    phase: str = "ccl",
+) -> "RooflineEstimate":
+    """One ring shift as tt-train does it today (ttnn_fixed::distributed::ring_shift): every device
+    sends tensor_bytes to its neighbour through a fabric socket on one worker core, in two phases
+    (even ranks send, then odd ranks), so one link in one direction carries each tensor, twice in a row.
+    The host synchronizes the device before and after; that wait is not part of a roofline.
+
+    Formula: time = 2 * tensor_bytes / link bandwidth + 2 * per-call latency of a two-device transfer
+    DRAM: every device reads its outgoing shard and writes the incoming one.
+    """
+    import dataclasses
+
+    est = _link_estimate(hw, operation, phase, 2 * tensor_bytes, 1, 1)
+    return dataclasses.replace(
+        est,
+        ideal_memory_ns=2 * tensor_bytes / hw.dram_bw_gb_s,
+        ideal_network_ns=est.ideal_network_ns + 2 * ccl_latency_ns(hw, "all_gather", 2),
+    )
+
+
 def send_recv_roofline(
     hw: HardwareSpec,
     tensor_bytes: int,

@@ -9,6 +9,7 @@ base classes for defining roofline-aware operations.
 """
 
 from __future__ import annotations
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 
@@ -165,6 +166,10 @@ class RooflineFunction:
         ...         pass
     """
 
+    # Selective recompute (RooflineContext.selective_recompute) recomputes this op in backward
+    # instead of holding its outputs: cheap ops and attention, not matmuls
+    recompute: bool = False
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -224,7 +229,20 @@ class RooflineFunction:
         fusion = roofline_ctx.current_fusion
 
         # Call forward
+        first_estimate = len(roofline_ctx.estimates)
         outputs = cls.forward(ctx, roofline_ctx, *inputs)
+
+        # Selective recompute: the op's outputs and the tensors it saved are not held until
+        # backward; its forward runs again at the start of its backward
+        recompute: list = []
+        if roofline_ctx.selective_recompute and cls.recompute:
+            recompute = [dataclasses.replace(e, phase="backward", operation=f"{e.operation}.recompute")
+                         for e in roofline_ctx.estimates[first_estimate:] if e.phase == "forward"]
+            input_ids = {id(t) for t in inputs}
+            produced = outputs if isinstance(outputs, tuple) else (outputs,)
+            for t in (*produced, *ctx.saved_tensors):
+                if isinstance(t, MockTensor) and id(t) not in input_ids and t.label != TensorLabel.PARAMETER:
+                    t.untrack()
 
         # Normalize outputs to tuple for consistent handling
         if not isinstance(outputs, tuple):
@@ -269,6 +287,9 @@ class RooflineFunction:
                         grad_outputs.append(None)
                 grad_outputs = tuple(grad_outputs)
 
+                for estimate in recompute:
+                    bwd_roofline_ctx.add_perf_result(dataclasses.replace(estimate))
+
                 # Call backward - single grad for single output, multiple for multi-output
                 with bwd_roofline_ctx.fused(fusion):
                     if len(grad_outputs) == 1:
@@ -297,17 +318,22 @@ class RooflineFunction:
                         # If tensor already has a gradient, add roofline estimate for accumulation
                         if tensor.is_grad_initialized():
                             num_elements = tensor.logical_volume()
+                            accumulated = tensor.get_grad()
                             estimate = elementwise_roofline(
                                 bwd_roofline_ctx.hw,
                                 num_elements,
                                 num_inputs=2,  # read existing grad + new grad
                                 sfpu_ops_per_element=0.0,
                                 fpu_ops_per_element=1.0,  # addition
-                                dtype=tensor.dtype,
+                                dtype=accumulated.dtype,
                                 operation="GradAccum",
                                 phase="backward",
                             )
                             bwd_roofline_ctx.add_perf_result(estimate)
+                            if accumulated.dtype != grad.dtype:
+                                # the sum keeps the accumulator's dtype (fp32 gradient accumulation)
+                                grad = create_grad_tensor(grad.shape, accumulated.dtype, grad.layout,
+                                                          name=accumulated.name, num_shards=grad.num_shards)
                         tensor.add_grad(grad)
 
                 # Clear saved tensors to allow early deallocation of activations

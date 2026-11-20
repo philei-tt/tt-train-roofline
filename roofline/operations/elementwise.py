@@ -119,6 +119,8 @@ class MockMulOp(RooflineFunction):
         - grad_b = grad_output * a
     """
 
+    recompute = True
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,

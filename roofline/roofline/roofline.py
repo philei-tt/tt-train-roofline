@@ -172,9 +172,20 @@ class RooflineContext:
     # None = one 32-token tile, today's tt-train kernels; see fused_attention_roofline(block).
     attn_block: Optional[int] = None
 
+    # Ring attention (context parallelism): "target" (load-balanced, fused merge, shifts overlapped)
+    # or "current" (tt-train's ring_attention_sdpa today); see operations/attention.py
+    cp_mode: str = "target"
+
+    # Selective recompute: ops with recompute = True (norms, activations, attention) do not hold
+    # their outputs until backward; their forward runs again in backward (operation.py, apply)
+    selective_recompute: bool = False
+
     # Ring or line for the collectives of each parallel group ("tp", "cp"), set from where the
     # group sits on the mesh; groups not listed use hw.topology. See hw_for().
     group_topology: Dict[str, str] = field(default_factory=dict)
+
+    # Groups of one kind that share the same links (default 1); see hw_for()
+    group_link_share: Dict[str, int] = field(default_factory=dict)
 
     # Current fusion id (see fused()) and a counter for new ones
     current_fusion: Optional[str] = None
@@ -212,13 +223,17 @@ class RooflineContext:
         self.add(result)
 
     def hw_for(self, group: str) -> HardwareSpec:
-        """Hardware spec for the collectives of a parallel group: its own ring or line topology."""
-        topology = self.group_topology.get(group)
-        if topology is None or topology == self.hw.topology:
+        """Hardware spec for the collectives of a parallel group: its own ring or line topology, and
+        its share of each link when several groups of the same kind cross the same links (DP groups
+        whose members are whole pipelines apart)."""
+        topology = self.group_topology.get(group, self.hw.topology)
+        share = self.group_link_share.get(group, 1)
+        if topology == self.hw.topology and share == 1:
             return self.hw
         import dataclasses
 
-        return dataclasses.replace(self.hw, topology=topology)
+        return dataclasses.replace(self.hw, topology=topology,
+                                   eth_bw_gb_s_per_link=self.hw.eth_bw_gb_s_per_link / share)
 
     def new_fusion(self, label: str) -> str:
         """A fresh fusion id."""

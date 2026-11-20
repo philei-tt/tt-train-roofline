@@ -9,8 +9,9 @@ optimizer weight update operations.
 """
 
 from __future__ import annotations
-from typing import Dict, List, TYPE_CHECKING
+from typing import Dict, List, Optional, TYPE_CHECKING
 
+from ..hardware import DataType
 from ..mock_tensor import MockTensor, TensorLabel
 from ..roofline import RooflineEstimate, elementwise_roofline
 
@@ -42,6 +43,8 @@ class MockAdamW:
         betas: tuple = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
+        master_dtype: Optional[DataType] = None,
+        num_shards: int = 1,
     ):
         """Initialize AdamW optimizer.
 
@@ -51,58 +54,53 @@ class MockAdamW:
             betas: Coefficients for computing running averages
             eps: Term for numerical stability
             weight_decay: Weight decay coefficient
+            master_dtype: dtype the parameters are stored and updated in (tt-train's
+                precision.master_dtype). None: the parameter's own dtype. FLOAT32 with bf16
+                parameters: an fp32 master copy, m and v in fp32, and the bf16 copy the model
+                computes with rewritten every step (as tt-train's PreferredPrecision cache)
+            num_shards: ZeRO-1: master copy, m and v (and the update) split over this many replicas
         """
         self.parameters = parameters
         self.lr = lr
         self.betas = betas
         self.eps = eps
         self.weight_decay = weight_decay
+        self.num_shards = num_shards
 
         # Calculate total parameter count
         self.total_params = sum(p.logical_volume() for p in parameters.values())
 
-        # Create optimizer state tensors (m and v for each parameter)
+        # Optimizer state tensors: m and v (and the master copy) for each parameter, this replica's shard
         self._state_tensors: List[MockTensor] = []
+        self._state_dtype: Dict[str, DataType] = {}
         for name, param in parameters.items():
-            # First moment (momentum)
-            m = MockTensor(
-                param.shape,
-                param.dtype,
-                param.layout,
-                requires_grad=False,
-                label=TensorLabel.OPTIMIZER_STATE,
-                name=f"{name}.m",
-            )
-            # Second moment (variance)
-            v = MockTensor(
-                param.shape,
-                param.dtype,
-                param.layout,
-                requires_grad=False,
-                label=TensorLabel.OPTIMIZER_STATE,
-                name=f"{name}.v",
-            )
-            self._state_tensors.extend([m, v])
+            dtype = master_dtype or param.dtype
+            master = dtype != param.dtype
+            self._state_dtype[name] = dtype
+            shape = (param.logical_volume() // num_shards,)
+            for suffix in ("m", "v") + (("master",) if master else ()):
+                self._state_tensors.append(MockTensor(
+                    shape, dtype, param.layout, requires_grad=False,
+                    label=TensorLabel.OPTIMIZER_STATE, name=f"{name}.{suffix}",
+                ))
 
     def step(self, ctx: "RooflineContext") -> None:
         """Estimate optimizer step cost.
 
-        This adds roofline estimates for the weight update operation
-        to the context.
+        Per element of this replica's shard: read the gradient; read and write m, v and the stored
+        weight; with an fp32 master copy also write the bf16 copy. About 10 SFPU FLOPs.
 
         Args:
             ctx: Roofline context for estimates
         """
         for name, param in self.parameters.items():
-            num_elements = param.logical_volume()
+            num_elements = param.logical_volume() // self.num_shards
+            state = self._state_dtype[name].value  # m, v and the stored weight
+            master = self._state_dtype[name] != param.dtype
+            grad = param.get_grad()
+            grad_bytes = (grad.dtype if grad is not None else param.dtype).value
+            per_element = grad_bytes + 6 * state + (param.dtype.value if master else 0)
 
-            # AdamW update per parameter:
-            # Read: weight, grad, m, v (4 tensors)
-            # Write: weight, m, v (3 tensors)
-            # Total: 7 tensor reads/writes
-            # FLOPs: ~10 per element (m update, v update, bias correction, update)
-
-            # TODO: check if adamw uses fpu. Check fused kernel
             estimate = elementwise_roofline(
                 ctx.hw,
                 num_elements,
@@ -113,37 +111,20 @@ class MockAdamW:
                 operation=f"AdamW.{name}",
                 phase="optimizer",
             )
-
-            # Adjust bytes for writing 3 tensors (weight, m, v)
-            # The elementwise_roofline assumes 1 output, we have 3
-            estimate = RooflineEstimate(
+            total_bytes = int(per_element * num_elements)
+            ctx.add_perf_result(RooflineEstimate(
                 operation=estimate.operation,
                 phase=estimate.phase,
                 total_flops=estimate.total_flops,
-                total_bytes=int(7 * num_elements * param.dtype.value),
+                total_bytes=total_bytes,
                 ideal_compute_ns=estimate.ideal_compute_ns,
-                ideal_memory_ns=7
-                * num_elements
-                * param.dtype.value
-                / ctx.hw.dram_bw_gb_s,
+                ideal_memory_ns=total_bytes / ctx.hw.dram_bw_gb_s,
                 hw=ctx.hw,
-            )
-
-            ctx.add_perf_result(estimate)
+            ))
 
     def estimate_memory(self) -> int:
-        """Estimate optimizer state memory.
-
-        AdamW stores m (momentum) and v (variance) for each parameter.
-
-        Returns:
-            Total optimizer state memory in bytes
-        """
-        total_bytes = 0
-        for param in self.parameters.values():
-            # m and v states, same size as parameter
-            total_bytes += 2 * param.bytes()
-        return total_bytes
+        """Optimizer state memory of this replica in bytes (m, v and any master copy)."""
+        return sum(t.bytes() for t in self._state_tensors)
 
     def __repr__(self) -> str:
         return (

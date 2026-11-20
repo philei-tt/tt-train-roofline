@@ -113,6 +113,7 @@ from .roofline import (
     reduce_scatter_roofline,
     all_gather_roofline,
     ring_shift_roofline,
+    socket_ring_shift_roofline,
     send_recv_roofline,
 )
 
@@ -255,6 +256,7 @@ __all__ = [
     "cross_entropy_roofline",
     "all_reduce_roofline",
     "ring_shift_roofline",
+    "socket_ring_shift_roofline",
     "send_recv_roofline",
     "reduce_scatter_roofline",
     "all_gather_roofline",

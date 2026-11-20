@@ -370,6 +370,7 @@ def fused_attention_roofline(
     tile_height: int = 32,
     tile_width: int = 32,
     block: Optional[int] = None,
+    causal: bool = True,
 ) -> "RooflineEstimate":
     """
     Performance model for fused scaled dot-product attention (Flash Attention style), following
@@ -413,6 +414,7 @@ def fused_attention_roofline(
         phase: "forward" or "backward"
         block: tokens kept on chip per block (forward and Q-kernel Q block, KV-kernel K/V block).
             None (default) = one tile (tile_height tokens), today's kernels.
+        causal: False for a full S x S block (ring attention: a K/V shard from earlier tokens)
 
     Returns:
         Single RooflineEstimate for the fused operation
@@ -434,9 +436,13 @@ def fused_attention_roofline(
     bpe = dtype.value
     Bt = block if block else tile_height
     flops_per_exp = 5
-    M = S * (S + tile_height) / 2  # causal volume visited per head, tile granularity
-    # Opposite operand re-read once per block: sum over blocks i of (i + 1) * Bt rows
-    rows_reread = (S / Bt) * (S + Bt) / 2
+    if causal:
+        M = S * (S + tile_height) / 2  # causal volume visited per head, tile granularity
+        # Opposite operand re-read once per block: sum over blocks i of (i + 1) * Bt rows
+        rows_reread = (S / Bt) * (S + Bt) / 2
+    else:
+        M = S * S
+        rows_reread = (S / Bt) * S
     stat_bytes_per_row = 32 * 4  # one fp32 tile (32 wide) per 32 rows
     row = d * bpe  # bytes of one row of Q, K, V, O, dO, dQ
 

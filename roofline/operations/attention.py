@@ -17,6 +17,7 @@ from ..hardware import DataType
 from ..roofline import (
     elementwise_roofline,
     ring_shift_roofline,
+    socket_ring_shift_roofline,
     attention_roofline,
     fused_attention_roofline,
     heads_creation_roofline,
@@ -141,6 +142,8 @@ class MockGroupedHeadsCreationOp(RooflineFunction):
     - KV: [B, 1, S, 2*num_groups*head_dim] -> K [B, num_groups, S, head_dim], V [B, num_groups, S, head_dim]
     """
 
+    recompute = True
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -249,6 +252,8 @@ class MockHeadsFusionOp(RooflineFunction):
     Merges attention output heads back into single tensor.
     Input: [B, H, S, d] -> Output: [B, 1, S, H*d]
     """
+
+    recompute = True
 
     @staticmethod
     def forward(
@@ -474,6 +479,8 @@ class MockScaledDotProductAttentionFusedOp(RooflineFunction):
     attention matrix is computed and consumed in tiles without full materialization.
     """
 
+    recompute = True
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -604,8 +611,10 @@ def _ring_attention_estimates(
     accumulator_elements: int,
     kv_bytes: int,
 ) -> None:
-    """Add the three parts of one ring-attention pass to the context.
+    """Add one ring-attention pass to the context: the target design, or tt-train's current one
+    (roofline_ctx.cp_mode).
 
+    Target, three parts:
     - attention: fused attention over the full sequence, divided by cp_size (balanced split)
     - merge: one read + one write of the fp32 accumulators per ring step (fused into the kernel)
     - shift: the K/V shards visit every device (cp - 1 hops); backward also moves the fp32
@@ -613,8 +622,95 @@ def _ring_attention_estimates(
 
     The three are one op (their own fusion): the shifts and merges run under the attention.
     """
+    if roofline_ctx.cp_mode == "current":
+        _current_ring_attention(roofline_ctx, query, key, cp_size, phase)
+        return
     with roofline_ctx.fused(roofline_ctx.new_fusion("RingAttention")):
         _ring_attention_parts(roofline_ctx, query, key, cp_size, phase, accumulator_elements, kv_bytes)
+
+
+def _current_ring_attention(roofline_ctx, query, key, cp_size, phase) -> None:
+    """tt-train's ring attention today (ttml/ops/distributed/ring_attention_sdpa.cpp), one op per
+    ttnn call, on the device that sets the pace.
+
+    - Contiguous split: device d holds tokens [d, d + 1) * S / cp. At step s it attends to the K/V
+      shard of device (d + s) mod cp: the diagonal shard causally, earlier shards in full, later
+      ones not at all (ring_sdpa_utils.hpp). The last device works at every step: half a block, then
+      cp - 1 full blocks, against cp / 2 blocks per device with a balanced split.
+    - Forward, per step: reset the statistics tile, ring_sdpa_fw, slice the log-sum-exp, 12 fp32
+      ops on it (log-add-exp and the two weights), cast the step output to fp32, rescale and add
+      into the fp32 accumulator (3 passes); then shift K, then V.
+    - Backward (ring_sdpa_bw, steps in reverse): zero the three step buffers, the Q and KV kernels,
+      cast each step gradient to fp32 and add it into its accumulator; then shift K, V (bf16) and
+      the dK, dV accumulators (fp32).
+    - Shifts: socket_ring_shift_roofline (one link, one direction, two phases).
+    - Each ttnn call is its own op: nothing overlaps.
+    """
+    hw = roofline_ctx.hw
+    batch_size, num_q_heads, local_seq, head_dim = query.shape
+    num_kv_heads = key.shape[1]
+    f32 = DataType.FLOAT32
+    stat = batch_size * num_q_heads * local_seq * 32  # fp32 statistics, one 32-wide tile per 32 rows
+    q_elems = batch_size * num_q_heads * local_seq * head_dim
+    kv_elems = batch_size * num_kv_heads * local_seq * head_dim
+    k_bytes = kv_elems * query.dtype.value  # one of K, V
+
+    def op(estimate) -> None:
+        estimate.fusion = roofline_ctx.new_fusion(estimate.operation)
+        roofline_ctx.add_perf_result(estimate)
+
+    def eltwise(name, elements, inputs, sfpu=0.0, dtype=f32) -> None:
+        op(elementwise_roofline(hw, elements, num_inputs=inputs, sfpu_ops_per_element=sfpu, dtype=dtype,
+                                operation=f"RingAttention.{name}", phase=phase))
+
+    def typecast(name, elements, src, dst) -> None:
+        est = elementwise_roofline(hw, elements, num_inputs=1, sfpu_ops_per_element=0.0, dtype=dst,
+                                   operation=f"RingAttention.{name}", phase=phase)
+        nbytes = elements * (src.value + dst.value)
+        op(dataclasses.replace(est, total_bytes=nbytes, ideal_memory_ns=nbytes / hw.dram_bw_gb_s))
+
+    def attention(step) -> None:
+        op(fused_attention_roofline(
+            hw, batch_size, num_q_heads, num_kv_heads, local_seq, head_dim, dtype=query.dtype,
+            operation="RingAttention.sdpa", phase=phase, block=roofline_ctx.attn_block, causal=step == 0,
+        ))
+
+    def shift(name, nbytes) -> None:
+        op(socket_ring_shift_roofline(roofline_ctx.hw_for("cp"), nbytes, operation=f"RingAttention.{name}",
+                                      phase=phase))
+
+    if phase == "forward":
+        eltwise("init_accumulator", q_elems, 0)
+        for step in range(cp_size):
+            eltwise("reset_stats", stat, 1)
+            attention(step)
+            eltwise("slice_lse", stat, 1)
+            for inputs, sfpu in [(2, 1)] * 7 + [(1, 1)] * 5:  # max, sub, exp, ..., log
+                eltwise("merge_lse", stat, inputs, sfpu)
+            typecast("cast_out", q_elems, query.dtype, f32)
+            eltwise("rescale_accumulator", q_elems, 1, 1)
+            eltwise("rescale_out", q_elems, 1, 1)
+            eltwise("add_out", q_elems, 2, 1)
+            if step < cp_size - 1:
+                shift("shift_k", k_bytes)
+                shift("shift_v", k_bytes)
+        typecast("cast_result", q_elems, f32, query.dtype)
+        return
+
+    eltwise("init_accumulators", q_elems + 2 * kv_elems, 0)
+    for step in range(cp_size):
+        eltwise("zero_step_buffers", q_elems + 2 * kv_elems, 1, dtype=query.dtype)
+        attention(step)
+        for name, elements in (("dq", q_elems), ("dk", kv_elems), ("dv", kv_elems)):
+            typecast(f"cast_{name}", elements, query.dtype, f32)
+            eltwise(f"add_{name}", elements, 2, 1)
+        if step > 0:
+            shift("shift_k", k_bytes)
+            shift("shift_v", k_bytes)
+            shift("shift_dk", 2 * k_bytes)  # fp32 accumulators: twice the bytes of K in bf16
+            shift("shift_dv", 2 * k_bytes)
+    for name, elements in (("dq", q_elems), ("dk", kv_elems), ("dv", kv_elems)):
+        typecast(f"cast_{name}_result", elements, f32, query.dtype)
 
 
 def _ring_attention_parts(roofline_ctx, query, key, cp_size, phase, accumulator_elements, kv_bytes) -> None:
@@ -650,7 +746,8 @@ class MockRingAttentionOp(RooflineFunction):
 
     The sequence is split across cp_size devices; each device holds the Q, K, V of its
     local tokens and K/V shards travel around the CP ring, one step per shard.
-    Models the target implementation, not tt-train's current ring attention:
+    roofline_ctx.cp_mode picks the model: "current" is tt-train's ring_attention_sdpa today
+    (_current_ring_attention); "target", the default, is the planned implementation:
 
     - Load-balanced split: device i holds sequence chunks i and 2*cp_size - 1 - i, so every
       device does the same causal work: attention FLOPs and DRAM traffic are those of fused
@@ -660,6 +757,8 @@ class MockRingAttentionOp(RooflineFunction):
     - The merge of per-step results is fused into the attention kernel: one read and one
       write of the fp32 accumulator per step (output forward; dQ, dK, dV backward).
     """
+
+    recompute = True
 
     @staticmethod
     def forward(

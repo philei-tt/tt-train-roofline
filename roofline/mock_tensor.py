@@ -131,6 +131,12 @@ class MockTensor:
             _global_memory_tracker.track_allocation(self)
             self._tracked = True
 
+    def untrack(self) -> None:
+        """Stop counting this tensor in the memory tracker (it is recomputed, not held)."""
+        if self._tracked and _global_memory_tracker is not None:
+            _global_memory_tracker.track_deallocation(self)
+        self._tracked = False
+
     def __del__(self):
         """Track deallocation when tensor is garbage collected."""
         if self._tracked and _global_memory_tracker is not None:

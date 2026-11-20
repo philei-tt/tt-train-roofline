@@ -12,10 +12,10 @@ Mirrors ttml::core::distributed (distributed.cpp).
 """
 
 from __future__ import annotations
-from typing import Dict, TYPE_CHECKING
+from typing import Dict, Sequence, Tuple, TYPE_CHECKING
 
 from ..mock_tensor import MockTensor, TensorLabel
-from ..roofline import all_reduce_roofline, elementwise_roofline
+from ..roofline import all_gather_roofline, all_reduce_roofline, elementwise_roofline, reduce_scatter_roofline
 
 if TYPE_CHECKING:
     from ..roofline import RooflineContext
@@ -116,3 +116,53 @@ def synchronize_gradients(
             phase="ccl",
         )
         ctx.add_perf_result(estimate)
+
+
+def synchronize_replica_gradients(
+    ctx: "RooflineContext",
+    parameters: Dict[str, MockTensor],
+    groups: Sequence[Tuple[str, int]],
+    zero1: bool = False,
+) -> None:
+    """Gradient sync across the replicas of a stage: CP and DP groups (phase "ccl").
+
+    Without ZeRO-1, as tt-train's synchronize_gradients_along: one all-reduce of the full gradient per
+    group, one group after the other. With ZeRO-1 (target), every replica keeps the optimizer state of
+    1/N of each parameter (N = product of the group sizes): the gradient is reduce-scattered group by
+    group, the optimizer updates the shard, and the updated parameter is all-gathered back.
+
+    Args:
+        groups: (group name, size) in order, e.g. [("cp", 4), ("dp", 2)]; hw_for(name) gives the
+            group's topology and link share
+    """
+    groups = [(g, n) for g, n in groups if n > 1]
+    if not groups:
+        return
+    for name, param in parameters.items():
+        if not param.is_grad_initialized():
+            continue
+        grad = param.get_grad()
+        replicas = 1
+        for _, n in groups:
+            replicas *= n
+        # average: multiply by 1/N, on the full gradient or this replica's shard
+        ctx.add_perf_result(elementwise_roofline(
+            ctx.hw, grad.logical_volume() // (replicas if zero1 else 1), num_inputs=1, sfpu_ops_per_element=0.0,
+            fpu_ops_per_element=1.0, dtype=grad.dtype, operation=f"SyncGrad.Scale.{name}", phase="ccl"))
+        if not zero1:
+            for g, n in groups:
+                ctx.add_perf_result(all_reduce_roofline(
+                    ctx.hw_for(g), grad.bytes(), n, operation=f"SyncGrad.AllReduce.{g}.{name}", phase="ccl"))
+            continue
+        size = grad.bytes()
+        for g, n in groups:
+            ctx.add_perf_result(reduce_scatter_roofline(
+                ctx.hw_for(g), size, n, operation=f"SyncGrad.ReduceScatter.{g}.{name}", phase="ccl"))
+            size //= n
+        size = param.bytes()
+        for g, n in groups:
+            size //= n
+        for g, n in reversed(groups):
+            ctx.add_perf_result(all_gather_roofline(
+                ctx.hw_for(g), size, n, operation=f"ZeRO1.AllGather.{g}.{name}", phase="ccl"))
+            size *= n
