@@ -54,14 +54,11 @@ WGRAD_OPERATIONS = ("Linear.backward.grad_weight", "Embedding.backward")  # defe
 
 
 def _pass_cost(estimates) -> PassCost:
-    """Resource times (ms) of a list of estimates. Ring attention overlaps its own shifts with its
-    compute; every other collective (TP) is on the critical path of its micro-batch."""
-    ring = [e for e in estimates if e.operation.startswith("RingAttention")]
+    """FLOP, DRAM and fabric time (ms) of a list of estimates, each summed."""
     return PassCost(
         flop=sum(e.ideal_compute_ns for e in estimates) / 1e6,
         dram=sum(e.ideal_memory_ns for e in estimates) / 1e6,
-        fabric=sum(e.ideal_network_ns for e in ring) / 1e6,
-        exposed_fabric=(sum(e.ideal_network_ns for e in estimates) - sum(e.ideal_network_ns for e in ring)) / 1e6,
+        fabric=sum(e.ideal_network_ns for e in estimates) / 1e6,
     )
 
 
@@ -295,24 +292,18 @@ def run_parallel_roofline(
     opt = max(max(c.opt_flop_ms, c.opt_dram_ms) for c in costs)
     link_total = max(m * p["fabric_ms"] + c.sync_fabric_ms for p, c in zip(per_stage, costs))
 
-    # Scheduled: the schedule played out with the slowest stage's pass costs on every device; an
-    # op run alone waits for its TP collectives, a pair overlaps them (training/pipeline.py).
-    # Hand-offs run in the background, half of a micro-batch's in each pass.
-    passes = costs[per_stage.index(D)].passes
-    hand_pass = PassCost(fabric=hand_per_mb / 2)
-    passes = dataclasses.replace(passes, forward=passes.forward + hand_pass, backward=passes.backward + hand_pass)
-    sim = simulate_schedule(sched, pp, m, passes)
-    step_scheduled = max(sim.step + opt, link_total)
-
-    # Overlapped: every pass at its largest resource, the base schedule's closed-form bubble;
-    # with an option the bubble of the schedule played out with all fabric time hidden
+    # Bubble and activations held: closed forms; with pairing or wgrad deferral, the schedule
+    # played out with the slowest stage's forward, backward and weight-gradient roofline times on
+    # every device (training/pipeline.py), hand-offs split evenly between forward and backward
     bubble = sched.bubble(pp, m)
+    peak_activations = sched.peak_activations(pp, m)
     if pairing or wgrad_deferral:
-        def hidden(c: PassCost) -> PassCost:
-            return PassCost(c.flop, c.dram, c.fabric + c.exposed_fabric)
-        hidden_passes = dataclasses.replace(passes, forward=hidden(passes.forward),
-                                            backward=hidden(passes.backward), wgrad=hidden(passes.wgrad))
-        bubble = simulate_schedule(sched, pp, m, hidden_passes).bubble
+        passes = costs[per_stage.index(D)].passes
+        hand_pass = PassCost(fabric=hand_per_mb / 2)
+        passes = dataclasses.replace(passes, forward=passes.forward + hand_pass,
+                                     backward=passes.backward + hand_pass)
+        sim = simulate_schedule(sched, pp, m, passes)
+        bubble, peak_activations = sim.bubble, sim.peak
     slots = m / (1.0 - bubble)
     step_overlapped = max(slots * D["overlapped_ms"] + opt, link_total)
     step_serial = (slots * max(p["serial_ms"] for p in per_stage)
@@ -321,7 +312,6 @@ def run_parallel_roofline(
     # Memory: the one-micro-batch run's peak (state, its activations, backward transients) plus
     # the other micro-batches held at the same time, on the first and the last stage
     # (device 0 holds the most, device P - 1 holds the LM head)
-    peak_activations = sim.peak if wgrad_deferral else sched.peak_activations(pp, m)
     memory = max(cs.peak_bytes + (peak_activations[sid] - 1) * cs.activation_bytes
                  for sid, cs in zip(stage_ids, costs))
 
@@ -344,7 +334,6 @@ def run_parallel_roofline(
         "per_microbatch": {**D, "bound": bound, "handoff_ms": hand},
         "bubble": bubble,
         "overlapped": throughput(step_overlapped),
-        "scheduled": {**throughput(step_scheduled), "bubble": sim.bubble},
         "serial": throughput(step_serial),
         "memory": {"peak_gb": memory / 1e9, "fits": memory <= hw.dram_gb_per_chip * 1e9,
                    "activation_gb_per_mb": costs[0].activation_bytes / 1e9,
@@ -421,12 +410,10 @@ def main():
         results = sweep(args.sweep, **common)
         fits = sorted((r for r in results if r["memory"]["fits"]), key=lambda r: -r["overlapped"]["tokens_per_second"])
         print(f"{len(fits)} of {len(results)} configurations fit in memory")
-        print(f"{'configuration':72s} {'tokens/s':>10s} {'MFU':>7s} {'bound':>7s} {'bubble':>7s} {'mem GB':>7s} "
-              f"{'sched tok/s':>11s}")
+        print(f"{'configuration':72s} {'tokens/s':>10s} {'MFU':>7s} {'bound':>7s} {'bubble':>7s} {'mem GB':>7s}")
         for r in fits[: args.top]:
             print(f"{_describe(r):72s} {r['overlapped']['tokens_per_second']:10,.0f} {r['overlapped']['mfu']:7.1%} "
-                  f"{r['per_microbatch']['bound']:>7s} {r['bubble']:7.1%} {r['memory']['peak_gb']:7.1f} "
-                  f"{r['scheduled']['tokens_per_second']:11,.0f}")
+                  f"{r['per_microbatch']['bound']:>7s} {r['bubble']:7.1%} {r['memory']['peak_gb']:7.1f}")
         out = results
     else:
         out = run_parallel_roofline(pp=args.pp, tp=args.tp, cp=args.cp, schedule=args.schedule,
@@ -441,9 +428,6 @@ def main():
               f"fabric {pm['fabric_ms']:.2f} ms (hand-off {pm['handoff_ms']:.3f} ms) -> {pm['bound']}-bound")
         print(f"  bubble {out['bubble']:.2%}")
         print(f"  overlapped roofline: {o['tokens_per_second']:,.0f} tokens/s, MFU {o['mfu']:.1%}, step {o['step_ms']/1e3:.2f} s")
-        sc = out["scheduled"]
-        print(f"  scheduled (TP collectives exposed unless paired): {sc['tokens_per_second']:,.0f} tokens/s, "
-              f"MFU {sc['mfu']:.1%}, bubble {sc['bubble']:.2%}")
         print(f"  serial (per-op sum): {s['tokens_per_second']:,.0f} tokens/s, MFU {s['mfu']:.1%}")
         print(f"  memory per chip: {mem['peak_gb']:.1f} GB ({'fits' if mem['fits'] else 'does not fit'}; "
               f"state {mem['state_gb']:.1f} GB + {mem['peak_activations']:.1f} x {mem['activation_gb_per_mb']:.2f} GB)")

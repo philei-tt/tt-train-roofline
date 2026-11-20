@@ -19,13 +19,14 @@ activations a device holds at once:
 `simulate_schedule` plays any order out op by op on a common clock and checks these.
 
 Two options apply on top of a schedule (`make_schedule(..., pairing=, wgrad_deferral=)`); with
-either one the step time comes from `simulate_schedule` with each pass's resource times:
+either one the bubble and the activations held come from `simulate_schedule` with each pass's
+resource times. A pass takes the largest of its FLOP, DRAM and fabric time:
 
 - pairing: each steady-state forward and backward (two different micro-batches) run as one
-  unit, so one micro-batch's TP collectives run under the other's compute (DeepSeek-V3's
-  DualPipe overlaps "a pair of individual forward and backward chunks", DeepSeek-AI, 2024).
-  An op run alone waits for its own collectives. 1F1B and interleaved 1F1B only. A pair hands both outputs on when it ends,
-  so a micro-batch crosses one device per pair in each direction; to keep every device busy,
+  unit that takes the largest of their summed resources, so one pass's DRAM or fabric time
+  runs under the other's compute (DeepSeek-V3's DualPipe overlaps "a pair of individual forward
+  and backward chunks", DeepSeek-AI, 2024). 1F1B and interleaved 1F1B only. A pair hands both
+  outputs on when it ends, so a micro-batch crosses one device per pair in each direction; to keep every device busy,
   the warm-up has to shrink by two forwards per device and the last device needs one, as
   interleaved 1F1B's already does (+1 forward). For 1F1B that is 2 (P - d - 1) + 1 warm-up
   forwards instead of P - d - 1: nearly twice the activations on device 0.
@@ -47,30 +48,24 @@ Op = Tuple[str, int, int]  # ("F" | "B", micro-batch, chunk)
 
 @dataclass(frozen=True)
 class PassCost:
-    """Device time of one pass of one micro-batch through one full stage, per resource."""
+    """Time of one pass of one micro-batch through one full stage, per resource."""
 
     flop: float = 0.0
     dram: float = 0.0
-    fabric: float = 0.0  # overlaps the pass's own compute (ring attention shifts, stage hand-offs)
-    exposed_fabric: float = 0.0  # collectives the pass waits for (TP), unless paired
+    fabric: float = 0.0
 
     def __add__(self, o: "PassCost") -> "PassCost":
-        return PassCost(self.flop + o.flop, self.dram + o.dram, self.fabric + o.fabric,
-                        self.exposed_fabric + o.exposed_fabric)
+        return PassCost(self.flop + o.flop, self.dram + o.dram, self.fabric + o.fabric)
 
     def __sub__(self, o: "PassCost") -> "PassCost":
         return self + o.scale(-1.0)
 
     def scale(self, k: float) -> "PassCost":
-        return PassCost(self.flop * k, self.dram * k, self.fabric * k, self.exposed_fabric * k)
+        return PassCost(self.flop * k, self.dram * k, self.fabric * k)
 
-    def alone(self) -> float:
-        """Time when run alone: its collectives are on its critical path."""
-        return max(self.flop, self.dram, self.fabric) + self.exposed_fabric
-
-    def overlapped(self) -> float:
-        """Time when its collectives run under other work: the largest resource."""
-        return max(self.flop, self.dram, self.fabric + self.exposed_fabric)
+    def time(self) -> float:
+        """Roofline time: the largest resource."""
+        return max(self.flop, self.dram, self.fabric)
 
 
 @dataclass(frozen=True)
@@ -274,7 +269,7 @@ def simulate_schedule(
     its ops are ready (forward: the previous virtual stage's forward of the same micro-batch;
     backward: the next virtual stage's backward, or its own forward on the last stage); its
     outputs are ready when it ends. Hand-offs take no time beyond the fabric time in `costs`.
-    An op alone takes PassCost.alone(), a pair PassCost.overlapped() of the two summed. With
+    An op takes PassCost.time(), a pair the time of the two summed. With
     wgrad deferral, a device runs its oldest pending W when the W fits before its next unit's
     inputs are ready, or when the unit's forward would hold more than wgrad_cap[device]
     micro-batches (default on every device: the pipeline's peak without deferral, device 0's);
@@ -305,7 +300,7 @@ def simulate_schedule(
 
     def unit_time(unit) -> float:
         passes = [f if op[0] == "F" else b for op in unit]
-        return passes[0].alone() if len(passes) == 1 else (passes[0] + passes[1]).overlapped()
+        return sum(passes, PassCost()).time()
 
     units = schedule.units(P, m)
     last = P * v - 1
@@ -333,8 +328,8 @@ def simulate_schedule(
 
     def run_w(d: int) -> None:
         pending[d].popleft()
-        free[d] += w.alone()
-        busy[d] += w.alone()
+        free[d] += w.time()
+        busy[d] += w.time()
         live[d] -= held
 
     # A device's actions change only its own timeline and the ready times of the ops it runs,
@@ -348,7 +343,7 @@ def simulate_schedule(
                 start = ready_time(d, unit)
                 n_fwd = sum(op[0] == "F" for op in unit)
                 over = split and live[d] + n_fwd / v > wgrad_cap[d] + 1e-9
-                if pending[d] and (over or free[d] + w.alone() <= start + 1e-12 < float("inf")):
+                if pending[d] and (over or free[d] + w.time() <= start + 1e-12 < float("inf")):
                     run_w(d)
                     progress = True
                     continue
