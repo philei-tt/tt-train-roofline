@@ -68,7 +68,8 @@ SYNC_PHASES = ("ccl",)  # gradient sync across the CP and DP groups
 
 # What --mode sets (see the module docstring); features only the target mode allows
 ATTN_BLOCK = {"current": None, "target": 512}  # per mode; the mode is also the ring-attention model
-TARGET_ONLY = {"vocab_parallel": "vocabulary parallelism across pipeline stages", "zero1": "ZeRO-1"}
+TARGET_ONLY = {"vocab_parallel": "vocabulary parallelism across pipeline stages", "zero1": "ZeRO-1",
+               "selective": "selective recompute"}  # tt-train runners today: default, memory-efficient
 RECOMPUTE = ("none", "selective", "full")
 DTYPES = {"bf16": DataType.BFLOAT16, "fp32": DataType.FLOAT32}
 
@@ -311,8 +312,9 @@ def run_parallel_roofline(
     blocks = list(blocks_per_stage) if blocks_per_stage is not None else even_split(L, pp)
     m = num_microbatches // dp if num_microbatches % dp == 0 else 0
     schedule_error = sched.validate(pp, m, blocks) if pp > 1 and m else ""
+    target_only = [TARGET_ONLY[k] for k, on in (("vocab_parallel", vocab_parallel), ("zero1", zero1),
+                                                 ("selective", recompute == "selective")) if on]
     vocab_parallel = vocab_parallel and pp > 1
-    target_only = [TARGET_ONLY[k] for k, on in (("vocab_parallel", vocab_parallel), ("zero1", zero1)) if on]
     checks = [
         (not (mode == "current" and target_only),
          f"{' and '.join(target_only)}: not in tt-train today, only with mode target"),
@@ -592,7 +594,8 @@ def main():
     parser.add_argument("--vocab-parallel", action="store_true",
                         help="Split the LM head across stages (target only)")
     parser.add_argument("--recompute", default="none", choices=RECOMPUTE,
-                        help="selective: norms, activations, attention; full: whole blocks (default: none)")
+                        help="selective (target only): norms, activations, attention; full: whole blocks "
+                             "(default: none)")
     parser.add_argument("--master-dtype", default="bf16", choices=list(DTYPES),
                         help="Stored weights, m and v (tt-train precision.master_dtype; default bf16)")
     parser.add_argument("--grad-dtype", default="bf16", choices=list(DTYPES),
@@ -619,7 +622,7 @@ def main():
                   master_dtype=args.master_dtype, grad_dtype=args.grad_dtype, zero1=args.zero1, mode=args.mode,
                   cut_links=args.cut_links, attn_block=args.attn_block, num_links=args.links, topology=args.topology)
     if args.sweep:
-        target_only = [TARGET_ONLY[k] for k in TARGET_ONLY if common[k]]
+        target_only = [TARGET_ONLY[k] for k in TARGET_ONLY if common.get(k)]
         if args.mode == "current" and target_only:
             raise SystemExit(f"{' and '.join(target_only)}: not in tt-train today, only with mode target")
         results = sweep(args.sweep, **common)
@@ -642,8 +645,8 @@ def main():
         # The other mode, for comparison, with that mode's own attention block (a given
         # --attn-block applies to the chosen mode only); current drops the target-only features
         other = "current" if args.mode == "target" else "target"
-        overrides = {"attn_block": None, **({k: False for k in TARGET_ONLY} if other == "current" else {})}
-        dropped = [TARGET_ONLY[k] for k in TARGET_ONLY if k in overrides and out["config"][k]]
+        overrides = {"attn_block": None, **({"vocab_parallel": False, "zero1": False} if other == "current" else {})}
+        dropped = [TARGET_ONLY[k] for k in ("vocab_parallel", "zero1") if k in overrides and out["config"][k]]
         alt = run_parallel_roofline(**{**single, "mode": other, **overrides})
         if "error" in alt:
             print(f"  {other}: {alt['error']}")

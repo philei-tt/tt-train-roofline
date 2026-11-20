@@ -192,7 +192,7 @@ python3 -m roofline.examples.matmuls
 - **TP** inside a stage, optionally with Megatron sequence parallelism (`--sp`)
 - **CP** inside a stage: ring attention, today's or the target one (below)
 - **DP**: `--dp` copies of the whole pipeline, each running m / dp micro-batches; `--zero1` shards the optimizer state over the CP x DP replicas (target only)
-- activation recompute: `--recompute none | selective | full`. Selective recomputes norms, SiLU and the gating multiply, the head split / RoPE / merge and attention in backward and holds the matmul outputs (ops with `recompute = True`); full recomputes each block's forward (the memory-efficient runner)
+- activation recompute: `--recompute none | selective | full`. Selective (target only) recomputes norms, SiLU and the gating multiply, the head split / RoPE / merge and attention in backward and holds the matmul outputs (ops with `recompute = True`); full recomputes each block's forward (the memory-efficient runner)
 - precision: `--master-dtype bf16 | fp32` (tt-train's `precision.master_dtype`: stored weights, m and v; fp32 keeps a bf16 copy for compute, 16 B per parameter instead of 8) and `--grad-dtype bf16 | fp32` (gradient accumulation across micro-batches, +2 B per parameter)
 
 `--mode` says whose kernels and features are modelled; a single run reports both:
@@ -201,7 +201,7 @@ python3 -m roofline.examples.matmuls
 |---|---|---|
 | attention block (`--attn-block`) | one 32-token tile | 512 tokens |
 | ring attention (CP) | contiguous split: the last device runs half a block then cp - 1 full ones; each step resets and slices the statistics, merges with 12 fp32 ops on them, a cast and 3 fp32 passes over the output; backward zeroes, casts and adds three step buffers; shifts are socket transfers on one link in one direction, in two phases (`ttnn_fixed::distributed::ring_shift`); every ttnn call is its own op | load-balanced split, merge fused into the kernel, shifts in both ring directions overlapped with attention (one op) |
-| vocabulary parallelism across stages, ZeRO-1 | not available (error) | allowed |
+| vocabulary parallelism across stages, ZeRO-1, selective recompute | not available (error; tt-train's runners are default and memory-efficient) | allowed |
 
 Host synchronizations in today's ring attention and ring shift are not modelled (a roofline has no host).
 
