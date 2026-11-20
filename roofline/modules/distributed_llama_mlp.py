@@ -84,9 +84,11 @@ class MockDistributedLlamaMLP(MockModule):
     def forward(self, ctx: "RooflineContext", x: MockTensor) -> MockTensor:
         if self.w1.sequence_parallel:
             # Sequence parallelism: gather the norm output once for both projections (Megatron)
-            x = self.w1.gather_input(ctx, x)
-            swished = MockSiLUOp.apply(ctx, self.w1(ctx, x, input_gathered=True))
-            gate = self.w3(ctx, x, input_gathered=True)
+            with ctx.fused(ctx.new_fusion("SPGatherW1W3")):
+                x = self.w1.gather_input(ctx, x)
+                h1 = self.w1(ctx, x, input_gathered=True)
+                gate = self.w3(ctx, x, input_gathered=True)
+            swished = MockSiLUOp.apply(ctx, h1)
         else:
             swished = MockSiLUOp.apply(ctx, self.w1(ctx, x))
             gate = self.w3(ctx, x)

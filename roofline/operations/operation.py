@@ -220,6 +220,8 @@ class RooflineFunction:
             Output MockTensor(s) from forward()
         """
         ctx = RooflineFunctionContext()
+        # The op's backward estimates belong to the same fused op as its forward ones
+        fusion = roofline_ctx.current_fusion
 
         # Call forward
         outputs = cls.forward(ctx, roofline_ctx, *inputs)
@@ -268,14 +270,15 @@ class RooflineFunction:
                 grad_outputs = tuple(grad_outputs)
 
                 # Call backward - single grad for single output, multiple for multi-output
-                if len(grad_outputs) == 1:
-                    grad_inputs = bwd_cls.backward(
-                        bwd_ctx, bwd_roofline_ctx, grad_outputs[0]
-                    )
-                else:
-                    grad_inputs = bwd_cls.backward(
-                        bwd_ctx, bwd_roofline_ctx, *grad_outputs
-                    )
+                with bwd_roofline_ctx.fused(fusion):
+                    if len(grad_outputs) == 1:
+                        grad_inputs = bwd_cls.backward(
+                            bwd_ctx, bwd_roofline_ctx, grad_outputs[0]
+                        )
+                    else:
+                        grad_inputs = bwd_cls.backward(
+                            bwd_ctx, bwd_roofline_ctx, *grad_outputs
+                        )
 
                 # Normalize to tuple
                 if grad_inputs is None:

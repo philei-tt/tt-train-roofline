@@ -68,6 +68,7 @@ def synchronize_gradients(
     ctx: "RooflineContext",
     parameters: Dict[str, MockTensor],
     num_devices: int,
+    group: str = "dp",
 ) -> None:
     """Synchronize (all-reduce + average) parameter gradients across DDP devices.
 
@@ -79,6 +80,8 @@ def synchronize_gradients(
         ctx: Roofline context for accumulating estimates
         parameters: Dict of parameter name -> MockTensor
         num_devices: Number of DDP devices
+        group: parallel group the replicas form ("dp", or "cp" for context-parallel replicas);
+            picks its ring or line topology (RooflineContext.hw_for)
     """
     if num_devices <= 1:
         return
@@ -92,7 +95,7 @@ def synchronize_gradients(
 
         # all-reduce
         estimate = all_reduce_roofline(
-            ctx.hw,
+            ctx.hw_for(group),
             tensor_bytes,
             num_devices,
             operation=f"SyncGrad.AllReduce.{name}",

@@ -610,7 +610,14 @@ def _ring_attention_estimates(
     - merge: one read + one write of the fp32 accumulators per ring step (fused into the kernel)
     - shift: the K/V shards visit every device (cp - 1 hops); backward also moves the fp32
       dK/dV accumulators, which need cp hops to return to the device that owns K/V
+
+    The three are one op (their own fusion): the shifts and merges run under the attention.
     """
+    with roofline_ctx.fused(roofline_ctx.new_fusion("RingAttention")):
+        _ring_attention_parts(roofline_ctx, query, key, cp_size, phase, accumulator_elements, kv_bytes)
+
+
+def _ring_attention_parts(roofline_ctx, query, key, cp_size, phase, accumulator_elements, kv_bytes) -> None:
     batch_size, num_q_heads, local_seq, head_dim = query.shape
     full = fused_attention_roofline(
         roofline_ctx.hw, batch_size, num_q_heads, key.shape[1], local_seq * cp_size, head_dim,
@@ -629,11 +636,11 @@ def _ring_attention_estimates(
         dtype=DataType.FLOAT32, operation="RingAttention.merge", phase=phase,
     ))
     roofline_ctx.add_perf_result(ring_shift_roofline(
-        roofline_ctx.hw, kv_bytes, cp_size, operation="RingAttention.shift_kv", phase=phase,
+        roofline_ctx.hw_for("cp"), kv_bytes, cp_size, operation="RingAttention.shift_kv", phase=phase,
     ))
     if phase == "backward":
         roofline_ctx.add_perf_result(ring_shift_roofline(
-            roofline_ctx.hw, 2 * kv_bytes, cp_size, operation="RingAttention.shift_dkv", phase=phase,
+            roofline_ctx.hw_for("cp"), 2 * kv_bytes, cp_size, operation="RingAttention.shift_dkv", phase=phase,
             num_steps=cp_size,  # dK, dV accumulators in fp32: twice the bytes of K, V in bf16
         ))
 

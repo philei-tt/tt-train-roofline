@@ -54,7 +54,7 @@ class MockAllReduceOp(RooflineFunction):
 
         if num_devices > 1:
             estimate = all_reduce_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 tensor.bytes(),
                 num_devices,
                 operation="AllReduce.forward",
@@ -78,7 +78,7 @@ class MockAllReduceOp(RooflineFunction):
 
         if not ctx._noop_backward and num_devices > 1:
             estimate = all_reduce_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 grad_output.bytes(),
                 num_devices,
                 operation="AllReduce.backward",
@@ -119,7 +119,7 @@ class MockReduceScatterOp(RooflineFunction):
                 f"ReduceScatter: shape[{dim}]={tensor.shape[dim]} not divisible by {num_devices}"
             )
             estimate = reduce_scatter_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 tensor.bytes(),
                 num_devices,
                 operation="ReduceScatter.forward",
@@ -153,7 +153,7 @@ class MockReduceScatterOp(RooflineFunction):
 
         if num_devices > 1:
             estimate = all_gather_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 grad_output.bytes(),
                 num_devices,
                 operation="ReduceScatter.backward(AllGather)",
@@ -191,7 +191,7 @@ class MockAllGatherOp(RooflineFunction):
 
         if num_devices > 1:
             estimate = all_gather_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 tensor.bytes(),
                 num_devices,
                 operation="AllGather.forward",
@@ -225,7 +225,7 @@ class MockAllGatherOp(RooflineFunction):
 
         if num_devices > 1:
             estimate = reduce_scatter_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 grad_output.bytes(),
                 num_devices,
                 operation="AllGather.backward(ReduceScatter)",
@@ -277,7 +277,7 @@ class MockBroadcastOp(RooflineFunction):
 
         if num_devices > 1:
             estimate = all_reduce_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 grad_output.bytes(),
                 num_devices,
                 operation="Broadcast.backward(AllReduce)",
@@ -321,7 +321,7 @@ class MockScatterOp(RooflineFunction):
 
             # reduce-scatter cost
             estimate = reduce_scatter_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 tensor.bytes(),
                 num_devices,
                 operation="Scatter.forward(ReduceScatter)",
@@ -332,7 +332,7 @@ class MockScatterOp(RooflineFunction):
             # divide by N (elementwise scale, negligible but modeled)
             out_elements = tensor.logical_volume() // num_devices
             estimate = elementwise_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 out_elements,
                 num_inputs=1,
                 sfpu_ops_per_element=0.0,
@@ -369,7 +369,7 @@ class MockScatterOp(RooflineFunction):
 
         if num_devices > 1:
             estimate = all_gather_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 grad_output.bytes(),
                 num_devices,
                 operation="Scatter.backward(AllGather)",

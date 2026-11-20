@@ -122,9 +122,10 @@ class MockDistributedGroupedQueryAttention(MockModule):
     ) -> MockTensor:
         if self.q_linear.sequence_parallel:
             # Sequence parallelism: gather the norm output once for both projections (Megatron)
-            x = self.q_linear.gather_input(ctx, x)
-            q = self.q_linear(ctx, x, input_gathered=True)
-            kv = self.kv_linear(ctx, x, input_gathered=True)
+            with ctx.fused(ctx.new_fusion("SPGatherQKV")):
+                x = self.q_linear.gather_input(ctx, x)
+                q = self.q_linear(ctx, x, input_gathered=True)
+                kv = self.kv_linear(ctx, x, input_gathered=True)
         else:
             q = self.q_linear(ctx, x)
             kv = self.kv_linear(ctx, x)

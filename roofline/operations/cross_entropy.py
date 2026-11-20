@@ -137,12 +137,12 @@ class MockVocabParallelCrossEntropyLossOp(RooflineFunction):
         ))
         if tp_size > 1:
             roofline_ctx.add_perf_result(all_gather_roofline(
-                roofline_ctx.hw, batch_seq * logits.dtype.value, tp_size,
+                roofline_ctx.hw_for("tp"), batch_seq * logits.dtype.value, tp_size,
                 operation="VocabParallelCrossEntropy.max_gather", phase="forward",
             ))
             for name in ("sum_all_reduce", "target_all_reduce"):
                 roofline_ctx.add_perf_result(all_reduce_roofline(
-                    roofline_ctx.hw, batch_seq * 4, tp_size,
+                    roofline_ctx.hw_for("tp"), batch_seq * 4, tp_size,
                     operation=f"VocabParallelCrossEntropy.{name}", phase="forward",
                 ))
         return create_activation_tensor((1,), logits.dtype, logits.layout)

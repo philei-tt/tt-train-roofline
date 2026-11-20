@@ -94,6 +94,8 @@ class RooflineEstimate:
     ideal_memory_ns: float
     hw: HardwareSpec
     ideal_network_ns: float = 0.0
+    # Estimates sharing a fusion id form one op: a matmul and its collective (RooflineContext.fused)
+    fusion: Optional[str] = None
 
     @property
     def theoretical_time_ns(self) -> float:
@@ -170,6 +172,14 @@ class RooflineContext:
     # None = one 32-token tile, today's tt-train kernels; see fused_attention_roofline(block).
     attn_block: Optional[int] = None
 
+    # Ring or line for the collectives of each parallel group ("tp", "cp"), set from where the
+    # group sits on the mesh; groups not listed use hw.topology. See hw_for().
+    group_topology: Dict[str, str] = field(default_factory=dict)
+
+    # Current fusion id (see fused()) and a counter for new ones
+    current_fusion: Optional[str] = None
+    _fusion_count: int = 0
+
     # Memory tracker for detailed allocation tracking
     memory_tracker: Optional[MemoryTracker] = field(default=None)
 
@@ -196,11 +206,58 @@ class RooflineContext:
         self.estimates.append(estimate)
 
     def add_perf_result(self, result: RooflineEstimate) -> None:
-        """Add a RooflineEstimate to the context.
-
-        This method exists for backwards compatibility and is equivalent to add().
-        """
+        """Add a RooflineEstimate to the context, tagged with the current fusion id if any."""
+        if self.current_fusion is not None and result.fusion is None:
+            result.fusion = self.current_fusion
         self.add(result)
+
+    def hw_for(self, group: str) -> HardwareSpec:
+        """Hardware spec for the collectives of a parallel group: its own ring or line topology."""
+        topology = self.group_topology.get(group)
+        if topology is None or topology == self.hw.topology:
+            return self.hw
+        import dataclasses
+
+        return dataclasses.replace(self.hw, topology=topology)
+
+    def new_fusion(self, label: str) -> str:
+        """A fresh fusion id."""
+        self._fusion_count += 1
+        return f"{label}#{self._fusion_count}"
+
+    def fused(self, fusion: Optional[str]):
+        """Context manager: estimates added inside (forward, and the backward of ops applied inside)
+        belong to one op whose time is max(sum compute, sum DRAM, sum fabric) of its estimates."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def scope():
+            previous = self.current_fusion
+            self.current_fusion = fusion
+            try:
+                yield fusion
+            finally:
+                self.current_fusion = previous
+
+        return scope()
+
+    def op_time_ns(self, phases: Optional[Tuple[str, ...]] = None) -> float:
+        """Per-op roofline: sum over ops of max(compute, DRAM, fabric). Estimates with the same
+        fusion id and phase are one op (a matmul with its collective; ring attention with its
+        shifts)."""
+        total = 0.0
+        groups: Dict[Tuple[str, str], List[float]] = {}
+        for e in self.estimates:
+            if phases is not None and e.phase not in phases:
+                continue
+            if e.fusion is None:
+                total += max(e.ideal_compute_ns, e.ideal_memory_ns, e.ideal_network_ns)
+            else:
+                g = groups.setdefault((e.fusion, e.phase), [0.0, 0.0, 0.0])
+                g[0] += e.ideal_compute_ns
+                g[1] += e.ideal_memory_ns
+                g[2] += e.ideal_network_ns
+        return total + sum(max(g) for g in groups.values())
 
     # =========================================================================
     # Aggregate metrics

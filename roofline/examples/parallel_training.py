@@ -11,9 +11,11 @@ Combines, on `chips = pp * tp * cp` devices:
   - activation recompute (--recompute, the memory-efficient runner)
 
 Every distinct pipeline stage (first, middle, last, and each block count when the layer split is
-uneven) is run for one micro-batch in its own RooflineContext. A stage's time per micro-batch is a
-resource-level roofline (FLOP, DRAM and fabric time each summed, the largest sets the time); the
-schedule is then played out with each device's own forward and backward time; see the README.
+uneven) is run for one micro-batch in its own RooflineContext. A stage's time per micro-batch is the
+sum over its ops of max(FLOP, DRAM, fabric) time, a matmul fused with its collective counting as one
+op; the schedule is then played out with each device's own forward and backward time; see the README.
+TP and CP are placed on whole axes of the stage's part of the mesh, as tt-train requires; each group's
+collectives run as a ring only where the group fills a whole wrapped mesh axis.
 
 Examples (from the repository root):
     python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \\
@@ -61,16 +63,15 @@ class StageCost:
     mb_flop_ms: float  # one micro-batch, forward + backward
     mb_dram_ms: float
     mb_fabric_ms: float
-    mb_serial_ms: float  # sum over ops of max(compute, DRAM, network)
-    mb_forward_ms: float  # forward alone: max(FLOP, DRAM, fabric) of the forward phase
+    mb_forward_ms: float  # roofline: sum over ops of max(FLOP, DRAM, fabric), fused ops as one
     mb_backward_ms: float
-    mb_forward_serial_ms: float
-    mb_backward_serial_ms: float
-    opt_flop_ms: float  # optimizer + gradient clipping, once per step
+    mb_forward_bound_ms: float  # upper bound: max(sum FLOP, sum DRAM, sum fabric) of the phase
+    mb_backward_bound_ms: float
+    opt_ms: float  # optimizer + gradient clipping, once per step (per-op roofline)
+    opt_flop_ms: float
     opt_dram_ms: float
-    opt_serial_ms: float
-    sync_fabric_ms: float  # CP gradient all-reduce, once per step
-    sync_serial_ms: float
+    sync_ms: float  # CP gradient all-reduce, once per step (per-op roofline)
+    sync_fabric_ms: float
     activation_bytes: int  # held from forward to backward by the blocks, one micro-batch (excl. LM head)
     state_bytes: int  # parameters + gradients + optimizer state
     peak_bytes: int  # peak of the whole one-micro-batch run (incl. backward transients)
@@ -82,6 +83,7 @@ class StageCost:
 def run_stage(
     hw, preset: dict, seq_len: int, tp: int, cp: int, pp: int, stage_index: int, stage_blocks: int,
     sequence_parallel: bool, vocab_parallel: bool, recompute: bool, attn_block: Optional[int],
+    group_topology: Optional[Dict[str, str]] = None,
 ) -> StageCost:
     """Run one micro-batch (one sequence) through one pipeline stage of `stage_blocks` blocks,
     then the optimizer step."""
@@ -91,14 +93,14 @@ def run_stage(
     gc.freeze()
     try:
         return _run_stage(hw, preset, seq_len, tp, cp, pp, stage_index, stage_blocks, sequence_parallel,
-                          vocab_parallel, recompute, attn_block)
+                          vocab_parallel, recompute, attn_block, group_topology or {})
     finally:
         gc.unfreeze()
 
 
 def _run_stage(hw, preset, seq_len, tp, cp, pp, stage_index, stage_blocks, sequence_parallel, vocab_parallel,
-               recompute, attn_block) -> StageCost:
-    ctx = RooflineContext(hw, attn_block=attn_block)
+               recompute, attn_block, group_topology) -> StageCost:
+    ctx = RooflineContext(hw, attn_block=attn_block, group_topology=dict(group_topology))
     config = distributed_llama_config(
         preset, tp_size=tp, cp_size=cp, sequence_parallel=sequence_parallel,
         num_stages=pp, stage_index=stage_index, stage_num_blocks=stage_blocks, vocab_parallel=vocab_parallel,
@@ -138,7 +140,7 @@ def _run_stage(hw, preset, seq_len, tp, cp, pp, stage_index, stage_blocks, seque
 
     for root in roots:
         root.backward(ctx, retain_graph=False)
-    synchronize_gradients(ctx, params, cp)  # weights are replicated across the CP group
+    synchronize_gradients(ctx, params, cp, group="cp")  # weights are replicated across the CP group
     optimizer.step(ctx)
     mock_clip_grad_norm(ctx, params, max_norm=1.0)
     del x, out, logits, roots  # release the micro-batch's tensors before reading the state
@@ -147,26 +149,25 @@ def _run_stage(hw, preset, seq_len, tp, cp, pp, stage_index, stage_blocks, seque
     peak_bytes, _ = ctx.memory_tracker.peak_memory()
     ctx.disable_memory_tracking()
 
-    def serial_ms(phases):
-        return sum(e.theoretical_time_ns for e in ctx.estimates if e.phase in phases) / 1e6
+    def op_ms(phases):
+        return ctx.op_time_ns(phases) / 1e6
 
-    def overlapped_ms(phases):
+    def bound_ms(phases):
         return ctx.overlapped_time_ns(phases) / 1e6
 
     return StageCost(
         mb_flop_ms=ctx.compute_time_ns(MICROBATCH_PHASES) / 1e6,
         mb_dram_ms=ctx.dram_time_ns(MICROBATCH_PHASES) / 1e6,
         mb_fabric_ms=ctx.network_time_ns(MICROBATCH_PHASES) / 1e6,
-        mb_serial_ms=serial_ms(MICROBATCH_PHASES),
-        mb_forward_ms=overlapped_ms(("forward",)),
-        mb_backward_ms=overlapped_ms(("backward",)),
-        mb_forward_serial_ms=serial_ms(("forward",)),
-        mb_backward_serial_ms=serial_ms(("backward",)),
+        mb_forward_ms=op_ms(("forward",)),
+        mb_backward_ms=op_ms(("backward",)),
+        mb_forward_bound_ms=bound_ms(("forward",)),
+        mb_backward_bound_ms=bound_ms(("backward",)),
+        opt_ms=op_ms(OPTIMIZER_PHASES),
         opt_flop_ms=ctx.compute_time_ns(OPTIMIZER_PHASES) / 1e6,
         opt_dram_ms=ctx.dram_time_ns(OPTIMIZER_PHASES + SYNC_PHASES) / 1e6,
-        opt_serial_ms=serial_ms(OPTIMIZER_PHASES),
+        sync_ms=op_ms(SYNC_PHASES),
         sync_fabric_ms=ctx.network_time_ns(SYNC_PHASES) / 1e6,
-        sync_serial_ms=serial_ms(SYNC_PHASES),
         activation_bytes=mem_after_blocks - mem_before,
         state_bytes=state_bytes,
         peak_bytes=peak_bytes,
@@ -189,7 +190,7 @@ def run_parallel_roofline(
     sequence_parallel: bool = False,
     vocab_parallel: bool = False,
     recompute: bool = False,
-    cut_links: int = 8,
+    cut_links: Optional[int] = None,
     attn_block: Optional[int] = None,
     num_links: Optional[int] = None,
     topology: Optional[str] = None,
@@ -209,11 +210,12 @@ def run_parallel_roofline(
         sequence_parallel: Megatron sequence parallelism inside TP
         vocab_parallel: split the LM head across all pipeline stages
         recompute: recompute each block's forward in backward (memory-efficient runner)
-        cut_links: Ethernet links (per direction) across the cut between two neighbouring stages.
-            Quad (32 x 4 torus), stages laid along the 32-chip axis: one row of 4 chip pairs,
-            2 links each = 8.
+        cut_links: Ethernet links (per direction) across the cut between two neighbouring stages;
+            default from the stage layout (place_stages), e.g. a quad (32 x 4 torus) with stages
+            of whole rows of 4 chips: 4 chip pairs x 2 links = 8
         attn_block: tokens per attention block, see fused_attention_roofline(block)
-        num_links, topology: override the hardware's links per neighbour and topology
+        num_links, topology: override the hardware's links per neighbour; topology forces one ring or
+            line topology on every group instead of deriving it from the placement
         blocks_per_stage: transformer blocks on each pipeline device (as tt-train's
             PipelineParallelConfig.blocks_per_rank); default an even split, the remainder on the
             first devices (the last one holds the LM head)
@@ -251,6 +253,12 @@ def run_parallel_roofline(
     for ok, msg in checks:
         if not ok:
             return {"error": msg}
+    placement = place_stages(hw, pp, tp, cp, interleaved=sched.interleave > 1)
+    if "error" in placement:
+        return placement
+    group_topology = placement["topology"] if topology is None else {"tp": topology, "cp": topology}
+    if cut_links is None:
+        cut_links = placement["cut_links"]
 
     cache = stage_cache if stage_cache is not None else {}
 
@@ -259,11 +267,11 @@ def run_parallel_roofline(
         return 0 if d == 0 else (pp - 1 if d == pp - 1 else 1)
 
     def stage_cost(d: int, with_recompute: bool) -> StageCost:
-        key = (model_name, seq_len, hardware, hw.num_links, hw.topology, pp, tp, cp, role(d), blocks[d],
-               sequence_parallel, vocab_parallel, with_recompute, attn_block)
+        key = (model_name, seq_len, hardware, hw.num_links, tuple(sorted(group_topology.items())), pp, tp, cp,
+               role(d), blocks[d], sequence_parallel, vocab_parallel, with_recompute, attn_block)
         if key not in cache:
             cache[key] = run_stage(hw, preset, seq_len, tp, cp, pp, role(d), blocks[d], sequence_parallel,
-                                   vocab_parallel, with_recompute, attn_block)
+                                   vocab_parallel, with_recompute, attn_block, group_topology)
         return cache[key]
 
     costs = [stage_cost(d, recompute) for d in range(pp)]
@@ -275,38 +283,42 @@ def run_parallel_roofline(
 
     # Stage hand-off: every device of the stage sends its part of the activation (forward) or its
     # gradient (backward) across the cut; without SP every TP chip holds the full activation.
-    # Per micro-batch a device sends v activations one way and v gradients the other way; the two
-    # directions of the full-duplex links run concurrently, so v hand-offs count.
+    # Per micro-batch a device sends v activations and v gradients. In the roofline each send is its
+    # own op on the device (2v ops); in the upper bound the two directions of the full-duplex links
+    # overlap, so v hand-offs count against the fabric.
     m, v = num_microbatches, sched.interleave
     handoff_bytes = costs[0].output_bytes * tp * cp
-    hand = send_recv_roofline(hw, handoff_bytes, cut_links, operation="PipelineHandoff").ideal_network_ns / 1e6
-    hand_per_mb = v * hand if pp > 1 else 0.0
+    hand = (send_recv_roofline(hw, handoff_bytes, cut_links, operation="PipelineHandoff").ideal_network_ns / 1e6
+            if pp > 1 else 0.0)
 
     def device_time(c: StageCost) -> Dict[str, float]:
-        flop, dram, fabric = c.mb_flop_ms, c.mb_dram_ms, c.mb_fabric_ms + hand_per_mb
-        return {"flop_ms": flop, "dram_ms": dram, "fabric_ms": fabric, "overlapped_ms": max(flop, dram, fabric),
-                "serial_ms": c.mb_serial_ms + hand_per_mb}
+        flop, dram, fabric = c.mb_flop_ms, c.mb_dram_ms, c.mb_fabric_ms + v * hand
+        return {"flop_ms": flop, "dram_ms": dram, "fabric_ms": fabric,
+                "roofline_ms": c.mb_forward_ms + c.mb_backward_ms + 2 * v * hand,
+                "upper_bound_ms": max(flop, dram, fabric)}
 
     per_stage = [device_time(c) for c in costs]
-    D = max(per_stage, key=lambda p: p["overlapped_ms"])
+    D = max(per_stage, key=lambda p: p["roofline_ms"])
 
-    # Play the schedule out with each device's own time per micro-batch, split into forward and
-    # backward in the proportion of that device's forward and backward phases. With equal devices
-    # this is slots(P, m) x D; uneven stages set the pace with the slowest and fill/drain with the sum.
-    def split(total: float, fwd: float, bwd: float):
-        r = fwd / (fwd + bwd) if fwd + bwd > 0 else 1 / 3
+    # Play the schedule out with each device's own forward and backward time per micro-batch.
+    # With equal devices this is slots(P, m) x D; uneven stages set the pace with the slowest and
+    # fill/drain with the sum.
+    fwd = [c.mb_forward_ms + v * hand for c in costs]
+    bwd = [c.mb_backward_ms + v * hand for c in costs]
+    bubble, held, pipeline_ms = simulate_schedule(sched, pp, m, fwd, bwd)
+
+    def split(total: float, f: float, b: float):
+        r = f / (f + b) if f + b > 0 else 1 / 3
         return total * r, total * (1 - r)
 
-    over = [split(p["overlapped_ms"], c.mb_forward_ms, c.mb_backward_ms) for p, c in zip(per_stage, costs)]
-    ser = [split(p["serial_ms"], c.mb_forward_serial_ms, c.mb_backward_serial_ms) for p, c in zip(per_stage, costs)]
-    bubble, held, pipeline_ms = simulate_schedule(sched, pp, m, [f for f, _ in over], [b for _, b in over])
-    _, _, pipeline_serial_ms = simulate_schedule(sched, pp, m, [f for f, _ in ser], [b for _, b in ser])
+    ub = [split(p["upper_bound_ms"], c.mb_forward_bound_ms, c.mb_backward_bound_ms) for p, c in zip(per_stage, costs)]
+    _, _, pipeline_bound_ms = simulate_schedule(sched, pp, m, [f for f, _ in ub], [b for _, b in ub])
 
-    # The optimizer runs after the last backward; the step waits for the slowest stage's update
-    opt = max(max(c.opt_flop_ms, c.opt_dram_ms) for c in costs)
+    # The CP gradient all-reduce and the optimizer run after the last backward, one after the other;
+    # the step waits for the slowest stage
+    step_roofline = pipeline_ms + max(c.sync_ms + c.opt_ms for c in costs)
     link_total = max(m * p["fabric_ms"] + c.sync_fabric_ms for p, c in zip(per_stage, costs))
-    step_overlapped = max(pipeline_ms + opt, link_total)
-    step_serial = pipeline_serial_ms + max(c.opt_serial_ms + c.sync_serial_ms for c in costs)
+    step_bound = max(pipeline_bound_ms + max(max(c.opt_flop_ms, c.opt_dram_ms) for c in costs), link_total)
 
     # Memory per device: the one-micro-batch run's peak (state, its activations, backward
     # transients) plus the other micro-batches the schedule makes it hold at the same time
@@ -325,18 +337,73 @@ def run_parallel_roofline(
     bound = max(("flop", "dram", "fabric"), key=lambda k: D[f"{k}_ms"])
     return {
         "config": {"model": model_name, "seq_len": seq_len, "num_microbatches": m, "hardware": hw.name,
-                   "num_links": hw.num_links, "topology": hw.topology, "chips": chips, "pp": pp, "tp": tp,
+                   "num_links": hw.num_links, "topology": group_topology, "stage_mesh": placement["stage_mesh"],
+                   "chips": chips, "pp": pp, "tp": tp,
                    "cp": cp, "schedule": str(sched), "interleave": v, "sequence_parallel": sequence_parallel,
                    "vocab_parallel": vocab_parallel, "recompute": recompute, "cut_links": cut_links,
                    "attn_block": attn_block, "blocks_per_stage": blocks},
         "per_microbatch": {**D, "bound": bound, "handoff_ms": hand},
         "bubble": bubble,
-        "overlapped": throughput(step_overlapped),
-        "serial": throughput(step_serial),
+        "roofline": throughput(step_roofline),
+        "upper_bound": throughput(step_bound),
         "memory": {"peak_gb": memory / 1e9, "fits": memory <= hw.dram_gb_per_chip * 1e9, "device": worst,
                    "activation_gb_per_mb": costs[worst].activation_bytes / 1e9,
                    "peak_activations": held[worst], "state_gb": costs[worst].state_bytes / 1e9},
     }
+
+
+def place_stages(hw, pp: int, tp: int, cp: int, interleaved: bool = False) -> Dict[str, Any]:
+    """Lay pipeline stages along the first mesh axis and TP / CP on whole axes of each stage's block.
+
+    The hardware's mesh (hw.mesh_shape, rows x columns, hw.mesh_wrap) is cut into pp equal blocks of
+    tp * cp chips: whole rows when a stage spans at least one row, else parts of a row. tt-train's
+    collectives run over whole mesh axes (ttnn_fixed/distributed/ttnn_ops.cpp), so TP and CP must each
+    be one axis of the block (one of them may be 1 on a one-row block); TP takes the column axis when
+    it fits. A group's collectives are a ring when it fills a whole wrapped axis of the mesh and has
+    more than 2 chips (tt-train's get_topology), else a line.
+
+    Returns {"topology": {"tp": ..., "cp": ...}, "cut_links", "stage_mesh"} or {"error": str}.
+    """
+    R, C = hw.mesh_shape
+    wrap_r, wrap_c = hw.mesh_wrap
+    n = tp * cp
+    if R * C == 1:  # single chip / unspecified mesh: keep the hardware's own topology
+        return {"topology": {}, "cut_links": hw.num_links, "stage_mesh": (1, n)}
+    if pp * n > R * C:
+        return {"error": f"pp*tp*cp = {pp * n} > {R * C} chips of {hw.name}"}
+    if n % C == 0:
+        block = (n // C, C)
+    elif C % n == 0:
+        block = (1, n)
+    else:
+        return {"error": f"a stage of {n} chips is neither whole rows nor part of a row of {C}"}
+    rows, cols = block
+
+    def topo(size: int, full: bool, wrap: bool) -> str:
+        return "ring" if size > 2 and full and wrap else "linear"
+
+    row_axis = (rows, rows == R, wrap_r)
+    col_axis = (cols, cols == C, wrap_c)
+    if tp > 1 and cp > 1:
+        if (tp, cp) == (cols, rows):
+            tp_axis, cp_axis = col_axis, row_axis
+        elif (tp, cp) == (rows, cols):
+            tp_axis, cp_axis = row_axis, col_axis
+        else:
+            return {"error": f"TP{tp} x CP{cp} is not one mesh axis each on a {rows} x {cols} stage "
+                             "(tt-train collectives run over whole mesh axes)"}
+    elif max(tp, cp) > 1:
+        if rows != 1:
+            return {"error": f"TP{tp} x CP{cp} on a {rows} x {cols} stage: one group cannot cover two mesh axes"}
+        tp_axis = cp_axis = col_axis
+    else:
+        tp_axis = cp_axis = col_axis
+    if interleaved and not (wrap_r and pp * rows == R):
+        return {"error": "interleaved needs the last stage to neighbour the first (stages filling a wrapped axis)"}
+    pairs = cols if rows >= 1 and cols == C else 1  # chip pairs across the cut between two stages
+    return {"topology": {"tp": topo(tp, *tp_axis[1:]) if tp > 1 else "linear",
+                         "cp": topo(cp, *cp_axis[1:]) if cp > 1 else "linear"},
+            "cut_links": pairs * hw.num_links, "stage_mesh": block}
 
 
 def even_split(num_blocks: int, pp: int) -> List[int]:
@@ -390,14 +457,16 @@ def main():
     parser.add_argument("--sp", action="store_true", help="Sequence parallelism inside TP")
     parser.add_argument("--vocab-parallel", action="store_true", help="Split the LM head across stages")
     parser.add_argument("--recompute", action="store_true", help="Recompute block forward in backward")
-    parser.add_argument("--cut-links", type=int, default=8, help="Links across a stage boundary (default: 8)")
+    parser.add_argument("--cut-links", type=int, default=None,
+                        help="Links across a stage boundary (default: from the stage layout)")
     parser.add_argument("--attn-block", type=int, default=None,
                         help="Tokens kept on chip per attention block, forward and backward "
                              "(default: one 32-token tile, today's kernels)")
     parser.add_argument("--blocks-per-stage", default=None, metavar="N,N,...",
                         help="Transformer blocks on each pipeline device (default: even split, remainder first)")
     parser.add_argument("--links", type=int, default=None, help="Override links per neighbouring chip pair")
-    parser.add_argument("--topology", choices=("ring", "linear"), default=None, help="Override topology")
+    parser.add_argument("--topology", choices=("ring", "linear"), default=None,
+                        help="Force one topology on every group (default: derived from the placement)")
     parser.add_argument("--sweep", type=int, default=None, metavar="CHIPS",
                         help="Evaluate every PP x TP x CP split of CHIPS chips and print the best that fit")
     parser.add_argument("--top", type=int, default=10, help="Rows to print with --sweep")
@@ -410,11 +479,11 @@ def main():
                   num_links=args.links, topology=args.topology)
     if args.sweep:
         results = sweep(args.sweep, **common)
-        fits = sorted((r for r in results if r["memory"]["fits"]), key=lambda r: -r["overlapped"]["tokens_per_second"])
+        fits = sorted((r for r in results if r["memory"]["fits"]), key=lambda r: -r["roofline"]["tokens_per_second"])
         print(f"{len(fits)} of {len(results)} configurations fit in memory")
         print(f"{'configuration':40s} {'tokens/s':>10s} {'MFU':>7s} {'bound':>7s} {'bubble':>7s} {'mem GB':>7s}")
         for r in fits[: args.top]:
-            print(f"{_describe(r):40s} {r['overlapped']['tokens_per_second']:10,.0f} {r['overlapped']['mfu']:7.1%} "
+            print(f"{_describe(r):40s} {r['roofline']['tokens_per_second']:10,.0f} {r['roofline']['mfu']:7.1%} "
                   f"{r['per_microbatch']['bound']:>7s} {r['bubble']:7.1%} {r['memory']['peak_gb']:7.1f}")
         out = results
     else:
@@ -424,16 +493,21 @@ def main():
                                     recompute=args.recompute, blocks_per_stage=blocks, **common)
         if "error" in out:
             raise SystemExit(out["error"])
-        pm, o, s, mem = out["per_microbatch"], out["overlapped"], out["serial"], out["memory"]
+        pm, o, ub, mem = out["per_microbatch"], out["roofline"], out["upper_bound"], out["memory"]
         print(f"{_describe(out)} on {out['config']['chips']} chips ({out['config']['hardware']}), "
               f"{args.microbatches} x {args.seq} tokens per step")
-        print(f"  per micro-batch, slowest stage: FLOP {pm['flop_ms']:.2f} ms, DRAM {pm['dram_ms']:.2f} ms, "
-              f"fabric {pm['fabric_ms']:.2f} ms (hand-off {pm['handoff_ms']:.3f} ms) -> {pm['bound']}-bound")
+        cfg = out["config"]
+        print(f"  stage mesh {cfg['stage_mesh'][0]} x {cfg['stage_mesh'][1]}, TP {cfg['topology'].get('tp', '-')}, "
+              f"CP {cfg['topology'].get('cp', '-')}, {cfg['cut_links']} links across a stage cut")
+        print(f"  per micro-batch, slowest stage: {pm['roofline_ms']:.2f} ms (sum of FLOP {pm['flop_ms']:.2f}, "
+              f"DRAM {pm['dram_ms']:.2f}, fabric {pm['fabric_ms']:.2f} ms; hand-off {pm['handoff_ms']:.3f} ms) "
+              f"-> mostly {pm['bound']}")
         if len(set(out["config"]["blocks_per_stage"])) > 1:
             print(f"  blocks per stage: {out['config']['blocks_per_stage']}")
         print(f"  bubble {out['bubble']:.2%}")
-        print(f"  overlapped roofline: {o['tokens_per_second']:,.0f} tokens/s, MFU {o['mfu']:.1%}, step {o['step_ms']/1e3:.2f} s")
-        print(f"  serial (per-op sum): {s['tokens_per_second']:,.0f} tokens/s, MFU {s['mfu']:.1%}")
+        print(f"  roofline (sum of per-op max): {o['tokens_per_second']:,.0f} tokens/s, MFU {o['mfu']:.1%}, "
+              f"step {o['step_ms']/1e3:.2f} s")
+        print(f"  upper bound (max of summed resources): {ub['tokens_per_second']:,.0f} tokens/s, MFU {ub['mfu']:.1%}")
         print(f"  memory per chip: {mem['peak_gb']:.1f} GB on device {mem['device']} "
               f"({'fits' if mem['fits'] else 'does not fit'}; state {mem['state_gb']:.1f} GB + "
               f"{mem['peak_activations']:.1f} x {mem['activation_gb_per_mb']:.2f} GB held)")

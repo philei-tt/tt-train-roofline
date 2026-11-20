@@ -207,16 +207,17 @@ python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048
     --pp 8 --tp 4 --cp 4 --recompute --blocks-per-stage 11,11,10,10,10,10,10,8
 ```
 
-Layers are split evenly across pipeline devices by default, the remainder going to the first devices; `--blocks-per-stage` sets any split. Every distinct stage (first, middle, last, each block count) is run for one micro-batch in its own `RooflineContext`. A stage's time per micro-batch is a resource-level roofline: compute, DRAM and fabric (Ethernet) time are summed separately and the largest one sets the time, so the three overlap:
+Layers are split evenly across pipeline devices by default, the remainder going to the first devices; `--blocks-per-stage` sets any split. Every distinct stage (first, middle, last, each block count) is run for one micro-batch in its own `RooflineContext`. The roofline is per op: every op takes max(FLOP, DRAM, fabric) time and the ops of a stage run one after another. A matmul and its collective are one op (column-parallel linear with its all-gather or broadcast, row-parallel linear with its reduce-scatter or all-reduce; with `--sp` one all-gather feeds q/kv or w1/w3), and so are ring attention and its K/V shifts:
 
 ```
-D_d     = max(FLOP, DRAM, fabric) for one micro-batch on device d
-          (fabric includes v stage hand-offs per micro-batch)
-T_pipe  = the schedule played out op by op (simulate_schedule), device d taking D_d per micro-batch,
-          split into forward and backward in the proportion of its own forward and backward phases
-        = slots * D when all devices are equal
-T_step  = max( T_pipe + max(optimizer FLOP, optimizer DRAM),  m * fabric + CP gradient sync )
+op time = max(sum FLOP time, sum DRAM time, sum fabric time) over the op's estimates
+F_d, B_d = sum of op times of one micro-batch's forward / backward on device d,
+          each + v stage hand-offs (each its own op)
+T_pipe  = the schedule played out op by op (simulate_schedule) with device d taking F_d and B_d
+        = slots * (F + B) when all devices are equal
+T_step  = T_pipe + CP gradient all-reduce + optimizer (per-op sums, slowest stage)
 bubble  = idle share of the step over all devices = (slots - m) / slots when all devices are equal
+upper bound: the same with every resource summed over the micro-batch and only the largest counted
 MFU     = model FLOPs / T_step / (chips * peak)
           model FLOPs: counted by the mock run over all stages, forward + backward without recompute
           (as tt-train's tools/profiling/results_json/add_roofline.py)
@@ -240,16 +241,17 @@ Supporting changes:
 | Where | What |
 |---|---|
 | `RooflineEstimate.ideal_network_ns`, `roofline/roofline/ccl.py` | Collectives put their link time and a fixed per-call latency (fitted to measured ttnn collectives, tt-metal `tech_reports/CCLs/CCL_bandwidth.md`) on the fabric, and their input read and output write on DRAM; `theoretical_time_ns = max(compute, memory, network)` |
-| `RooflineContext.compute_time_ns / dram_time_ns / network_time_ns / overlapped_time_ns` | Per-resource sums and their max |
+| `RooflineContext.op_time_ns`, `fused()`, `RooflineEstimate.fusion` | Per-op roofline with fused ops (a matmul and its collective); `compute_time_ns / dram_time_ns / network_time_ns / overlapped_time_ns` give the per-resource sums and the upper bound |
+| `place_stages`, `RooflineContext.group_topology` / `hw_for(group)` | Stages are blocks of whole rows of the mesh (or parts of a row); TP and CP each take one axis of the block, as tt-train's whole-axis collectives require; a group's collectives run as a ring only when it fills a whole wrapped mesh axis with more than 2 chips, else as a line; links across a stage cut = chip pairs on the boundary x links per pair |
 | `fused_attention_roofline(..., block)`, `RooflineContext.attn_block` (`--attn-block`) | Follows tt-train's `sdpa_fw` and split `sdpa_bw` (Q and KV kernels): causal, K/V re-read per Q block in the forward and the Q kernel, Q, dO and the fp32 statistics re-read per K/V block in the KV kernel; backward matmul FLOPs 14 · B · Hq · M · d. Default block: one 32-token tile, today's kernels; 512 makes attention compute-bound |
 | `ring_shift_roofline`, `send_recv_roofline` | CP ring shifts (both ring directions) and stage hand-offs over the links across a stage cut |
 | `MockRingAttentionOp`, `cp_size` on the distributed block | Ring attention: attention of the full sequence divided by `cp`, K/V (bf16) shifts forward, K/V + dK/dV (fp32) backward, fp32 accumulator read + write per ring step |
 | `sequence_parallel` on the parallel linears, attention, MLP, block and `MockDistributedLlamaConfig` | All-gather / reduce-scatter along the sequence instead of broadcast / all-reduce; norms and residual adds hold `S / tp` tokens |
 | `num_stages`, `stage_index`, `stage_num_blocks`, `vocab_parallel` on `MockDistributedLlamaConfig`; `training/pipeline.py` | The model as one pipeline stage (`forward_stage`); schedule classes (`NaiveSchedule`, `GPipeSchedule`, `OneFOneBSchedule`, `InterleavedOneFOneBSchedule`) and a schedule simulator |
 | Embedding, LM head, gradients | Embedding untilizes its whole table each forward and returns a dense table gradient (tt-train `embedding_op`); LM head keeps logits sharded over the vocabulary with `MockVocabParallelCrossEntropyLossOp` (tt-train `vocab_parallel_cross_entropy_loss`); each stage run starts with every gradient allocated, as after the first micro-batch, so the out-of-place gradient add and the resident gradients are in the step time and the memory peak; the micro-batches held at once count only the blocks' activations |
-| `BLACKHOLE_QUAD`, `HARDWARE_PRESETS` | 4 galaxies, 128 chips, 32 x 4 torus, 2 links per neighbouring chip pair; one name-to-spec map used by both examples (`--hardware bh_quad`) |
+| `BLACKHOLE_GALAXY`, `BLACKHOLE_QUAD`, `HARDWARE_PRESETS` | Galaxy chips: 130 compute cores (13 x 10), 25 GB/s per Ethernet link per direction (galaxy links run at half their rated speed, tt-metal `tech_reports/CCLs/CCL_bandwidth.md`), 2 links per neighbouring chip pair; galaxy 8 x 4 torus, quad 4 galaxies as a 32 x 4 torus (`HardwareSpec.mesh_shape`, `mesh_wrap`); one name-to-spec map used by both examples (`--hardware bh_quad`) |
 
-Limitations: TP must divide the number of KV heads (as in tt-train). With `--sp` the attention and MLP gather the norm output once and keep the gathered copy for backward (Megatron keeps the shard and re-gathers), so memory is higher than Megatron's. The communication of vocabulary parallelism is not modelled. `--cut-links` (default 8) assumes stages laid along the 32-chip axis of a quad.
+Limitations: TP must divide the number of KV heads (as in tt-train). With `--sp` the attention and MLP gather the norm output once and keep the gathered copy for backward (Megatron keeps the shard and re-gathers), so memory is higher than Megatron's. The communication of vocabulary parallelism is not modelled. Links between galaxies are assumed to be the same as inside a galaxy. Overlap between ops that the hardware or a schedule could provide (other than a matmul with its own collective) is not credited; the upper bound credits all of it.
 
 ## Dependencies
 

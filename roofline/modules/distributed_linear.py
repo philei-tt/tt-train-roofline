@@ -105,11 +105,13 @@ class MockColumnParallelLinear(MockModule):
     def forward(self, ctx: "RooflineContext", x: MockTensor, input_gathered: bool = False) -> MockTensor:
         """input_gathered: x is already gather_input's output, shared with another column-parallel
         layer reading the same tensor (one all-gather, one reduce-scatter for both)."""
-        if not input_gathered:
-            x = self.gather_input(ctx, x)
-
-        bias_tensor = self.bias.tensor if self.bias is not None else None
-        x = MockLinearOp.apply(ctx, x, self.weight.tensor, bias_tensor)
+        # One op: the input gather / broadcast fused with the matmul (unless the caller already
+        # opened the fused op around a shared gather)
+        with ctx.fused(ctx.current_fusion if input_gathered else ctx.new_fusion("ColumnParallelLinear")):
+            if not input_gathered:
+                x = self.gather_input(ctx, x)
+            bias_tensor = self.bias.tensor if self.bias is not None else None
+            x = MockLinearOp.apply(ctx, x, self.weight.tensor, bias_tensor)
 
         if self.gather_output and self.tp_size > 1:
             x = MockAllGatherOp.apply(ctx, x, x.shape.__len__() - 1, self.tp_size)
@@ -185,19 +187,21 @@ class MockRowParallelLinear(MockModule):
         if not self.input_is_parallel and self.tp_size > 1:
             x = MockScatterOp.apply(ctx, x, len(x.shape) - 1, self.tp_size)
 
-        # Linear without bias (bias added after all-reduce)
-        x = MockLinearOp.apply(ctx, x, self.weight.tensor, None)
+        # One op: the matmul fused with its reduce-scatter / all-reduce
+        with ctx.fused(ctx.new_fusion("RowParallelLinear")):
+            # Linear without bias (bias added after all-reduce)
+            x = MockLinearOp.apply(ctx, x, self.weight.tensor, None)
 
-        if self.sequence_parallel and self.tp_size > 1:
-            # Reduce-scatter partial sums into sequence shards (all-gather in backward)
-            x = MockReduceScatterOp.apply(ctx, x, SEQ_DIM, self.tp_size)
-        else:
-            # All-reduce to sum partial results across TP devices.
-            # noop_backward when input_is_parallel to avoid double all-reduce
-            # (broadcast in the paired ColumnParallelLinear already handles it).
-            x = MockAllReduceOp.apply(
-                ctx, x, self.input_is_parallel, self.tp_size,
-            )
+            if self.sequence_parallel and self.tp_size > 1:
+                # Reduce-scatter partial sums into sequence shards (all-gather in backward)
+                x = MockReduceScatterOp.apply(ctx, x, SEQ_DIM, self.tp_size)
+            else:
+                # All-reduce to sum partial results across TP devices.
+                # noop_backward when input_is_parallel to avoid double all-reduce
+                # (broadcast in the paired ColumnParallelLinear already handles it).
+                x = MockAllReduceOp.apply(
+                    ctx, x, self.input_is_parallel, self.tp_size,
+                )
 
         if self.bias is not None:
             x = MockAddOp.apply(ctx, x, self.bias.tensor)
