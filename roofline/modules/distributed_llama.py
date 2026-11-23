@@ -10,9 +10,7 @@ and MockDistributedLlamaBlock for each transformer block.
 
 Optionally the model is one stage of a pipeline (num_stages > 1): it holds stage_num_blocks
 blocks (L/P by default; splits may be uneven), the first stage the token embedding,
-the last stage the final norm and LM head. With vocab_parallel (Yeung et al., 2024,
-"Balancing Pipeline Parallelism with Vocabulary Parallelism") every stage holds 1/P of
-the LM head instead.
+the last stage the final norm and LM head.
 """
 
 from __future__ import annotations
@@ -52,7 +50,6 @@ class MockDistributedLlamaConfig:
     num_stages: int = 1  # pipeline stages
     stage_index: int = 0
     stage_num_blocks: Optional[int] = None  # blocks on this stage; default num_blocks // num_stages
-    vocab_parallel: bool = False  # LM head split across all pipeline stages
 
 
 class MockDistributedLlama(MockModule):
@@ -87,7 +84,7 @@ class MockDistributedLlama(MockModule):
         tp_size = config.tp_size
         self.is_first = config.stage_index == 0
         self.is_last = config.stage_index == config.num_stages - 1
-        self.has_head = self.is_last or config.vocab_parallel
+        self.has_head = self.is_last
 
         vocab_size_padded = (config.vocab_size + 31) // 32 * 32
         head_dim = config.embedding_dim // config.num_heads
@@ -120,14 +117,10 @@ class MockDistributedLlama(MockModule):
         self.ln_fc = None
         self.fc = None
         if self.has_head:
-            head_vocab = vocab_size_padded
-            if config.vocab_parallel and config.num_stages > 1:
-                quantum = 32 * tp_size
-                head_vocab = (vocab_size_padded // config.num_stages + quantum - 1) // quantum * quantum
             self.ln_fc = MockRMSNormLayer(config.embedding_dim, dtype=dtype)
             self.fc = MockColumnParallelLinear(
                 config.embedding_dim,
-                head_vocab,
+                vocab_size_padded,
                 has_bias=False,
                 gather_output=False,
                 tp_size=tp_size,
@@ -168,19 +161,11 @@ class MockDistributedLlama(MockModule):
         return out
 
     def forward_head(self, ctx: "RooflineContext", out: MockTensor) -> Optional[MockTensor]:
-        """Final norm and LM head (shard) on the stages that hold it: the logits, else None."""
+        """Final norm and LM head on the last stage: the logits (sharded over the vocabulary
+        across TP), else None."""
         if not self.has_head:
             return None
-        head_in = out
-        if not self.is_last:
-            # Vocabulary parallelism: the last stage's final hidden state, broadcast to every
-            # stage (the broadcast, gradient reduce and loss all-reduces across stages are costed
-            # in parallel_training.run_parallel_roofline, vocab_comm)
-            head_in = MockTensor(
-                out.shape, out.dtype, out.layout, requires_grad=True,
-                label=out.label, name="final_hidden", num_shards=out.num_shards,
-            )
-        return self.fc(ctx, self.ln_fc(ctx, head_in))
+        return self.fc(ctx, self.ln_fc(ctx, out))
 
     def forward(
         self,

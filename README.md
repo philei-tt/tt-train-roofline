@@ -188,7 +188,7 @@ python3 -m roofline.examples.matmuls
 
 `roofline.examples.parallel_training` models one optimizer step of a Llama on `dp * pp * tp * cp` chips:
 
-- **PP** with a choice of schedule (`--schedule naive | gpipe | 1f1b | interleaved`, `--interleave v` chunks per device for interleaved), optional vocabulary parallelism across stages (`--vocab-parallel`, target only)
+- **PP** with a choice of schedule (`--schedule naive | gpipe | 1f1b | interleaved`, `--interleave v` chunks per device for interleaved); the LM head stays on the last stage, split over the vocabulary across TP as in tt-train
 - **TP** inside a stage, optionally with Megatron sequence parallelism (`--sp`)
 - **CP** inside a stage: ring attention, today's or the target one (below)
 - **DP**: `--dp` copies of the whole pipeline, each running m / dp micro-batches; `--zero1` shards the optimizer state over the CP x DP replicas (target only)
@@ -201,7 +201,7 @@ python3 -m roofline.examples.matmuls
 |---|---|---|
 | attention block (`--attn-block`) | one 32-token tile | 512 tokens |
 | ring attention (CP) | contiguous split: the last device runs half a block then cp - 1 full ones; each step resets and slices the statistics, merges with 12 fp32 ops on them, a cast and 3 fp32 passes over the output; backward zeroes, casts and adds three step buffers; shifts are socket transfers on one link in one direction, in two phases (`ttnn_fixed::distributed::ring_shift`); every ttnn call is its own op | load-balanced split, merge fused into the kernel, shifts in both ring directions overlapped with attention (one op) |
-| vocabulary parallelism across stages, ZeRO-1, selective recompute | not available (error; tt-train's runners are default and memory-efficient) | allowed |
+| ZeRO-1, selective recompute | not available (error; tt-train's runners are default and memory-efficient) | allowed |
 
 Host synchronizations in today's ring attention and ring shift are not modelled (a roofline has no host).
 
@@ -252,7 +252,7 @@ MFU     = ideal time / T_step,  ideal time = model FLOPs / (chips * peak)
 
 `simulate_schedule` plays any schedule out op by op on a common clock; with equal devices every closed form above matches it. With uneven devices the slowest one sets the pace and the fill and drain take the sum of the devices' times; the held counts it reports set each device's memory.
 
-Vocabulary parallelism across stages (Yeung et al., 2024) adds a pass H(j) per micro-batch on every device: its LM-head shard and loss, the broadcast of the final hidden state and the reduce of its gradient (about one hand-off each), and three cross-entropy all-reduces over the stages. H(j) needs the last stage's forward of j, and the last stage's backward of j needs H(j) from every device. `simulate_schedule(..., vocab=...)` places H(j) on each device at the first op of its order that starts after the last stage's forward of j, and plays the dependencies out: plain 1F1B pays for them in bubble (PP16 x TP4 x CP2 with SP, full recompute: 8.9% without the dependency, 34.4% with it). The modified schedules of the paper that hide it are not modelled.
+Vocabulary parallelism across pipeline stages (Yeung et al., 2024, the LM head split over every stage) is not modelled: tt-train does not have it, and the head stays on the last stage.
 
 Gradient sync: without ZeRO-1 one all-reduce of every gradient per group (CP, then DP), as tt-train's `synchronize_gradients_along`; with ZeRO-1 a reduce-scatter per group, the optimizer on 1/(cp dp) of each parameter (its fp32 master copy, m and v sharded too), and an all-gather of the updated bf16 parameters. DP copies of the pipeline sit one after another along the rows, so each DP group's members are a pipeline apart and all DP groups of a column share its links (`RooflineContext.group_link_share`); DP needs stages of whole rows.
 
@@ -269,7 +269,7 @@ Supporting changes:
 | `ring_shift_roofline`, `send_recv_roofline` | CP ring shifts (both ring directions) and stage hand-offs over the links across a stage cut |
 | `MockRingAttentionOp`, `cp_size` on the distributed block, `RooflineContext.cp_mode`, `socket_ring_shift_roofline` | Ring attention, target: attention of the full sequence divided by `cp`, K/V (bf16) shifts forward, K/V + dK/dV (fp32) backward, fp32 accumulator read + write per ring step; current: tt-train's `ring_attention_sdpa` call by call (table above); `fused_attention_roofline(causal=False)` for a full off-diagonal block |
 | `sequence_parallel` on the parallel linears, attention, MLP, block and `MockDistributedLlamaConfig` | All-gather / reduce-scatter along the sequence instead of broadcast / all-reduce; norms and residual adds hold `S / tp` tokens |
-| `num_stages`, `stage_index`, `stage_num_blocks`, `vocab_parallel` on `MockDistributedLlamaConfig`; `training/pipeline.py` | The model as one pipeline stage (`forward_stage`); schedule classes (`NaiveSchedule`, `GPipeSchedule`, `OneFOneBSchedule`, `InterleavedOneFOneBSchedule`) and a schedule simulator |
+| `num_stages`, `stage_index`, `stage_num_blocks` on `MockDistributedLlamaConfig`; `training/pipeline.py` | The model as one pipeline stage (`forward_stage`); schedule classes (`NaiveSchedule`, `GPipeSchedule`, `OneFOneBSchedule`, `InterleavedOneFOneBSchedule`) and a schedule simulator |
 | `RooflineFunction.recompute`, `RooflineContext.selective_recompute`, `MockTensor.untrack` | Selective recompute: the op's outputs and saved tensors are not held; its forward estimates run again in backward, and the recomputed tensors are live through the op's backward (and through the backward of every op that reads them); in the forward they are not counted while the next op uses them, a transient left out |
 | `MockAdamW(master_dtype, num_shards)`, `synchronize_replica_gradients` | fp32 master copy with fp32 m and v, ZeRO-1 sharding; gradient sync over CP and DP; fp32 gradient accumulation keeps the accumulator's dtype |
 | Embedding, LM head, gradients | Embedding untilizes its whole table each forward and returns a dense table gradient (tt-train `embedding_op`); LM head keeps logits sharded over the vocabulary with `MockVocabParallelCrossEntropyLossOp` (tt-train `vocab_parallel_cross_entropy_loss`); each stage run starts with every gradient allocated, as after the first micro-batch, so the out-of-place gradient add and the resident gradients are in the step time and the memory peak; the micro-batches held at once count only the blocks' activations |

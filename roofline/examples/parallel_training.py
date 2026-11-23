@@ -5,7 +5,7 @@
 """Roofline analysis for Llama training with pipeline, tensor, sequence, context and data parallelism.
 
 Combines, on `chips = dp * pp * tp * cp` devices:
-  - PP: a pipeline schedule (training/pipeline.py), optional vocabulary parallelism across stages
+  - PP: a pipeline schedule (training/pipeline.py)
   - TP: tensor parallelism inside a stage, optionally with sequence parallelism (--sp)
   - CP: context parallelism inside a stage (ring attention)
   - DP: dp copies of the whole pipeline, each running m / dp micro-batches; optional ZeRO-1
@@ -16,7 +16,7 @@ Combines, on `chips = dp * pp * tp * cp` devices:
 blocks, contiguous ring attention with unfused merges and socket shifts); "target" is the planned
 implementation (512-token attention blocks, load-balanced ring attention with fused merges and
 overlapped shifts) and is the only mode that allows the features tt-train does not have yet:
-vocabulary parallelism across stages and ZeRO-1. A single run reports both modes.
+ZeRO-1 and selective recompute. A single run reports both modes.
 
 Every distinct pipeline stage (first, middle, last, and each block count when the layer split is
 uneven) is run for one micro-batch in its own RooflineContext. A stage's time per micro-batch is the
@@ -54,7 +54,6 @@ from roofline import (
     RooflineContext,
     TensorLabel,
     mock_clip_grad_norm,
-    all_reduce_roofline,
     send_recv_roofline,
 )
 from roofline.operations.operation import create_grad_tensor
@@ -69,8 +68,7 @@ GATHER_PHASES = ("param_gather",)  # ZeRO-1: all-gather of the updated parameter
 
 # What --mode sets (see the module docstring); features only the target mode allows
 ATTN_BLOCK = {"current": None, "target": 512}  # per mode; the mode is also the ring-attention model
-TARGET_ONLY = {"vocab_parallel": "vocabulary parallelism across pipeline stages", "zero1": "ZeRO-1",
-               "selective": "selective recompute"}  # tt-train runners today: default, memory-efficient
+TARGET_ONLY = {"zero1": "ZeRO-1", "selective": "selective recompute"}  # tt-train runners today: default, memory-efficient
 RECOMPUTE = ("none", "selective", "full")
 DTYPES = {"bf16": DataType.BFLOAT16, "fp32": DataType.FLOAT32}
 
@@ -80,7 +78,6 @@ class Options:
     """How a stage runs, apart from its parallel degrees (hashable: part of the stage cache key)."""
 
     sequence_parallel: bool = False
-    vocab_parallel: bool = False  # LM head split across all pipeline stages (target only)
     recompute: str = "none"  # none | selective | full
     attn_block: Optional[int] = None  # tokens per attention block; None = one tile
     cp_mode: str = "target"  # ring attention: current | target
@@ -110,8 +107,6 @@ class StageCost:
     state_bytes: int  # parameters + gradients + optimizer state
     peak_bytes: int  # peak of the whole one-micro-batch run (incl. backward transients)
     output_bytes: int  # activation sent to the next stage, per device
-    head_forward_ms: float = 0.0  # LM-head shard + loss, vocabulary parallelism only (part of mb_*)
-    head_backward_ms: float = 0.0
 
 
 def run_stage(
@@ -142,7 +137,7 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
     ctx = _context(hw, opts, group_topology, link_share)
     config = distributed_llama_config(
         preset, tp_size=tp, cp_size=cp, sequence_parallel=opts.sequence_parallel,
-        num_stages=pp, stage_index=stage_index, stage_num_blocks=stage_blocks, vocab_parallel=opts.vocab_parallel,
+        num_stages=pp, stage_index=stage_index, stage_num_blocks=stage_blocks,
     )
     stage = MockDistributedLlama(config, runner="mem_eff" if opts.recompute == "full" else "default")
     params = stage.parameters()
@@ -178,7 +173,6 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
     if not stage.is_last:
         roots.append(out)  # the gradient arrives from the next stage
     output_bytes = out.bytes()
-    out_shape = out.shape
 
     for root in roots:
         root.backward(ctx, retain_graph=False)
@@ -190,17 +184,6 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
     state_bytes, _ = ctx.memory_tracker.current_memory()
     peak_bytes, _ = ctx.memory_tracker.peak_memory()
     ctx.disable_memory_tracking()
-
-    head_forward_ms = head_backward_ms = 0.0
-    if opts.vocab_parallel:
-        # The LM-head shard and loss alone, for the schedule's separate vocabulary pass
-        head = _context(hw, opts, group_topology, link_share)
-        head.disable_memory_tracking()
-        hidden = MockTensor(out_shape, dtype=DataType.BFLOAT16, requires_grad=True,
-                            label=TensorLabel.ACTIVATION, name="final_hidden")
-        _loss(head, stage.forward_head(head, hidden), local_seq, tp).backward(head, retain_graph=False)
-        head_forward_ms = head.op_time_ns(("forward",)) / 1e6
-        head_backward_ms = head.op_time_ns(("backward",)) / 1e6
 
     def op_ms(phases):
         return ctx.op_time_ns(phases) / 1e6
@@ -226,8 +209,6 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
         state_bytes=state_bytes,
         peak_bytes=peak_bytes,
         output_bytes=output_bytes,
-        head_forward_ms=head_forward_ms,
-        head_backward_ms=head_backward_ms,
     )
 
 
@@ -250,7 +231,6 @@ def run_parallel_roofline(
     interleave: int = 1,
     mode: str = "target",
     sequence_parallel: bool = False,
-    vocab_parallel: bool = False,
     recompute: str = "none",
     master_dtype: str = "bf16",
     grad_dtype: str = "bf16",
@@ -274,7 +254,6 @@ def run_parallel_roofline(
         interleave: v, model chunks per pipeline device (interleaved schedule only)
         mode: "current" (tt-train today) or "target" (planned kernels and features); see ATTN_BLOCK
         sequence_parallel: Megatron sequence parallelism inside TP
-        vocab_parallel: split the LM head across all pipeline stages (target only)
         recompute: "none", "selective" (norms, activations and attention recomputed in backward;
             matmul outputs held) or "full" (each block's forward, the memory-efficient runner)
         master_dtype, grad_dtype: "bf16" or "fp32": stored weights with m and v; gradient accumulation
@@ -315,9 +294,7 @@ def run_parallel_roofline(
     blocks = list(blocks_per_stage) if blocks_per_stage is not None else even_split(L, pp)
     m = num_microbatches // dp if num_microbatches % dp == 0 else 0
     schedule_error = sched.validate(pp, m, blocks) if pp > 1 and m else ""
-    target_only = [TARGET_ONLY[k] for k, on in (("vocab_parallel", vocab_parallel), ("zero1", zero1),
-                                                 ("selective", recompute == "selective")) if on]
-    vocab_parallel = vocab_parallel and pp > 1
+    target_only = [TARGET_ONLY[k] for k, on in (("zero1", zero1), ("selective", recompute == "selective")) if on]
     checks = [
         (not (mode == "current" and target_only),
          f"{' and '.join(target_only)}: not in tt-train today, only with mode target"),
@@ -343,7 +320,7 @@ def run_parallel_roofline(
     group_topology = placement["topology"] if topology is None else {g: topology for g in ("tp", "cp", "dp")}
     if cut_links is None:
         cut_links = placement["cut_links"]
-    opts = Options(sequence_parallel=sequence_parallel, vocab_parallel=vocab_parallel,
+    opts = Options(sequence_parallel=sequence_parallel,
                    recompute=recompute, cp_mode=mode,
                    attn_block=attn_block if attn_block is not None else ATTN_BLOCK[mode],
                    master_dtype=master_dtype, grad_dtype=grad_dtype, zero1=zero1)
@@ -374,21 +351,10 @@ def run_parallel_roofline(
     hand = (send_recv_roofline(hw, handoff_bytes, cut_links, operation="PipelineHandoff").ideal_network_ns / 1e6
             if pp > 1 else 0.0)
 
-    # Vocabulary parallelism across stages (target): every device runs its LM-head shard as a separate
-    # pass per micro-batch. It receives the final hidden state broadcast from the last stage, takes part
-    # in the cross-entropy all-reduces over the stages (max, sum of exponentials, target logit; one fp32
-    # tile column per 32 rows) and sends its part of the hidden state's gradient back (a reduce): both
-    # cost about one hand-off. The schedule plays out the pass's dependencies (simulate_schedule).
-    vocab_comm = 0.0
-    if opts.vocab_parallel:
-        stats_bytes = seq_len // cp * 32 * 4
-        line = dataclasses.replace(hw, topology="linear")
-        vocab_comm = 2 * hand + 3 * all_reduce_roofline(line, stats_bytes, pp).ideal_network_ns / 1e6
-
     def device_time(c: StageCost) -> Dict[str, float]:
-        flop, dram, fabric = c.mb_flop_ms, c.mb_dram_ms, c.mb_fabric_ms + v * hand + vocab_comm
+        flop, dram, fabric = c.mb_flop_ms, c.mb_dram_ms, c.mb_fabric_ms + v * hand
         return {"flop_ms": flop, "dram_ms": dram, "fabric_ms": fabric,
-                "roofline_ms": c.mb_forward_ms + c.mb_backward_ms + 2 * v * hand + vocab_comm,
+                "roofline_ms": c.mb_forward_ms + c.mb_backward_ms + 2 * v * hand,
                 "upper_bound_ms": max(flop, dram, fabric)}
 
     per_stage = [device_time(c) for c in costs]
@@ -397,26 +363,16 @@ def run_parallel_roofline(
     # Play the schedule out with each device's own forward and backward time per micro-batch.
     # With equal devices this is slots(P, m) x D; uneven stages set the pace with the slowest and
     # fill/drain with the sum.
-    head = [c.head_forward_ms + c.head_backward_ms for c in costs]
-    fwd = [c.mb_forward_ms - c.head_forward_ms + v * hand for c in costs]
-    bwd = [c.mb_backward_ms - c.head_backward_ms + v * hand for c in costs]
-    vocab = [h + vocab_comm for h in head] if opts.vocab_parallel else None
-    bubble, held, pipeline_ms = simulate_schedule(sched, pp, m, fwd, bwd, vocab)
+    fwd = [c.mb_forward_ms + v * hand for c in costs]
+    bwd = [c.mb_backward_ms + v * hand for c in costs]
+    bubble, held, pipeline_ms = simulate_schedule(sched, pp, m, fwd, bwd)
 
     def split(total: float, f: float, b: float):
         r = f / (f + b) if f + b > 0 else 1 / 3
         return total * r, total * (1 - r)
 
-    ub_f, ub_b, ub_v = [], [], []
-    for p, h in zip(per_stage, head):
-        # the vocabulary pass's share of the device's roofline time (its communication is in fabric_ms)
-        share = (h + vocab_comm) / p["roofline_ms"] if opts.vocab_parallel else 0.0
-        c = costs[len(ub_f)]
-        f, b = split(p["upper_bound_ms"] * (1 - share), c.mb_forward_bound_ms, c.mb_backward_bound_ms)
-        ub_f.append(f)
-        ub_b.append(b)
-        ub_v.append(p["upper_bound_ms"] * share)
-    _, _, pipeline_bound_ms = simulate_schedule(sched, pp, m, ub_f, ub_b, ub_v if opts.vocab_parallel else None)
+    ub = [split(p["upper_bound_ms"], c.mb_forward_bound_ms, c.mb_backward_bound_ms) for p, c in zip(per_stage, costs)]
+    _, _, pipeline_bound_ms = simulate_schedule(sched, pp, m, [f for f, _ in ub], [b for _, b in ub])
 
     # Each layer's gradient sync starts as soon as its gradient is final (after the last micro-batch's
     # backward through it) and the syncs queue on the fabric; what is left after the last backward is
@@ -450,7 +406,7 @@ def run_parallel_roofline(
                    "stage_mesh": placement["stage_mesh"], "chips": chips, "dp": dp, "pp": pp, "tp": tp,
                    "cp": cp, "schedule": str(sched), "interleave": v, "mode": mode, "cut_links": cut_links,
                    **dataclasses.asdict(opts), "blocks_per_stage": blocks},
-        "per_microbatch": {**D, "bound": bound, "handoff_ms": hand, "vocab_pass_ms": max(vocab or [0.0])},
+        "per_microbatch": {**D, "bound": bound, "handoff_ms": hand},
         "step_end": {"grad_sync_ms": max(c.sync_ms for c in costs),
                      "grad_sync_exposed_ms": max(exposed_sync(c, blocks[d]) for d, c in enumerate(costs)),
                      "optimizer_ms": max(c.opt_ms for c in costs),
@@ -615,8 +571,6 @@ def main():
     parser.add_argument("--interleave", type=int, default=2,
                         help="Chunks per pipeline device for --schedule interleaved (default: 2)")
     parser.add_argument("--sp", action="store_true", help="Sequence parallelism inside TP")
-    parser.add_argument("--vocab-parallel", action="store_true",
-                        help="Split the LM head across stages (target only)")
     parser.add_argument("--recompute", default="none", choices=RECOMPUTE,
                         help="selective (target only): norms, activations, attention; full: whole blocks "
                              "(default: none)")
@@ -642,7 +596,7 @@ def main():
     args = parser.parse_args()
 
     common = dict(model_name=args.model, seq_len=args.seq, num_microbatches=args.microbatches,
-                  hardware=args.hardware, sequence_parallel=args.sp, vocab_parallel=args.vocab_parallel,
+                  hardware=args.hardware, sequence_parallel=args.sp,
                   master_dtype=args.master_dtype, grad_dtype=args.grad_dtype, zero1=args.zero1, mode=args.mode,
                   cut_links=args.cut_links, attn_block=args.attn_block, num_links=args.links, topology=args.topology)
     if args.sweep:
@@ -669,8 +623,8 @@ def main():
         # The other mode, for comparison, with that mode's own attention block (a given
         # --attn-block applies to the chosen mode only); current drops the target-only features
         other = "current" if args.mode == "target" else "target"
-        overrides = {"attn_block": None, **({"vocab_parallel": False, "zero1": False} if other == "current" else {})}
-        dropped = [TARGET_ONLY[k] for k in ("vocab_parallel", "zero1") if k in overrides and out["config"][k]]
+        overrides = {"attn_block": None, **({"zero1": False} if other == "current" else {})}
+        dropped = [TARGET_ONLY[k] for k in ("zero1",) if k in overrides and out["config"][k]]
         alt = run_parallel_roofline(**{**single, "mode": other, **overrides})
         if "error" in alt:
             print(f"  {other}: {alt['error']}")
@@ -698,8 +652,6 @@ def _print(out: Dict[str, Any], args) -> None:
     print(f"  per micro-batch, slowest stage: {pm['roofline_ms']:.2f} ms (sum of FLOP {pm['flop_ms']:.2f}, "
           f"DRAM {pm['dram_ms']:.2f}, fabric {pm['fabric_ms']:.2f} ms; hand-off {pm['handoff_ms']:.3f} ms) "
           f"-> mostly {pm['bound']}")
-    if cfg["vocab_parallel"]:
-        print(f"  vocabulary pass per micro-batch: {pm['vocab_pass_ms']:.2f} ms (LM-head shard, loss, broadcast, reduce)")
     if len(set(cfg["blocks_per_stage"])) > 1:
         print(f"  blocks per stage: {cfg['blocks_per_stage']}")
     print(f"  bubble {out['bubble']:.2%}")

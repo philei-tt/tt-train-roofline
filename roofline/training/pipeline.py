@@ -23,7 +23,6 @@ device's own forward and backward time it also gives the step length when stages
 
 from __future__ import annotations
 
-import bisect
 from typing import List, Optional, Sequence, Tuple
 
 Op = Tuple[str, int, int]  # ("F" | "B", micro-batch, chunk)
@@ -180,7 +179,6 @@ def simulate_schedule(
     num_microbatches: int,
     forward: Optional[Sequence[float]] = None,
     backward: Optional[Sequence[float]] = None,
-    vocab: Optional[Sequence[float]] = None,
 ) -> Tuple[float, List[float], float]:
     """Play a schedule out op by op on a common clock.
 
@@ -195,13 +193,6 @@ def simulate_schedule(
         forward, backward: per device, the time of one micro-batch's forward / backward through the
             device's whole share of the model (each of its v chunks takes 1/v of it). Default 1 and 2
             on every device; with equal devices the bubble does not depend on these times.
-        vocab: vocabulary parallelism across stages: per device, the time of its LM-head shard's
-            forward + backward for one micro-batch (not part of forward / backward). That pass H(j)
-            needs the last stage's forward of j, and the last stage's backward of j needs H(j) from
-            every device. Each device runs H(j) at a fixed place in its order: before the first of
-            its ops that, in the schedule played out without H, starts after the last stage's
-            forward of j ends. This is what plain schedules pay for the dependency; Yeung et al.
-            (2024) reshape the schedule to hide it.
 
     Returns:
         (bubble = idle fraction of the step over all devices,
@@ -212,33 +203,15 @@ def simulate_schedule(
     f = list(forward) if forward is not None else [1.0] * P
     b = list(backward) if backward is not None else [2.0] * P
     if P <= 1:
-        return 0.0, [1.0], m * (f[0] + b[0] + (vocab[0] if vocab is not None else 0.0))
-    orders = schedule.order(P, m)
-    last = P * v - 1
-    if vocab is not None:
-        starts = _play(orders, P, v, f, b, None, schedule)[2]
-        for d in range(P):
-            begin = [starts[op_key(op, d, P)][0] for op in orders[d]]  # increasing: a device runs in order
-            placed = [(bisect.bisect_left(begin, starts[("F", j, last)][1]), j) for j in range(m)]
-            new = list(orders[d])
-            for pos, j in sorted(placed, reverse=True):
-                new.insert(pos, ("H", j, 0))
-            orders[d] = new
-    free, peak, _ = _play(orders, P, v, f, b, vocab, schedule)
+        return 0.0, [1.0], m * (f[0] + b[0])
+    free, peak = _play(schedule.order(P, m), P, v, f, b, schedule)
     end = max(free)
-    busy = m * sum(f[d] + b[d] + (vocab[d] if vocab is not None else 0.0) for d in range(P))
+    busy = m * sum(f[d] + b[d] for d in range(P))
     return 1.0 - busy / (P * end), peak, end
 
 
-def op_key(op: Tuple[str, int, int], device: int, num_stages: int) -> Tuple[str, int, int]:
-    """(kind, micro-batch, virtual stage) of an entry (kind, micro-batch, chunk) of a device's order."""
-    kind, mb, chunk = op
-    return kind, mb, chunk * num_stages + device
-
-
-def _play(orders, P, v, f, b, vocab, schedule):
-    """Run the orders on a common clock. Returns (free time per device, peak held per device,
-    {op key: (start, end)})."""
+def _play(orders, P, v, f, b, schedule):
+    """Run the orders on a common clock. Returns (free time per device, peak held per device)."""
     last = P * v - 1
     done = {}
     pos = [0] * P
@@ -251,36 +224,21 @@ def _play(orders, P, v, f, b, vocab, schedule):
         for d in range(P):
             order, fd, bd = orders[d], f[d] / v, b[d] / v
             while pos[d] < len(order):
-                kind, mb, stage = op_key(order[pos[d]], d, P)
-                if kind == "H":
-                    dep = ("F", mb, last)
-                    if dep not in done:
-                        break
-                    start = max(free[d], done[dep][1])
-                    end = start + vocab[d]
-                    key = ("H", mb, d)
+                kind, mb, chunk = order[pos[d]]
+                stage = chunk * P + d
+                if kind == "F":
+                    dep = ("F", mb, stage - 1) if stage > 0 else None
                 else:
-                    if kind == "F":
-                        dep = ("F", mb, stage - 1) if stage > 0 else None
-                    else:
-                        dep = ("B", mb, stage + 1) if stage < last else ("F", mb, stage)
-                    if dep is not None and dep not in done:
-                        break
-                    ready = done[dep][1] if dep is not None else 0.0
-                    if kind == "B" and stage == last and vocab is not None:
-                        heads = [("H", mb, e) for e in range(P)]
-                        if any(h not in done for h in heads):
-                            break
-                        ready = max(ready, max(done[h][1] for h in heads))
-                    start = max(free[d], ready)
-                    end = start + (fd if kind == "F" else bd)
-                    key = (kind, mb, stage)
-                    live[d] += (1.0 if kind == "F" else -1.0) / v
-                    peak[d] = max(peak[d], live[d])
-                done[key] = (start, end)
-                free[d] = end
+                    dep = ("B", mb, stage + 1) if stage < last else ("F", mb, stage)
+                if dep is not None and dep not in done:
+                    break
+                start = max(free[d], done[dep] if dep is not None else 0.0)
+                free[d] = start + (fd if kind == "F" else bd)
+                done[(kind, mb, stage)] = free[d]
+                live[d] += (1.0 if kind == "F" else -1.0) / v
+                peak[d] = max(peak[d], live[d])
                 pos[d] += 1
                 progress = True
     if any(pos[d] != len(orders[d]) for d in range(P)):
         raise RuntimeError(f"{schedule} deadlocked")
-    return free, peak, done
+    return free, peak
