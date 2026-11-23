@@ -19,7 +19,6 @@ from typing import Optional, Tuple, TYPE_CHECKING
 
 from ..mock_tensor import MockTensor, memory_efficient_runner
 from ..hardware import DataType
-from ..operations.comm_ops import MockScatterOp
 from .module import MockModule, MockModuleList
 from .embedding import MockEmbedding
 from .rmsnorm import MockRMSNormLayer
@@ -147,13 +146,14 @@ class MockDistributedLlama(MockModule):
         x: MockTensor,
         mask: Optional[MockTensor] = None,
     ) -> MockTensor:
-        """Embedding (first stage) and this stage's blocks: the activation sent to the next stage."""
+        """Embedding (first stage) and this stage's blocks: the activation sent to the next stage.
+
+        With sequence parallelism the first stage receives only its own S / tp token indices: each TP
+        device embeds its own tokens (no communication) and accumulates a partial table gradient,
+        summed over TP once per step with the replica sync."""
         out = x
         if self.tok_emb is not None:
             out = self.tok_emb(ctx, x)
-            if self.config.sequence_parallel and self.config.tp_size > 1:
-                # the embedding output is the same on every TP device: a local slice, not a reduce-scatter
-                out = MockScatterOp.apply(ctx, out, SEQ_DIM, self.config.tp_size, True)
         for block in self.blocks:
             if self.runner == "mem_eff":
                 out = memory_efficient_runner(block, ctx, out, mask)

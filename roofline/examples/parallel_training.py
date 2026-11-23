@@ -169,9 +169,11 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
                        label=TensorLabel.ACTIVATION, name="attention_mask") if opts.explicit_mask else None)
     mem_before, _ = ctx.memory_tracker.current_memory()
 
+    sp_split = opts.sequence_parallel and tp > 1
     if stage.is_first:
-        x = MockTensor((1, 1, 1, local_seq), dtype=DataType.BFLOAT16, requires_grad=False,
-                       label=TensorLabel.ACTIVATION, name="indices")
+        # with SP each TP device embeds only its own S / tp tokens
+        x = MockTensor((1, 1, 1, local_seq // (tp if sp_split else 1)), dtype=DataType.BFLOAT16,
+                       requires_grad=False, label=TensorLabel.ACTIVATION, name="indices")
     else:
         rows = local_seq // (tp if opts.sequence_parallel else 1)
         x = MockTensor((1, 1, rows, config.embedding_dim), dtype=DataType.BFLOAT16, requires_grad=True,
@@ -206,6 +208,9 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
     grad_bytes = sum(p.get_grad().bytes() for n, p in params.items()
                      if n.startswith("blocks.") and p.is_grad_initialized()) // max(stage_blocks, 1)
     first_sync = len(ctx.estimates)
+    if stage.is_first and sp_split:
+        # each TP device saw only its own tokens: sum the replicated table's partial gradients over TP
+        synchronize_replica_gradients(ctx, {"tok_emb.weight": params["tok_emb.weight"]}, [("tp", tp)])
     synchronize_replica_gradients(ctx, params, replica_groups, zero1=opts.zero1)
     # The embedding table's gradient is final only after the embedding backward, the stage's last op
     tail = [e for e in ctx.estimates[first_sync:] if "tok_emb" in e.operation and e.phase == "ccl"]
