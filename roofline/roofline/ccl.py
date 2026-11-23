@@ -42,7 +42,7 @@ def ccl_latency_ns(hw: HardwareSpec, collective: str, num_devices: int) -> float
     if num_devices <= 1:
         return 0.0
     a, b = CCL_LATENCY_US[hw.arch][collective][hw.topology]
-    hops = num_devices / 2 if hw.topology == "ring" else num_devices - 1
+    hops = (num_devices / 2 if hw.topology == "ring" else num_devices - 1) * hw.hops_per_step
     return (a + b * hops) * 1e3
 
 

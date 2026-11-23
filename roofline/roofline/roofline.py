@@ -230,14 +230,16 @@ class RooflineContext:
     def hw_for(self, group: str) -> HardwareSpec:
         """Hardware spec for the collectives of a parallel group: its own ring or line topology, and
         its share of each link when several groups of the same kind cross the same links (DP groups
-        whose members are whole pipelines apart)."""
+        whose members are whole pipelines apart); those members are as many physical hops apart as
+        groups share a link, which scales the per-call latency."""
         key = (self.group_topology.get(group, self.hw.topology), self.group_link_share.get(group, 1))
         if key not in self._group_hw:
             import dataclasses
 
             topology, share = key
             self._group_hw[key] = (self.hw if topology == self.hw.topology and share == 1 else dataclasses.replace(
-                self.hw, topology=topology, eth_bw_gb_s_per_link=self.hw.eth_bw_gb_s_per_link / share))
+                self.hw, topology=topology, eth_bw_gb_s_per_link=self.hw.eth_bw_gb_s_per_link / share,
+                hops_per_step=share))
         return self._group_hw[key]
 
     def new_fusion(self, label: str) -> str:

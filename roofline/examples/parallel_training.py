@@ -484,7 +484,9 @@ def place_stages(hw, pp: int, tp: int, cp: int, dp: int = 1, interleaved: bool =
     (tt-train's get_topology), else a line.
 
     DP groups: every chip position of a pipeline forms one, and all of them run their all-reduce
-    along the same column links at once, so each gets 1 / (pp * rows per stage) of a link.
+    along the same column links at once, so each gets 1 / (pp * rows per stage) of a link; neighbouring
+    members are that many hops apart. When the copies fill the wrapped axis the group is a ring, even
+    with two copies (half of each transfer goes each way round), else a line.
 
     Returns {"topology": {"tp", "cp", "dp"}, "link_share": {"dp": ...}, "cut_links", "stage_mesh"}
     or {"error": str}.
@@ -530,7 +532,9 @@ def place_stages(hw, pp: int, tp: int, cp: int, dp: int = 1, interleaved: bool =
     return {"tp_on_rows": tp > 1 and cp > 1 and tp_axis is row_axis,
             "topology": {"tp": topo(tp, *tp_axis[1:]) if tp > 1 else "linear",
                          "cp": topo(cp, *cp_axis[1:]) if cp > 1 else "linear",
-                         "dp": topo(dp, dp * pp * rows == R, wrap_r) if dp > 1 else "linear"},
+                         # copies filling the wrapped axis form a ring, even two of them: the halves of
+                         # each transfer go both ways round (opposite arcs)
+                         "dp": "ring" if dp > 1 and dp * pp * rows == R and wrap_r else "linear"},
             "link_share": {"dp": pp * rows} if dp > 1 else {},
             "cut_links": pairs * hw.num_links, "stage_mesh": block}
 
