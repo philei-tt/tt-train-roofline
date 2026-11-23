@@ -129,6 +129,7 @@ def run_stage(
 def _context(hw, opts: Options, group_topology, link_share) -> RooflineContext:
     return RooflineContext(hw, attn_block=opts.attn_block, cp_mode=opts.cp_mode,
                            selective_recompute=opts.recompute == "selective",
+                           lean_captures=opts.cp_mode == "target",
                            group_topology=dict(group_topology), group_link_share=dict(link_share))
 
 
@@ -176,6 +177,7 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
 
     for root in roots:
         root.backward(ctx, retain_graph=False)
+    del root
     synchronize_replica_gradients(ctx, params, replica_groups, zero1=opts.zero1)
     optimizer.step(ctx)
     mock_clip_grad_norm(ctx, params, max_norm=1.0, num_shards=optimizer.num_shards)

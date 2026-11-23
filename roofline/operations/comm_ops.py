@@ -40,6 +40,8 @@ class MockAllReduceOp(RooflineFunction):
     Mirrors ttml::ops::distributed::all_reduce.
     """
 
+    reads_saved_in_backward = False  # only shapes
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -101,6 +103,8 @@ class MockReduceScatterOp(RooflineFunction):
 
     Mirrors ttml::ops::distributed::reduce_scatter.
     """
+
+    reads_saved_in_backward = False  # only shapes
 
     @staticmethod
     def forward(
@@ -177,6 +181,8 @@ class MockAllGatherOp(RooflineFunction):
     Mirrors ttml::ops::distributed::all_gather.
     """
 
+    reads_saved_in_backward = False  # only shapes
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -250,6 +256,8 @@ class MockBroadcastOp(RooflineFunction):
     Mirrors ttml::ops::distributed::broadcast.
     """
 
+    reads_saved_in_backward = False  # only shapes
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -305,6 +313,8 @@ class MockScatterOp(RooflineFunction):
     Mirrors ttml::ops::distributed::scatter.
     """
 
+    reads_saved_in_backward = False  # only shapes
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -312,12 +322,18 @@ class MockScatterOp(RooflineFunction):
         tensor: MockTensor,
         dim: int,
         num_devices: int = 1,
+        local: bool = False,
     ) -> MockTensor:
         ctx.save_for_backward(tensor)
         ctx._dim = dim
         ctx._num_devices = num_devices
 
-        if num_devices > 1:
+        if num_devices > 1 and local:
+            # The input is the same on every device: each keeps its slice (read and write it)
+            roofline_ctx.add_perf_result(elementwise_roofline(
+                roofline_ctx.hw, tensor.logical_volume() // num_devices, num_inputs=1, sfpu_ops_per_element=0.0,
+                dtype=tensor.dtype, operation="Scatter.forward(LocalSlice)", phase="forward"))
+        elif num_devices > 1:
             assert tensor.shape[dim] % num_devices == 0, (
                 f"Scatter: shape[{dim}]={tensor.shape[dim]} not divisible by {num_devices}"
             )

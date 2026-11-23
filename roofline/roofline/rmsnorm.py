@@ -84,8 +84,10 @@ def rmsnorm_roofline(
         # Backward pass:
         # Read grad_output, input (or cached normalized), weight
         # Write grad_input, grad_weight
+        # tt-train rmsnorm_bw: reads grad_output and input, writes grad_input and the per-row dgamma
+        # components (input-shaped); sum_over_leading_dims then reads the components again
         total_bytes = int(
-            3 * num_elements * bytes_per_elem  # grad_output + input + grad_input
+            5 * num_elements * bytes_per_elem
             + 2 * embedding_dim * bytes_per_elem  # weight + grad_weight
         )
 

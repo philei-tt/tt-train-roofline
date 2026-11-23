@@ -179,8 +179,10 @@ class MockTensor:
         In a real implementation this would add gradients together.
         For roofline estimation, we just track the latest gradient, in the accumulator's dtype.
         """
-        if self._grad is not None and self._grad.dtype != grad.dtype:
-            # the sum keeps the accumulator's dtype (fp32 gradient accumulation)
+        if self._grad is not None:
+            # tt-train's Tensor::add_grad is out of place (m_grad = ttnn::add(m_grad, grad)): the
+            # old accumulator, the incoming gradient and the sum are live together; the sum keeps
+            # the accumulator's dtype (fp32 gradient accumulation)
             grad = MockTensor(grad.shape, self._grad.dtype, grad.layout, requires_grad=False,
                               label=TensorLabel.GRADIENT, name=self._grad.name, num_shards=grad.num_shards)
         self._grad = grad

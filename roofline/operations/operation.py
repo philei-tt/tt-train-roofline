@@ -170,6 +170,10 @@ class RooflineFunction:
     # instead of holding its outputs: cheap ops and attention, not matmuls
     recompute: bool = False
 
+    # False when backward reads only the shapes of what forward saved; with
+    # RooflineContext.lean_captures (target mode) those tensors are then not held until backward
+    reads_saved_in_backward: bool = True
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -237,6 +241,13 @@ class RooflineFunction:
             outputs_tuple = (outputs,)
         else:
             outputs_tuple = outputs
+
+        if roofline_ctx.lean_captures and not cls.reads_saved_in_backward:
+            ctx._saved_tensors = [
+                MockTensor(t.shape, t.dtype, t.layout, requires_grad=False, label=t.label, name=t.name,
+                           num_shards=t.num_shards, track=False) if isinstance(t, MockTensor) else t
+                for t in ctx._saved_tensors
+            ]
 
         # Selective recompute: the op's outputs and the tensors it saved are not held until
         # backward; its forward runs again at the start of its backward

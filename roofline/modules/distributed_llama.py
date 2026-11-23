@@ -152,7 +152,8 @@ class MockDistributedLlama(MockModule):
         if self.tok_emb is not None:
             out = self.tok_emb(ctx, x)
             if self.config.sequence_parallel and self.config.tp_size > 1:
-                out = MockScatterOp.apply(ctx, out, SEQ_DIM, self.config.tp_size)
+                # the embedding output is the same on every TP device: a local slice, not a reduce-scatter
+                out = MockScatterOp.apply(ctx, out, SEQ_DIM, self.config.tp_size, True)
         for block in self.blocks:
             if self.runner == "mem_eff":
                 out = memory_efficient_runner(block, ctx, out, mask)

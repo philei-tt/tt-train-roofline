@@ -180,6 +180,10 @@ class RooflineContext:
     # their outputs until backward; their forward runs again in backward (operation.py, apply)
     selective_recompute: bool = False
 
+    # Target mode: ops whose backward reads only shapes (residual add, collectives) do not hold their
+    # inputs until backward. Today's tt-train closures capture them, so current mode holds them.
+    lean_captures: bool = False
+
     # Ring or line for the collectives of each parallel group ("tp", "cp"), set from where the
     # group sits on the mesh; groups not listed use hw.topology. See hw_for().
     group_topology: Dict[str, str] = field(default_factory=dict)

@@ -27,10 +27,12 @@ CCL_LATENCY_US = {
     "wormhole": {
         "all_gather": {"linear": (4.5, 1.9), "ring": (4.5, 2.5)},
         "reduce_scatter": {"linear": (3.2, 4.0), "ring": (3.2, 3.1)},
+        "all_reduce": {"linear": (9.1, 5.8), "ring": (9.1, 5.3)},
     },
     "blackhole": {
         "all_gather": {"linear": (3.7, 1.3), "ring": (3.7, 1.6)},
         "reduce_scatter": {"linear": (1.3, 3.0), "ring": (1.3, 2.1)},
+        "all_reduce": {"linear": (4.4, 4.4), "ring": (4.4, 3.9)},
     },
 }
 
@@ -39,8 +41,6 @@ def ccl_latency_ns(hw: HardwareSpec, collective: str, num_devices: int) -> float
     """Fixed per-call latency of one collective on num_devices devices (0 for one device)."""
     if num_devices <= 1:
         return 0.0
-    if collective == "all_reduce":
-        return ccl_latency_ns(hw, "reduce_scatter", num_devices) + ccl_latency_ns(hw, "all_gather", num_devices)
     a, b = CCL_LATENCY_US[hw.arch][collective][hw.topology]
     hops = num_devices / 2 if hw.topology == "ring" else num_devices - 1
     return (a + b * hops) * 1e3

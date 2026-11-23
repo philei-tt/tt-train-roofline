@@ -337,8 +337,11 @@ def grouped_heads_creation_roofline(
     kv_elements = batch_size * seq_len * 2 * num_groups * head_dim
     num_elements = q_elements + kv_elements
 
-    # Pure memory movement: read input, write output
+    # Pure memory movement: read input, write output; the backward also concatenates the K and V
+    # gradients (ttnn::concat, multi_head_utils.cpp): one more pass over them
     total_bytes = int(2 * num_elements * bytes_per_elem)
+    if phase == "backward":
+        total_bytes += int(2 * kv_elements * bytes_per_elem)
     total_flops = 0  # No compute, just reshape/transpose
 
     ideal_compute_ns = 0
@@ -385,11 +388,16 @@ def fused_attention_roofline(
     - Backward: Uses recomputation instead of reading saved attention weights
 
     Causal attention; tiles above the diagonal are skipped, so the visited volume per head is
-    M = S * (S + tile) / 2 (diagonal tiles are computed in full). With a block of Bt tokens kept on
-    chip, the opposite operands are re-read once per block: about S / Bt times, causal-halved.
+    M = S * (S + tile) / 2 (diagonal tiles are computed in full; the forward rounds the diagonal up
+    to its 4-tile K/V chunk, S * (S + 4 tile) / 2). With a block of Bt tokens kept on chip, the
+    opposite operands are re-read once per block: about S / Bt times, causal-halved.
+
+    SFPU work is counted in instructions per element (32 lanes per instruction, so 32 per core per
+    cycle): exp is 15 on Blackhole (non-approximate, as tt-train runs it), the backward softmax
+    recompute and gradient 26 per score and kernel; it runs after the matmuls (summed cycles).
 
     Forward (one kernel, Q-block outer, per Q head):
-        - FLOPs: QK^T and PV, 4 * B * Hq * M * d, plus softmax on the SFPU
+        - FLOPs: QK^T and PV, 4 * B * Hq * M * d, plus exp per score and a rescale per row and chunk
         - DRAM: Q read once; K and V re-read per Q block per Q head; O written; the log-sum-exp
           statistic written as one fp32 32-wide tile per 32 rows
     Backward (two kernels, run one after the other):
@@ -435,28 +443,41 @@ def fused_attention_roofline(
     d = head_dim
     bpe = dtype.value
     Bt = block if block else tile_height
-    flops_per_exp = 5
+    # SFPU work is counted in instructions per element: one instruction handles 32 lanes, so
+    # sfpu_flops_per_core_per_cycle (32) turns it into cycles. Blackhole, tt-train's kernels with
+    # math_approx_mode=false: exp is 15 instructions per 32 elements (_sfpu_exp_21f_bf16_tti_,
+    # ckernel_sfpu_exp.h BODY_LEN); the backward per score and kernel is sub (4) + exp (15) +
+    # mul (4) + mul (3) = 26 (sdpa_bw_compute_utils.hpp)
+    exp_instr, bw_instr_per_kernel = 15, 26
+    chunk = 4 * tile_height  # sdpa_fw walks K/V in chunks of Sk_chunk_t = 4 tiles
     if causal:
-        M = S * (S + tile_height) / 2  # causal volume visited per head, tile granularity
+        M = S * (S + tile_height) / 2  # causal volume visited per head, tile granularity (backward)
+        # forward: the diagonal is rounded up to a whole K/V chunk
+        M_fw = S * (S + chunk) / 2
         # Opposite operand re-read once per block: sum over blocks i of (i + 1) * Bt rows
         rows_reread = (S / Bt) * (S + Bt) / 2
+        rows_reread_fw = (S / Bt) * (S + chunk) / 2
+        chunks_per_row = (S / chunk + 1) / 2
     else:
-        M = S * S
-        rows_reread = (S / Bt) * S
+        M = M_fw = S * S
+        rows_reread = rows_reread_fw = (S / Bt) * S
+        chunks_per_row = S / chunk
     stat_bytes_per_row = 32 * 4  # one fp32 tile (32 wide) per 32 rows
     row = d * bpe  # bytes of one row of Q, K, V, O, dO, dQ
 
     if phase == "forward":
-        matmul_flops = 4 * B * Hq * M * d
-        sfpu_flops = (flops_per_exp + 5) * B * Hq * M + (flops_per_exp + d + 2) * B * Hq * S * (S / Bt)
+        matmul_flops = 4 * B * Hq * M_fw * d
+        # exp per score (max and subtract run on the FPU); per row and K/V chunk the running max,
+        # sum and output rescale
+        sfpu_flops = exp_instr * B * Hq * M_fw + (exp_instr + d + 2) * B * Hq * S * chunks_per_row
 
-        reads = B * Hq * S * row + 2 * B * Hq * rows_reread * row  # Q once; K and V per Q block
+        reads = B * Hq * S * row + 2 * B * Hq * rows_reread_fw * row  # Q once; K and V per Q block
         writes = B * Hq * S * row + B * Hq * S * stat_bytes_per_row  # O, log-sum-exp
         total_bytes = int(reads + writes)
 
     else:  # backward
         matmul_flops = 14 * B * Hq * M * d
-        sfpu_flops = 2 * B * Hq * (M * (flops_per_exp + 4) + S * (2 * d - 1))  # softmax recomputed in both kernels
+        sfpu_flops = 2 * B * Hq * (M * bw_instr_per_kernel + S * (2 * d - 1))  # softmax recomputed in both kernels
 
         # Q kernel
         q_reads = 3 * B * Hq * S * row + B * Hq * S * stat_bytes_per_row + 2 * B * Hq * rows_reread * row
@@ -538,7 +559,9 @@ def heads_fusion_roofline(
     num_elements = batch_size * num_heads * seq_len * head_dim
 
     # Pure memory movement: read input, write output
-    total_bytes = int(2 * num_elements * bytes_per_elem)
+    # backward (tt-train heads_fusion, multi_head_utils.cpp): two transposes, each a full pass
+    passes = 2 if phase == "backward" else 1
+    total_bytes = int(2 * passes * num_elements * bytes_per_elem)
     total_flops = 0  # No compute, just reshape/transpose
 
     ideal_compute_ns = 0

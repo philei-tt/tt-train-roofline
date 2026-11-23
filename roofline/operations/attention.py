@@ -510,20 +510,15 @@ class MockScaledDotProductAttentionFusedOp(RooflineFunction):
         seq_len = query.shape[2]
         head_dim = query.shape[3]
 
-        #   - max values per attention row: [B, H, S]
-        #   - sum(exp-max) per row: [B, H, S]
+        # tt-train sdpa_fw returns its intermediates (log-sum-exp) as [B, H, S, 32] fp32: one tile
+        # column per 32 rows, saved for backward
         max_values = create_activation_tensor(
-            (batch_size, num_q_heads, seq_len),
-            query.dtype,
+            (batch_size, num_q_heads, seq_len, 32),
+            DataType.FLOAT32,
             query.layout,
-            name="attention_max_values",
+            name="attention_intermediates",
         )
-        sum_values = create_activation_tensor(
-            (batch_size, num_q_heads, seq_len),
-            query.dtype,
-            query.layout,
-            name="attention_sum_values",
-        )
+        sum_values = None
 
         # Save for backward: inputs + intermediate values
         # Backward will recompute attention on-the-fly using these saved values
@@ -787,10 +782,16 @@ class MockRingAttentionOp(RooflineFunction):
         Returns:
             Attention output for the local queries [B, H, S/cp_size, d]
         """
+        # log-sum-exp as [B, H, S, 1] fp32 in tile layout (one 32-wide tile column per 32 rows);
+        # today's code also keeps K and V as they stand after the cp - 1 shifts
         stats = create_activation_tensor(
-            query.shape[:3], query.dtype, query.layout, name="ring_attention_lse",
+            (*query.shape[:3], 32), DataType.FLOAT32, query.layout, name="ring_attention_lse",
         )
-        ctx.save_for_backward(query, key, value, stats)
+        extra = ()
+        if roofline_ctx.cp_mode == "current" and cp_size > 1:
+            extra = tuple(create_activation_tensor(t.shape, t.dtype, t.layout, name=f"ring_attention_{n}_current")
+                          for n, t in (("k", key), ("v", value)))
+        ctx.save_for_backward(query, key, value, stats, *extra)
         ctx._cp_size = cp_size
         _ring_attention_estimates(
             roofline_ctx, query, key, cp_size, "forward",
@@ -806,7 +807,7 @@ class MockRingAttentionOp(RooflineFunction):
         grad_output: MockTensor,
     ) -> Tuple[MockTensor, MockTensor, MockTensor, None]:
         """Backward pass: dQ, dK, dV with the K/V shards and dK, dV accumulators on the ring."""
-        query, key, value, stats = ctx.saved_tensors
+        query, key, value, stats = ctx.saved_tensors[:4]
         _ring_attention_estimates(
             roofline_ctx, query, key, ctx._cp_size, "backward",
             accumulator_elements=query.logical_volume() + key.logical_volume() + value.logical_volume(),

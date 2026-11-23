@@ -100,7 +100,8 @@ class MockAdamW:
             master = self._state_dtype[name] != param.dtype
             grad = param.get_grad()
             grad_bytes = (grad.dtype if grad is not None else param.dtype).value
-            per_element = grad_bytes + 6 * state + (param.dtype.value if master else 0)
+            # fp32 master: the bf16 copy is refreshed by a typecast on its next use (read 4, write 2)
+            per_element = grad_bytes + 6 * state + (state + param.dtype.value if master else 0)
 
             estimate = elementwise_roofline(
                 ctx.hw,

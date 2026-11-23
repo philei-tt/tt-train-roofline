@@ -56,13 +56,19 @@ def embedding_roofline(
         # Forward (tt-train embedding_op): untilize the whole [V, E] table (read + write it), then
         # gather batch_seq rows from the untilized copy
         table_bytes = vocab_size * embedding_dim * bytes_per_elem
-        total_bytes = int(2 * table_bytes + batch_seq * embedding_dim * bytes_per_elem)
+        rows = batch_seq * embedding_dim * bytes_per_elem
+        total_bytes = int(2 * table_bytes + 2 * rows)  # untilize; gather reads and writes the rows
         total_flops = 0  # Pure gather, no compute
     else:
-        # Backward (ttnn::embedding_bw): a dense [V, E] gradient is written, and batch_seq rows of
-        # grad_output are read and scattered into it
+        # Backward (ttnn::embedding_bw, reader_embedding_backward.cpp): the dense [V, E] gradient is
+        # zero-filled; then for each 32-token group, every 32-row vocabulary chunk its tokens hit
+        # (up to 32 distinct ones) is read, accumulated and written back in full E width; grad_output
+        # is read once. Repeated tokens within a group hit fewer chunks (this counts them distinct).
         table_bytes = vocab_size * embedding_dim * bytes_per_elem
-        total_bytes = int(table_bytes + 2 * batch_seq * embedding_dim * bytes_per_elem)
+        groups = -(-batch_seq // 32)
+        chunks = min(32, -(-vocab_size // 32))
+        rmw = groups * chunks * 2 * 32 * embedding_dim * bytes_per_elem
+        total_bytes = int(table_bytes + rmw + batch_seq * embedding_dim * bytes_per_elem)
         total_flops = batch_seq * embedding_dim  # Addition for accumulation
 
     # Compute time (minimal for forward, some for backward accumulation)
