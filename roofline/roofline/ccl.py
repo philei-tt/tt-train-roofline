@@ -308,6 +308,10 @@ def send_recv_roofline(
     two neighbouring stages, using every link across the cut. Activations and gradients use
     opposite directions of the full-duplex links and do not share bandwidth.
 
-    Formula: time = tensor_bytes / (num_links * link bandwidth)
+    Formula: time = tensor_bytes / (num_links * link bandwidth) + per-call latency of a two-device
+    transfer
     """
-    return _link_estimate(hw, operation, phase, tensor_bytes, num_links, 1)
+    import dataclasses
+
+    est = _link_estimate(hw, operation, phase, tensor_bytes, num_links, 1)
+    return dataclasses.replace(est, ideal_network_ns=est.ideal_network_ns + ccl_latency_ns(hw, "all_gather", 2))

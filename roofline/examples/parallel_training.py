@@ -205,7 +205,7 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
     first_sync = len(ctx.estimates)
     synchronize_replica_gradients(ctx, params, replica_groups, zero1=opts.zero1)
     # The embedding table's gradient is final only after the embedding backward, the stage's last op
-    tail = [e for e in ctx.estimates[first_sync:] if "tok_emb" in e.operation]
+    tail = [e for e in ctx.estimates[first_sync:] if "tok_emb" in e.operation and e.phase == "ccl"]
     tail_sync_ms = sum(max(e.ideal_compute_ns, e.ideal_memory_ns, e.ideal_network_ns) for e in tail) / 1e6
     tail_dram_ms = sum(e.ideal_memory_ns for e in tail) / 1e6
     optimizer.step(ctx)
@@ -484,6 +484,7 @@ def run_parallel_roofline(
                    "cp": cp, "schedule": str(sched), "interleave": v, "mode": mode, "cut_links": cut_links,
                    **dataclasses.asdict(opts), "blocks_per_stage": blocks},
         "per_microbatch": {**D, "bound": bound, "handoff_ms": hand},
+        "pipeline_ms": pipeline_ms,
         "step_end": {"grad_sync_ms": max(c.sync_ms for c in costs),
                      "grad_sync_exposed_ms": max(exposed_sync(c, blocks[d], overlap) for d, c in enumerate(costs)),
                      "optimizer_ms": max(c.opt_ms for c in costs),
