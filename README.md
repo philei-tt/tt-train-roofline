@@ -201,9 +201,20 @@ python3 -m roofline.examples.matmuls
 |---|---|---|
 | attention block (`--attn-block`) | one 32-token tile | 512 tokens |
 | ring attention (CP) | contiguous split: the last device runs half a block then cp - 1 full ones; each step resets and slices the statistics, merges with 12 fp32 ops on them, a cast and 3 fp32 passes over the output; backward zeroes, casts and adds three step buffers; shifts are socket transfers on one link in one direction, in two phases (`ttnn_fixed::distributed::ring_shift`); every ttnn call is its own op | load-balanced split, merge fused into the kernel, shifts in both ring directions overlapped with attention (one op) |
-| ZeRO-1, selective recompute | not available (error; tt-train's runners are default and memory-efficient) | allowed |
+| pipeline schedule | `naive` only: one micro-batch at a time through the stages (tt-train's pipeline trainer) | any |
+| layouts | as tt-train's ParallelismContext: a stage mesh holds TP and CP, CP on the rows and TP on the columns; CP even (`ring_shift`); no DP across pipelines | any placeable |
+| stage hand-off | one socket per chip pair across the cut, one link (`socket_manager`) | every link across the cut |
+| gradient sync | after the last backward | each layer's sync starts once its last backward is done |
+| sequence parallelism, fp32 gradient accumulation, ZeRO-1, selective recompute | not available (error) | allowed |
 
-Host synchronizations in today's ring attention and ring shift are not modelled (a roofline has no host).
+A group may fold over a stage of several rows as a line, as tt-train's mesh graph descriptors do (its shipped Llama-70B pipeline is PP16 x TP8, each stage a 4 x 2 block declared as a [1, 8] mesh). Host synchronizations in today's ring attention and ring shift are not modelled (a roofline has no host).
+
+tt-train's shipped run as a reference point (llama70b.yaml: memory-efficient runner, 2048 tokens; training_shakespeare_llama70b_pp16_fabric_galaxy.yaml):
+
+```bash
+python3 -m roofline.examples.parallel_training --model llama-70b -s 2048 -m 64 \
+    --pp 16 --tp 8 --recompute full --schedule naive --mode current
+```
 
 ```bash
 # One configuration: Llama 70B, 8K sequences, 2048 sequences per step, on a quad galaxy (128 chips)
@@ -214,8 +225,9 @@ python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048
 python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \
     --dp 2 --pp 8 --tp 4 --cp 2 --sp --recompute full --zero1 --master-dtype fp32
 
-# Every DP x PP x TP x CP split of 128 chips (each schedule and recompute level), best ones that fit
-python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 --sweep 128 --sp --mode current
+# Every DP x PP x TP x CP split of 128 chips (each schedule and recompute level), best ones that fit;
+# --mode current sweeps what tt-train can run today (naive schedule, no SP)
+python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 --sweep 128 --sp
 
 # Uneven layer split (as tt-train's PipelineParallelConfig.blocks_per_rank): fewer blocks on the LM-head stage
 python3 -m roofline.examples.parallel_training --model llama-70b -s 8192 -m 2048 \

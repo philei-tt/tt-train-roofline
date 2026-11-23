@@ -68,7 +68,8 @@ GATHER_PHASES = ("param_gather",)  # ZeRO-1: all-gather of the updated parameter
 
 # What --mode sets (see the module docstring); features only the target mode allows
 ATTN_BLOCK = {"current": None, "target": 512}  # per mode; the mode is also the ring-attention model
-TARGET_ONLY = {"zero1": "ZeRO-1", "selective": "selective recompute"}  # tt-train runners today: default, memory-efficient
+TARGET_ONLY = {"zero1": "ZeRO-1", "selective": "selective recompute", "sequence_parallel": "sequence parallelism",
+               "grad_fp32": "fp32 gradient accumulation"}  # tt-train runners today: default, memory-efficient
 RECOMPUTE = ("none", "selective", "full")
 DTYPES = {"bf16": DataType.BFLOAT16, "fp32": DataType.FLOAT32}
 
@@ -296,10 +297,19 @@ def run_parallel_roofline(
     blocks = list(blocks_per_stage) if blocks_per_stage is not None else even_split(L, pp)
     m = num_microbatches // dp if num_microbatches % dp == 0 else 0
     schedule_error = sched.validate(pp, m, blocks) if pp > 1 and m else ""
-    target_only = [TARGET_ONLY[k] for k, on in (("zero1", zero1), ("selective", recompute == "selective")) if on]
+    target_only = [TARGET_ONLY[k] for k, on in (("zero1", zero1), ("selective", recompute == "selective"),
+                                                 ("sequence_parallel", sequence_parallel),
+                                                 ("grad_fp32", grad_dtype == "fp32")) if on]
+    current = mode == "current"
     checks = [
-        (not (mode == "current" and target_only),
+        (not (current and target_only),
          f"{' and '.join(target_only)}: not in tt-train today, only with mode target"),
+        # tt-train today: the pipeline runs one micro-batch at a time; DP exists only inside a mesh;
+        # ring_shift needs an even ring (ttnn_fixed/distributed/ttnn_ops.cpp)
+        (not (current and pp > 1 and schedule != "naive"),
+         "tt-train's pipeline runs one micro-batch at a time today: mode current needs --schedule naive"),
+        (not (current and pp > 1 and dp > 1), "tt-train has no data parallelism across pipelines today"),
+        (not (current and cp > 1 and cp % 2), f"tt-train's ring attention needs an even CP ring, got CP{cp}"),
         (recompute in RECOMPUTE, f"recompute must be one of {', '.join(RECOMPUTE)}"),
         (master_dtype in DTYPES and grad_dtype in DTYPES, f"dtypes must be one of {', '.join(DTYPES)}"),
         (chips <= hw.chips_per_galaxy, f"dp*pp*tp*cp = {chips} > {hw.chips_per_galaxy} chips of {hw.name}"),
@@ -319,9 +329,12 @@ def run_parallel_roofline(
     placement = place_stages(hw, pp, tp, cp, dp, interleaved=sched.interleave > 1)
     if "error" in placement:
         return placement
+    if current and placement.get("tp_on_rows"):
+        return {"error": "tt-train puts CP on the first mesh axis (rows) and TP on the second"}
     group_topology = placement["topology"] if topology is None else {g: topology for g in ("tp", "cp", "dp")}
     if cut_links is None:
-        cut_links = placement["cut_links"]
+        # today's hand-off: one socket per chip pair across the cut, on one link (socket_manager.cpp)
+        cut_links = placement["cut_links"] // (hw.num_links if current else 1)
     opts = Options(sequence_parallel=sequence_parallel,
                    recompute=recompute, cp_mode=mode,
                    attn_block=attn_block if attn_block is not None else ATTN_BLOCK[mode],
@@ -380,7 +393,8 @@ def run_parallel_roofline(
     # backward through it) and the syncs queue on the fabric; what is left after the last backward is
     # exposed, then the optimizer and (ZeRO-1) the parameter all-gather; the step waits for the slowest
     # stage
-    step_roofline = pipeline_ms + max(exposed_sync(c, blocks[d]) + c.opt_ms + c.gather_ms
+    overlap = not current  # tt-train syncs after the last backward today
+    step_roofline = pipeline_ms + max(exposed_sync(c, blocks[d], overlap) + c.opt_ms + c.gather_ms
                                       for d, c in enumerate(costs))
     link_total = max(m * p["fabric_ms"] + c.sync_fabric_ms for p, c in zip(per_stage, costs))
     step_bound = max(pipeline_bound_ms + max(max(c.opt_flop_ms, c.opt_dram_ms) for c in costs), link_total)
@@ -410,7 +424,7 @@ def run_parallel_roofline(
                    **dataclasses.asdict(opts), "blocks_per_stage": blocks},
         "per_microbatch": {**D, "bound": bound, "handoff_ms": hand},
         "step_end": {"grad_sync_ms": max(c.sync_ms for c in costs),
-                     "grad_sync_exposed_ms": max(exposed_sync(c, blocks[d]) for d, c in enumerate(costs)),
+                     "grad_sync_exposed_ms": max(exposed_sync(c, blocks[d], overlap) for d, c in enumerate(costs)),
                      "optimizer_ms": max(c.opt_ms for c in costs),
                      "param_gather_ms": max(c.gather_ms for c in costs)},
         "bubble": bubble,
@@ -425,15 +439,15 @@ def run_parallel_roofline(
     }
 
 
-def exposed_sync(c: StageCost, num_blocks: int) -> float:
+def exposed_sync(c: StageCost, num_blocks: int, overlap: bool = True) -> float:
     """Gradient sync left after the stage's last backward, with each of its k layers' syncs started as
     soon as that layer's last backward ends and the syncs run one after another: with b the last
     micro-batch's backward, t = b / k per layer, S the sync and s = S / k per layer, layer i's sync
     ends at F_i = max(F_(i-1), i t) + s, so the exposed part is F_k - b = max(s, S - b + t). Only the
     last layer's sync is exposed when s <= t; a link-bound sync (s > t) stays mostly exposed."""
     S = c.sync_ms
-    if S <= 0:
-        return 0.0
+    if S <= 0 or not overlap:
+        return S
     k = max(num_blocks, 1)
     b = c.mb_backward_ms
     return max(S / k, S - b + b / k)
@@ -505,15 +519,16 @@ def place_stages(hw, pp: int, tp: int, cp: int, dp: int = 1, interleaved: bool =
             return {"error": f"TP{tp} x CP{cp} is not one mesh axis each on a {rows} x {cols} stage "
                              "(tt-train collectives run over whole mesh axes)"}
     elif max(tp, cp) > 1:
-        if rows != 1:
-            return {"error": f"TP{tp} x CP{cp} on a {rows} x {cols} stage: one group cannot cover two mesh axes"}
-        tp_axis = cp_axis = col_axis
+        # one group over the whole block; on more than one row it is a line folded over the block
+        # (tt-train's mesh graph descriptor declares e.g. a 4 x 2 block as a [1, 8] mesh)
+        tp_axis = cp_axis = col_axis if rows == 1 else (rows * cols, False, False)
     else:
         tp_axis = cp_axis = col_axis
     if interleaved and not (wrap_r and pp * rows == R):
         return {"error": "interleaved needs the last stage to neighbour the first (one pipeline filling a wrapped axis)"}
     pairs = cols if rows >= 1 and cols == C else 1  # chip pairs across the cut between two stages
-    return {"topology": {"tp": topo(tp, *tp_axis[1:]) if tp > 1 else "linear",
+    return {"tp_on_rows": tp > 1 and cp > 1 and tp_axis is row_axis,
+            "topology": {"tp": topo(tp, *tp_axis[1:]) if tp > 1 else "linear",
                          "cp": topo(cp, *cp_axis[1:]) if cp > 1 else "linear",
                          "dp": topo(dp, dp * pp * rows == R, wrap_r) if dp > 1 else "linear"},
             "link_share": {"dp": pp * rows} if dp > 1 else {},
@@ -538,8 +553,10 @@ def sweep(chips: int, schedules=SWEEP_SCHEDULES, **kwargs) -> List[Dict[str, Any
         if chips % (tp * cp * dp):
             continue
         pp = chips // (tp * cp * dp)
-        for (schedule, v), recompute in itertools.product(schedules, RECOMPUTE):
-            if pp == 1 and schedule != "1f1b":
+        current = kwargs.get("mode") == "current"
+        levels = ("none", "full") if current else RECOMPUTE
+        for (schedule, v), recompute in itertools.product((("naive", 1),) if current else schedules, levels):
+            if pp == 1 and schedule not in ("1f1b", "naive"):
                 continue
             r = run_parallel_roofline(pp=pp, tp=tp, cp=cp, dp=dp, schedule=schedule, interleave=v,
                                       recompute=recompute, stage_cache=cache, **kwargs)
@@ -602,7 +619,8 @@ def main():
                   master_dtype=args.master_dtype, grad_dtype=args.grad_dtype, zero1=args.zero1, mode=args.mode,
                   cut_links=args.cut_links, attn_block=args.attn_block, num_links=args.links, topology=args.topology)
     if args.sweep:
-        target_only = [TARGET_ONLY[k] for k in TARGET_ONLY if common.get(k)]
+        target_only = [TARGET_ONLY[k] for k, on in (("zero1", args.zero1), ("sequence_parallel", args.sp),
+                                                     ("grad_fp32", args.grad_dtype == "fp32")) if on]
         if args.mode == "current" and target_only:
             raise SystemExit(f"{' and '.join(target_only)}: not in tt-train today, only with mode target")
         results = sweep(args.sweep, **common)
@@ -625,8 +643,19 @@ def main():
         # The other mode, for comparison, with that mode's own attention block (a given
         # --attn-block applies to the chosen mode only); current drops the target-only features
         other = "current" if args.mode == "target" else "target"
-        overrides = {"attn_block": None, **({"zero1": False} if other == "current" else {})}
-        dropped = [TARGET_ONLY[k] for k in ("zero1",) if k in overrides and out["config"][k]]
+        cfg = out["config"]
+        overrides, dropped = {"attn_block": None}, []
+        if other == "current":
+            for key, value, on in (("zero1", False, cfg["zero1"]), ("sequence_parallel", False, cfg["sequence_parallel"]),
+                                   ("grad_dtype", "bf16", cfg["grad_dtype"] == "fp32"),
+                                   ("recompute", "full", cfg["recompute"] == "selective")):
+                overrides[key] = value
+                if on:
+                    dropped.append({"grad_dtype": "fp32 gradient accumulation", "recompute": "selective recompute (full)",
+                                    "zero1": "ZeRO-1", "sequence_parallel": "sequence parallelism"}[key])
+            if cfg["pp"] > 1 and cfg["schedule"] != "naive":
+                overrides.update(schedule="naive", interleave=1)
+                dropped.append(f"{cfg['schedule']} (naive schedule)")
         alt = run_parallel_roofline(**{**single, "mode": other, **overrides})
         if "error" in alt:
             print(f"  {other}: {alt['error']}")
