@@ -104,6 +104,9 @@ class StageCost:
     sync_ms: float  # gradient sync over CP and DP, once per step (per-op roofline)
     sync_fabric_ms: float
     gather_ms: float  # ZeRO-1 parameter all-gather after the optimizer (per-op roofline)
+    sync_dram_ms: float  # DRAM time of the gradient sync (competes with the backward it overlaps)
+    tail_sync_ms: float  # sync of gradients final only at the very end (embedding table)
+    grad_bytes: int  # this stage's gradients
     activation_bytes: int  # held from forward to backward by the blocks, one micro-batch (excl. LM head)
     state_bytes: int  # parameters + gradients + optimizer state
     peak_bytes: int  # peak of the whole one-micro-batch run (incl. backward transients)
@@ -179,7 +182,12 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
     for root in roots:
         root.backward(ctx, retain_graph=False)
     del root
+    grad_bytes = sum(p.get_grad().bytes() for p in params.values() if p.is_grad_initialized())
+    first_sync = len(ctx.estimates)
     synchronize_replica_gradients(ctx, params, replica_groups, zero1=opts.zero1)
+    # The embedding table's gradient is final only after the embedding backward, the stage's last op
+    tail = [e for e in ctx.estimates[first_sync:] if "tok_emb" in e.operation]
+    tail_sync_ms = sum(max(e.ideal_compute_ns, e.ideal_memory_ns, e.ideal_network_ns) for e in tail) / 1e6
     optimizer.step(ctx)
     mock_clip_grad_norm(ctx, params, max_norm=1.0, num_shards=optimizer.num_shards)
     del x, out, logits, roots  # release the micro-batch's tensors before reading the state
@@ -208,6 +216,9 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
         sync_ms=op_ms(SYNC_PHASES),
         sync_fabric_ms=ctx.network_time_ns(SYNC_PHASES + GATHER_PHASES) / 1e6,
         gather_ms=op_ms(GATHER_PHASES),
+        sync_dram_ms=ctx.dram_time_ns(SYNC_PHASES) / 1e6,
+        tail_sync_ms=tail_sync_ms,
+        grad_bytes=grad_bytes,
         activation_bytes=mem_after_blocks - mem_before,
         state_bytes=state_bytes,
         peak_bytes=peak_bytes,
@@ -366,21 +377,28 @@ def run_parallel_roofline(
     hand = (send_recv_roofline(hw, handoff_bytes, cut_links, operation="PipelineHandoff").ideal_network_ns / 1e6
             if pp > 1 else 0.0)
 
-    def device_time(c: StageCost) -> Dict[str, float]:
-        flop, dram, fabric = c.mb_flop_ms, c.mb_dram_ms, c.mb_fabric_ms + v * hand
+    # hand-offs a device sends per micro-batch: v forward (v - 1 on the last device), v backward
+    # (v - 1 on the first)
+    sends_f = [v - (d == pp - 1) for d in range(pp)]
+    sends_b = [v - (d == 0) for d in range(pp)]
+
+    def device_time(d: int, c: StageCost) -> Dict[str, float]:
+        flop, dram, fabric = c.mb_flop_ms, c.mb_dram_ms, c.mb_fabric_ms + max(sends_f[d], sends_b[d]) * hand
         return {"flop_ms": flop, "dram_ms": dram, "fabric_ms": fabric,
-                "roofline_ms": c.mb_forward_ms + c.mb_backward_ms + 2 * v * hand,
+                "roofline_ms": c.mb_forward_ms + c.mb_backward_ms + (sends_f[d] + sends_b[d]) * hand,
                 "upper_bound_ms": max(flop, dram, fabric)}
 
-    per_stage = [device_time(c) for c in costs]
+    per_stage = [device_time(d, c) for d, c in enumerate(costs)]
     D = max(per_stage, key=lambda p: p["roofline_ms"])
 
     # Play the schedule out with each device's own forward and backward time per micro-batch.
     # With equal devices this is slots(P, m) x D; uneven stages set the pace with the slowest and
     # fill/drain with the sum.
-    fwd = [c.mb_forward_ms + v * hand for c in costs]
-    bwd = [c.mb_backward_ms + v * hand for c in costs]
+    fwd = [c.mb_forward_ms + sends_f[d] * hand for d, c in enumerate(costs)]
+    bwd = [c.mb_backward_ms + sends_b[d] * hand for d, c in enumerate(costs)]
     bubble, held, pipeline_ms = simulate_schedule(sched, pp, m, fwd, bwd)
+    # the same schedule with every device at the average: what fill and drain alone cost
+    fill_bubble = simulate_schedule(sched, pp, m, [sum(fwd) / pp] * pp, [sum(bwd) / pp] * pp)[0] if pp > 1 else 0.0
 
     def split(total: float, f: float, b: float):
         r = f / (f + b) if f + b > 0 else 1 / 3
@@ -401,7 +419,11 @@ def run_parallel_roofline(
 
     # Memory per device: the one-micro-batch run's peak (state, its activations, backward
     # transients) plus the other micro-batches the schedule makes it hold at the same time
-    device_memory = [c.peak_bytes + (held[d] - 1) * c.activation_bytes for d, c in enumerate(costs)]
+    # Interleaved: a device's v chunks each keep their own input and output, one more pair per chunk
+    # than the whole-stage run holds. With the sync overlapped, one layer's gradient is in flight.
+    per_mb = [c.activation_bytes + (v - 1) * 2 * c.output_bytes for c in costs]
+    in_flight = [c.grad_bytes / max(blocks[d], 1) if overlap else 0 for d, c in enumerate(costs)]
+    device_memory = [c.peak_bytes + (held[d] - 1) * per_mb[d] + in_flight[d] for d, c in enumerate(costs)]
     worst = max(range(pp), key=lambda d: device_memory[d])
     memory = device_memory[worst]
 
@@ -428,6 +450,7 @@ def run_parallel_roofline(
                      "optimizer_ms": max(c.opt_ms for c in costs),
                      "param_gather_ms": max(c.gather_ms for c in costs)},
         "bubble": bubble,
+        "bubble_fill": fill_bubble,
         "ideal_ms": ideal_ms,
         "peak": {"tflops_per_chip": peak / 1e12, "fidelity": "HiFi4", "cores": hw.tensix_cores_per_chip,
                  "clock_ghz": hw.clock_ghz},
@@ -448,9 +471,13 @@ def exposed_sync(c: StageCost, num_blocks: int, overlap: bool = True) -> float:
     S = c.sync_ms
     if S <= 0 or not overlap:
         return S
+    # the embedding table's sync (first stage) can only start after the last op: fully exposed;
+    # the layers' syncs read and write DRAM, which the backward they overlap also uses
+    T = min(c.tail_sync_ms, S)
+    S -= T
     k = max(num_blocks, 1)
-    b = c.mb_backward_ms
-    return max(S / k, S - b + b / k)
+    b = max(c.mb_backward_ms - c.sync_dram_ms, 0.0)
+    return T + (max(S / k, S - b + b / k) if S > 0 else 0.0)
 
 
 def model_flops_per_token(preset: dict, seq_len: int) -> float:
@@ -526,6 +553,8 @@ def place_stages(hw, pp: int, tp: int, cp: int, dp: int = 1, interleaved: bool =
         tp_axis = cp_axis = col_axis if rows == 1 else (rows * cols, False, False)
     else:
         tp_axis = cp_axis = col_axis
+    if interleaved and cols != C:
+        return {"error": "interleaved needs stages of whole rows (the last stage must neighbour the first)"}
     if interleaved and not (wrap_r and pp * rows == R):
         return {"error": "interleaved needs the last stage to neighbour the first (one pipeline filling a wrapped axis)"}
     pairs = cols if rows >= 1 and cols == C else 1  # chip pairs across the cut between two stages
@@ -545,7 +574,7 @@ def even_split(num_blocks: int, pp: int) -> List[int]:
     return [base + (1 if d < extra else 0) for d in range(pp)]
 
 
-SWEEP_SCHEDULES = (("1f1b", 1), ("interleaved", 2), ("interleaved", 5))
+SWEEP_SCHEDULES = (("1f1b", 1), ("interleaved", 2), ("interleaved", 4), ("interleaved", 5), ("interleaved", 10))
 DEGREES = (1, 2, 4, 8, 16, 32)
 
 
@@ -617,6 +646,13 @@ def main():
     parser.add_argument("--output", default=None,
                         help="Write the result (with the other mode's under 'other_mode'), or the sweep, as JSON")
     args = parser.parse_args()
+    if args.sweep:
+        ignored = [f for f, on in (("--pp/--tp/--cp/--dp", (args.pp, args.tp, args.cp, args.dp) != (1, 1, 1, 1)),
+                                   ("--schedule/--interleave", args.schedule != "1f1b" or args.interleave != 2),
+                                   ("--recompute", args.recompute != "none"),
+                                   ("--blocks-per-stage", args.blocks_per_stage is not None)) if on]
+        if ignored:
+            print(f"note: --sweep tries every split, schedule and recompute level; ignoring {', '.join(ignored)}")
 
     common = dict(model_name=args.model, seq_len=args.seq, num_microbatches=args.microbatches,
                   hardware=args.hardware, sequence_parallel=args.sp,
@@ -689,7 +725,8 @@ def _print(out: Dict[str, Any], args) -> None:
           f"-> mostly {pm['bound']}")
     if len(set(cfg["blocks_per_stage"])) > 1:
         print(f"  blocks per stage: {cfg['blocks_per_stage']}")
-    print(f"  bubble {out['bubble']:.2%}")
+    print(f"  bubble {out['bubble']:.2%} (fill and drain {out['bubble_fill']:.2%}, "
+          f"stage imbalance {out['bubble'] - out['bubble_fill']:.2%})")
     se = out["step_end"]
     print(f"  after the pipeline: gradient sync {se['grad_sync_ms']:.1f} ms, {se['grad_sync_exposed_ms']:.1f} ms "
           f"exposed (per-layer syncs start during the last backward), optimizer {se['optimizer_ms']:.1f} ms"
