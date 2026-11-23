@@ -21,8 +21,10 @@ if TYPE_CHECKING:
     from .roofline import RooflineEstimate
 
 
-# Per-call latency (us): arch -> collective -> topology -> (a, b). An all-reduce is a
-# reduce-scatter followed by an all-gather.
+# Per-call latency (us): arch -> collective -> topology -> (a, b), latency = a + b * hops with
+# hops = N - 1 (line) or N / 2 (ring). The fixed terms of the fits in tt-metal
+# tech_reports/CCLs/CCL_bandwidth.md (traced ttnn.all_gather / reduce_scatter / all_reduce); their
+# bandwidth terms are not used: transfer time comes from the ideal link rate.
 CCL_LATENCY_US = {
     "wormhole": {
         "all_gather": {"linear": (4.5, 1.9), "ring": (4.5, 2.5)},
