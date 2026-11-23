@@ -65,6 +65,7 @@ from roofline.training.pipeline import make_schedule, simulate_schedule
 MICROBATCH_PHASES = ("forward", "backward")
 OPTIMIZER_PHASES = ("optimizer", "grad_clip")
 SYNC_PHASES = ("ccl",)  # gradient sync across the CP and DP groups
+GATHER_PHASES = ("param_gather",)  # ZeRO-1: all-gather of the updated parameters, after the optimizer
 
 # What --mode sets (see the module docstring); features only the target mode allows
 ATTN_BLOCK = {"current": None, "target": 512}  # per mode; the mode is also the ring-attention model
@@ -102,8 +103,9 @@ class StageCost:
     opt_ms: float  # optimizer + gradient clipping, once per step (per-op roofline)
     opt_flop_ms: float
     opt_dram_ms: float
-    sync_ms: float  # CP gradient all-reduce, once per step (per-op roofline)
+    sync_ms: float  # gradient sync over CP and DP, once per step (per-op roofline)
     sync_fabric_ms: float
+    gather_ms: float  # ZeRO-1 parameter all-gather after the optimizer (per-op roofline)
     activation_bytes: int  # held from forward to backward by the blocks, one micro-batch (excl. LM head)
     state_bytes: int  # parameters + gradients + optimizer state
     peak_bytes: int  # peak of the whole one-micro-batch run (incl. backward transients)
@@ -216,9 +218,10 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
         mb_backward_bound_ms=bound_ms(("backward",)),
         opt_ms=op_ms(OPTIMIZER_PHASES),
         opt_flop_ms=ctx.compute_time_ns(OPTIMIZER_PHASES) / 1e6,
-        opt_dram_ms=ctx.dram_time_ns(OPTIMIZER_PHASES + SYNC_PHASES) / 1e6,
+        opt_dram_ms=ctx.dram_time_ns(OPTIMIZER_PHASES + SYNC_PHASES + GATHER_PHASES) / 1e6,
         sync_ms=op_ms(SYNC_PHASES),
-        sync_fabric_ms=ctx.network_time_ns(SYNC_PHASES) / 1e6,
+        sync_fabric_ms=ctx.network_time_ns(SYNC_PHASES + GATHER_PHASES) / 1e6,
+        gather_ms=op_ms(GATHER_PHASES),
         activation_bytes=mem_after_blocks - mem_before,
         state_bytes=state_bytes,
         peak_bytes=peak_bytes,
@@ -415,9 +418,12 @@ def run_parallel_roofline(
         ub_v.append(p["upper_bound_ms"] * share)
     _, _, pipeline_bound_ms = simulate_schedule(sched, pp, m, ub_f, ub_b, ub_v if opts.vocab_parallel else None)
 
-    # The gradient sync (CP, DP) and the optimizer run after the last backward, one after the other;
-    # the step waits for the slowest stage
-    step_roofline = pipeline_ms + max(c.sync_ms + c.opt_ms for c in costs)
+    # Each layer's gradient sync starts as soon as its gradient is final (after the last micro-batch's
+    # backward through it) and the syncs queue on the fabric; what is left after the last backward is
+    # exposed, then the optimizer and (ZeRO-1) the parameter all-gather; the step waits for the slowest
+    # stage
+    step_roofline = pipeline_ms + max(exposed_sync(c, blocks[d]) + c.opt_ms + c.gather_ms
+                                      for d, c in enumerate(costs))
     link_total = max(m * p["fabric_ms"] + c.sync_fabric_ms for p, c in zip(per_stage, costs))
     step_bound = max(pipeline_bound_ms + max(max(c.opt_flop_ms, c.opt_dram_ms) for c in costs), link_total)
 
@@ -445,6 +451,10 @@ def run_parallel_roofline(
                    "cp": cp, "schedule": str(sched), "interleave": v, "mode": mode, "cut_links": cut_links,
                    **dataclasses.asdict(opts), "blocks_per_stage": blocks},
         "per_microbatch": {**D, "bound": bound, "handoff_ms": hand, "vocab_pass_ms": max(vocab or [0.0])},
+        "step_end": {"grad_sync_ms": max(c.sync_ms for c in costs),
+                     "grad_sync_exposed_ms": max(exposed_sync(c, blocks[d]) for d, c in enumerate(costs)),
+                     "optimizer_ms": max(c.opt_ms for c in costs),
+                     "param_gather_ms": max(c.gather_ms for c in costs)},
         "bubble": bubble,
         "ideal_ms": ideal_ms,
         "peak": {"tflops_per_chip": peak / 1e12, "fidelity": "HiFi4", "cores": hw.tensix_cores_per_chip,
@@ -455,6 +465,20 @@ def run_parallel_roofline(
                    "activation_gb_per_mb": costs[worst].activation_bytes / 1e9,
                    "peak_activations": held[worst], "state_gb": costs[worst].state_bytes / 1e9},
     }
+
+
+def exposed_sync(c: StageCost, num_blocks: int) -> float:
+    """Gradient sync left after the stage's last backward, with each of its k layers' syncs started as
+    soon as that layer's last backward ends and the syncs run one after another: with b the last
+    micro-batch's backward, t = b / k per layer, S the sync and s = S / k per layer, layer i's sync
+    ends at F_i = max(F_(i-1), i t) + s, so the exposed part is F_k - b = max(s, S - b + t). Only the
+    last layer's sync is exposed when s <= t; a link-bound sync (s > t) stays mostly exposed."""
+    S = c.sync_ms
+    if S <= 0:
+        return 0.0
+    k = max(num_blocks, 1)
+    b = c.mb_backward_ms
+    return max(S / k, S - b + b / k)
 
 
 def model_flops_per_token(preset: dict, seq_len: int) -> float:
@@ -679,6 +703,10 @@ def _print(out: Dict[str, Any], args) -> None:
     if len(set(cfg["blocks_per_stage"])) > 1:
         print(f"  blocks per stage: {cfg['blocks_per_stage']}")
     print(f"  bubble {out['bubble']:.2%}")
+    se = out["step_end"]
+    print(f"  after the pipeline: gradient sync {se['grad_sync_ms']:.1f} ms, {se['grad_sync_exposed_ms']:.1f} ms "
+          f"exposed (per-layer syncs start during the last backward), optimizer {se['optimizer_ms']:.1f} ms"
+          + (f", ZeRO-1 parameter all-gather {se['param_gather_ms']:.1f} ms" if se['param_gather_ms'] else ""))
     pk = out["peak"]
     print(f"  roofline (sum of per-op max): {o['tokens_per_second']:,.0f} tokens/s, step {o['step_ms']/1e3:.2f} s")
     print(f"  MFU {o['mfu']:.1%} = ideal {out['ideal_ms']/1e3:.2f} s / roofline {o['step_ms']/1e3:.2f} s; ideal: "

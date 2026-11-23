@@ -91,7 +91,8 @@ def synchronize_replica_gradients(
     groups: Sequence[Tuple[str, int]],
     zero1: bool = False,
 ) -> None:
-    """Gradient sync across the replicas of a stage: CP and DP groups (phase "ccl").
+    """Gradient sync across the replicas of a stage: CP and DP groups (phase "ccl"; with ZeRO-1 the
+    all-gather of the updated parameters, which runs after the optimizer, is phase "param_gather").
 
     Without ZeRO-1, as tt-train's synchronize_gradients_along: one all-reduce of the full gradient per
     group, one group after the other. With ZeRO-1 (target), every replica keeps the optimizer state of
@@ -127,5 +128,5 @@ def synchronize_replica_gradients(
         size = param.bytes() // replicas
         for g, n in reversed(groups):
             ctx.add_perf_result(all_gather_roofline(
-                ctx.hw_for(g), size, n, operation=f"ZeRO1.AllGather.{g}.{name}", phase="ccl"))
+                ctx.hw_for(g), size, n, operation=f"ZeRO1.AllGather.{g}.{name}", phase="param_gather"))
             size *= n

@@ -230,7 +230,9 @@ F_d, B_d = sum of op times of one micro-batch's forward / backward on device d,
           each + v stage hand-offs (each its own op)
 T_pipe  = the schedule played out op by op (simulate_schedule) with device d taking F_d and B_d
         = slots * (F + B) when all devices are equal
-T_step  = T_pipe + gradient sync over CP and DP + optimizer (per-op sums, slowest stage)
+T_step  = T_pipe + exposed gradient sync + optimizer (+ ZeRO-1 parameter all-gather), slowest stage;
+          each layer's sync starts once its last backward is done and the syncs queue on the fabric,
+          exposed = max(S / k, S - b + b / k) for k layers, sync S, last backward b
 bubble  = idle share of the step over all devices = (slots - m) / slots when all devices are equal
 upper bound: the same with every resource summed over the micro-batch and only the largest counted
 MFU     = ideal time / T_step,  ideal time = model FLOPs / (chips * peak)
