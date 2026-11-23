@@ -183,8 +183,10 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
         gc.collect()
         for t in gc.get_objects():
             if (isinstance(t, MockTensor) and t._tracked and t.label == TensorLabel.ACTIVATION
-                    and id(t) not in ctx.saved_ids and t is not x and not (t is out and stage.is_last)):
+                    and t not in ctx.saved_ids and t is not x and not (t is out and stage.is_last)):
                 t.untrack()
+    # the peak is measured from here on: before, the timeline still holds what the scan freed
+    peak_from = len(ctx.memory_tracker._events) if ctx.lean_captures else 0
     # The micro-batches held at once by the schedule hold only the blocks' activations: the LM head
     # and loss run and free theirs within one micro-batch (they are in peak_bytes)
     mem_after_blocks, _ = ctx.memory_tracker.current_memory()
@@ -214,7 +216,8 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
     del x, out, logits, roots  # release the micro-batch's tensors before reading the state
     gc.collect()
     state_bytes, _ = ctx.memory_tracker.current_memory()
-    peak_bytes, _ = ctx.memory_tracker.peak_memory()
+    timeline = ctx.memory_tracker.get_memory_timeline()[max(peak_from - 1, 0):]
+    peak_bytes = max(s.total_bytes for s in timeline)
     del mask  # resident for the whole step: in the state and the peak
     ctx.disable_memory_tracking()
 
@@ -453,15 +456,15 @@ def run_parallel_roofline(
 
     # Memory per device: the one-micro-batch run's peak (state, its activations, backward
     # transients) plus the other micro-batches the schedule makes it hold at the same time
-    # Interleaved: a device's v chunks each keep their own input and output, one more pair per chunk
-    # than the whole-stage run holds. With the sync overlapped, one layer's gradient is in flight.
-    # (the extra (v - 1) boundary tensors apply to every micro-batch held, the one in peak_bytes too).
-    # The in-flight sync buffer exists only during the last micro-batch, when the device holds one.
-    # Today's sockets keep an 80 MB receive FIFO per neighbour (socket_manager.cpp).
-    chunks = [(v - 1) * c.output_bytes for c in costs]
-    fifos = 2 * 80e6 if current and pp > 1 else 0
-    device_memory = [max(c.peak_bytes + (held[d] - 1) * c.activation_bytes + held[d] * chunks[d],
-                         c.peak_bytes + chunks[d] + (c.grad_bytes if overlap and c.sync_ms > 0 else 0)) + fifos
+    # With interleaving a chunk's received input is the tensor the whole-stage run keeps at that block
+    # boundary, and its output is freed after the send: no extra. With the sync overlapped, one
+    # layer's gradient is in flight, only during the last micro-batch, when the device holds one.
+    # Today's sockets keep an 80 MB receive FIFO per peer (socket_manager.cpp): the pipeline
+    # neighbours (two, the first and last stages linked for the targets; one with PP2) and, with CP,
+    # ring_shift's sockets in each direction.
+    fifos = 80e6 * ((min(pp - 1, 2) if pp > 1 else 0) + (2 if cp > 1 else 0)) if current else 0
+    device_memory = [max(c.peak_bytes + (held[d] - 1) * c.activation_bytes,
+                         c.peak_bytes + (c.grad_bytes if overlap and c.sync_ms > 0 else 0)) + fifos
                      for d, c in enumerate(costs)]
     worst = max(range(pp), key=lambda d: device_memory[d])
     memory = device_memory[worst]

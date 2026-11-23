@@ -242,14 +242,20 @@ class RooflineFunction:
         else:
             outputs_tuple = outputs
 
-        if roofline_ctx.lean_captures and not cls.reads_saved_in_backward:
+        # (not for ops selective recompute replays: the replay needs their inputs)
+        if (roofline_ctx.lean_captures and not cls.reads_saved_in_backward
+                and not (roofline_ctx.selective_recompute and cls.recompute)):
             ctx._saved_tensors = [
                 MockTensor(t.shape, t.dtype, t.layout, requires_grad=False, label=t.label, name=t.name,
                            num_shards=t.num_shards, track=False) if isinstance(t, MockTensor) else t
                 for t in ctx._saved_tensors
             ]
 
-        roofline_ctx.saved_ids.update(id(t) for t in ctx._saved_tensors if isinstance(t, MockTensor))
+        for t in ctx._saved_tensors:
+            if isinstance(t, MockTensor):
+                roofline_ctx.saved_ids.add(t)
+                if t.base is not None:
+                    roofline_ctx.saved_ids.add(t.base)
 
         # Selective recompute: the op's outputs and the tensors it saved are not held until
         # backward; its forward runs again at the start of its backward

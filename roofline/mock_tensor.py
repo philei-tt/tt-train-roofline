@@ -128,6 +128,9 @@ class MockTensor:
         # Selective recompute: not held from forward to backward, rebuilt when a backward reads it
         self.recomputed = False
 
+        # A view (track=False) of another tensor: what saving the view really keeps alive
+        self.base: Optional["MockTensor"] = None
+
         # Track allocation with global tracker
         self._tracked = False
         if track and _global_memory_tracker is not None:

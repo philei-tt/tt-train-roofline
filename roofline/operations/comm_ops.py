@@ -275,6 +275,7 @@ class MockBroadcastOp(RooflineFunction):
             num_shards=tensor.num_shards, track=False,
         )
         view.recomputed = tensor.recomputed
+        view.base = tensor.base or tensor
         return view
 
     @staticmethod

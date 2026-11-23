@@ -9,6 +9,7 @@ multiple operations in a forward/backward pass.
 """
 
 from __future__ import annotations
+import weakref
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, TYPE_CHECKING
 
@@ -184,9 +185,9 @@ class RooflineContext:
     # inputs until backward. Today's tt-train closures capture them, so current mode holds them.
     lean_captures: bool = False
 
-    # ids of the tensors some op saved for its backward (lean_captures: everything else an op's
-    # inputs list pins is not held)
-    saved_ids: set = field(default_factory=set)
+    # the tensors some op saved for its backward, and the bases of saved views (lean_captures:
+    # everything else an op's inputs list pins is not held); weak, so dead tensors drop out
+    saved_ids: weakref.WeakSet = field(default_factory=weakref.WeakSet)
 
     # Today's pipeline trainer passes an explicit causal mask: attention runs the full square and
     # reads the mask (tt-train trainer.py, scaled_dot_product_attention.cpp AttentionMaskType::Arbitrary)

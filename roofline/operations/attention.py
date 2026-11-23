@@ -42,6 +42,8 @@ class MockHeadsCreationOp(RooflineFunction):
     Input: [B, 1, S, 3*H*d] -> Output: 3x [B, H, S, d]
     """
 
+    reads_saved_in_backward = False  # only shapes
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -141,6 +143,8 @@ class MockGroupedHeadsCreationOp(RooflineFunction):
     - Q: [B, 1, S, E] -> [B, num_heads, S, head_dim]
     - KV: [B, 1, S, 2*num_groups*head_dim] -> K [B, num_groups, S, head_dim], V [B, num_groups, S, head_dim]
     """
+
+    reads_saved_in_backward = False  # only shapes
 
     recompute = True
 
