@@ -193,6 +193,10 @@ class RooflineContext:
     # reads the mask (tt-train trainer.py, scaled_dot_product_attention.cpp AttentionMaskType::Arbitrary)
     explicit_mask: bool = False
 
+    # A matmul and its collective as one op (max of their times). False: separate ops, one after the
+    # other, as tt-train runs them today (no fused collective-matmul kernels)
+    fuse_collectives: bool = True
+
     # Ring or line for the collectives of each parallel group ("tp", "cp"), set from where the
     # group sits on the mesh; groups not listed use hw.topology. See hw_for().
     group_topology: Dict[str, str] = field(default_factory=dict)
@@ -259,6 +263,9 @@ class RooflineContext:
         """Context manager: estimates added inside (forward, and the backward of ops applied inside)
         belong to one op whose time is max(sum compute, sum DRAM, sum fabric) of its estimates."""
         import contextlib
+
+        if not self.fuse_collectives:
+            fusion = None
 
         @contextlib.contextmanager
         def scope():

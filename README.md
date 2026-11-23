@@ -205,6 +205,7 @@ python3 -m roofline.examples.matmuls
 | layouts | as tt-train's ParallelismContext: a stage mesh holds TP and CP, CP on the rows and TP on the columns; CP even (`ring_shift`); no DP across pipelines | any placeable |
 | stage hand-off | one socket per chip, as many links as the mesh graph descriptor's inter-mesh channels (one per chip pair across the cut; 4 for the shipped PP16 x TP8); 80 MB receive FIFO per neighbour | every link across the cut |
 | collective topology | line (the shipped descriptors declare LINE axes) | ring where a group fills a wrapped axis |
+| matmul and its collective | two ops, one after the other (tt-train enqueues them separately) | one op: max of the two (fused collective-matmul kernels) |
 | gradient sync | after the last backward | each layer's sync starts once its last backward is done |
 | sequence parallelism, fp32 gradient accumulation, ZeRO-1, selective recompute | not available (error) | allowed |
 

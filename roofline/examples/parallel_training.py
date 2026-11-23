@@ -139,6 +139,7 @@ def _context(hw, opts: Options, group_topology, link_share) -> RooflineContext:
     return RooflineContext(hw, attn_block=opts.attn_block, cp_mode=opts.cp_mode,
                            selective_recompute=opts.recompute == "selective",
                            lean_captures=opts.cp_mode == "target", explicit_mask=opts.explicit_mask,
+                           fuse_collectives=opts.cp_mode == "target",
                            group_topology=dict(group_topology), group_link_share=dict(link_share))
 
 
