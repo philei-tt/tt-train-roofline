@@ -117,7 +117,8 @@ class MockVocabParallelCrossEntropyLossOp(RooflineFunction):
 
     Mirrors tt-train's ttml::ops::distributed::vocab_parallel_cross_entropy_loss
     (ops/distributed/losses.cpp), pass by pass over the [S, V/tp] logits shard:
-    - forward: max (read bf16), fused subtract + exp to an fp32 buffer (read 2, write 4), sum over the
+    - forward: max (read bf16), fused subtract + exp to an fp32 buffer (read 2, write 4; fp32 output
+      takes the accurate exp, 24 SFPU instructions, plus the subtract), sum over the
       fp32 buffer (read 4): 12 bytes per logit; the per-token max is all-gathered, the sum and the
       target logit all-reduced over TP, each a [S, 1] tensor padded to one 32-wide tile column
     - backward: subtract + exp to fp32 again (read 2, write 4), multiply to bf16 (read 4, write 2),
@@ -154,7 +155,7 @@ class MockVocabParallelCrossEntropyLossOp(RooflineFunction):
         exp_buffer = MockTensor(logits.shape, DataType.FLOAT32, logits.layout, requires_grad=False,
                                 label=TensorLabel.ACTIVATION, name="ce_local_exp")
         MockVocabParallelCrossEntropyLossOp._passes(roofline_ctx, logits, [
-            ("max", 2, 0, 0.0), ("sub_exp", 2, 4, 16.0), ("sum", 4, 0, 1.0),
+            ("max", 2, 0, 0.0), ("sub_exp", 2, 4, 28.0), ("sum", 4, 0, 1.0),
         ], "forward")
         del exp_buffer
         if tp_size > 1:
@@ -182,7 +183,7 @@ class MockVocabParallelCrossEntropyLossOp(RooflineFunction):
         exp_buffer = MockTensor(logits.shape, DataType.FLOAT32, logits.layout, requires_grad=False,
                                 label=TensorLabel.ACTIVATION, name="ce_local_exp")
         MockVocabParallelCrossEntropyLossOp._passes(roofline_ctx, logits, [
-            ("sub_exp", 2, 4, 16.0), ("scale", 4, 2, 1.0), ("subtract_at_target", 2, 2, 0.0),
+            ("sub_exp", 2, 4, 28.0), ("scale", 4, 2, 1.0), ("subtract_at_target", 2, 2, 0.0),
             ("multiply_grad", 2, 2, 1.0),
         ], "backward")
         del exp_buffer

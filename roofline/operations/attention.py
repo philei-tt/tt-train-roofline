@@ -465,6 +465,17 @@ class MockScaledDotProductAttentionOp(RooflineFunction):
         return grad_query, grad_key, grad_value, None
 
 
+def _with_mask_reads(roofline_ctx, estimate, batch_size, num_heads, seq_len):
+    """Explicit mask (today's pipeline trainer): every kernel pass reads the S x S bf16 mask per head
+    (forward one kernel, backward two)."""
+    if not roofline_ctx.explicit_mask:
+        return estimate
+    passes = 1 if estimate.phase == "forward" else 2
+    extra = passes * batch_size * num_heads * seq_len * seq_len * 2
+    return dataclasses.replace(estimate, total_bytes=estimate.total_bytes + extra,
+                               ideal_memory_ns=estimate.ideal_memory_ns + extra / roofline_ctx.hw.dram_bw_gb_s)
+
+
 class MockScaledDotProductAttentionFusedOp(RooflineFunction):
     """Roofline estimation for fused scaled dot-product attention (Flash Attention style).
 
@@ -535,8 +546,9 @@ class MockScaledDotProductAttentionFusedOp(RooflineFunction):
             operation="FusedSDPA",
             phase="forward",
             block=roofline_ctx.attn_block,
+            causal=not roofline_ctx.explicit_mask,
         )
-        roofline_ctx.add_perf_result(estimate)
+        roofline_ctx.add_perf_result(_with_mask_reads(roofline_ctx, estimate, batch_size, num_q_heads, seq_len))
 
         # Output shape same as input: [B, H, S, d]
         return create_activation_tensor(query.shape, query.dtype, query.layout)
@@ -581,8 +593,9 @@ class MockScaledDotProductAttentionFusedOp(RooflineFunction):
             operation="FusedSDPA",
             phase="backward",
             block=roofline_ctx.attn_block,
+            causal=not roofline_ctx.explicit_mask,
         )
-        roofline_ctx.add_perf_result(estimate)
+        roofline_ctx.add_perf_result(_with_mask_reads(roofline_ctx, estimate, batch_size, num_q_heads, seq_len))
 
         grad_query = create_grad_tensor(
             query.shape, query.dtype, query.layout, name="grad_query"

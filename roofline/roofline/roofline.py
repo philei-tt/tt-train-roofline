@@ -184,6 +184,14 @@ class RooflineContext:
     # inputs until backward. Today's tt-train closures capture them, so current mode holds them.
     lean_captures: bool = False
 
+    # ids of the tensors some op saved for its backward (lean_captures: everything else an op's
+    # inputs list pins is not held)
+    saved_ids: set = field(default_factory=set)
+
+    # Today's pipeline trainer passes an explicit causal mask: attention runs the full square and
+    # reads the mask (tt-train trainer.py, scaled_dot_product_attention.cpp AttentionMaskType::Arbitrary)
+    explicit_mask: bool = False
+
     # Ring or line for the collectives of each parallel group ("tp", "cp"), set from where the
     # group sits on the mesh; groups not listed use hw.topology. See hw_for().
     group_topology: Dict[str, str] = field(default_factory=dict)
@@ -230,16 +238,15 @@ class RooflineContext:
     def hw_for(self, group: str) -> HardwareSpec:
         """Hardware spec for the collectives of a parallel group: its own ring or line topology, and
         its share of each link when several groups of the same kind cross the same links (DP groups
-        whose members are whole pipelines apart); those members are as many physical hops apart as
-        groups share a link, which scales the per-call latency."""
+        whose members are whole pipelines apart). The per-call latency is the fitted one for
+        neighbours: passing through other chips' routers is assumed cheap next to a ring step."""
         key = (self.group_topology.get(group, self.hw.topology), self.group_link_share.get(group, 1))
         if key not in self._group_hw:
             import dataclasses
 
             topology, share = key
             self._group_hw[key] = (self.hw if topology == self.hw.topology and share == 1 else dataclasses.replace(
-                self.hw, topology=topology, eth_bw_gb_s_per_link=self.hw.eth_bw_gb_s_per_link / share,
-                hops_per_step=share))
+                self.hw, topology=topology, eth_bw_gb_s_per_link=self.hw.eth_bw_gb_s_per_link / share))
         return self._group_hw[key]
 
     def new_fusion(self, label: str) -> str:

@@ -83,9 +83,6 @@ class HardwareSpec:
     # Chips of a multi-chip system as a 2D mesh, and which mesh axes wrap around (torus)
     mesh_shape: Tuple[int, int] = (1, 1)
     mesh_wrap: Tuple[bool, bool] = (False, False)
-    # Physical hops between neighbouring members of a collective's group (1 = neighbouring chips);
-    # set per group by RooflineContext.hw_for, e.g. DP copies a whole pipeline apart
-    hops_per_step: int = 1
 
     @property
     def sram_mb_per_chip(self) -> float:

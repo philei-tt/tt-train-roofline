@@ -360,6 +360,7 @@ def memory_efficient_runner(
             label=TensorLabel.ACTIVATION,
             name=f"{saved_input.name}_recompute" if saved_input.name else None,
             num_shards=saved_input.num_shards,
+            track=False,  # shares the saved input's buffer (tt-train create_tensor(input->get_value()))
         )
 
         # The recomputed forward is part of the backward pass

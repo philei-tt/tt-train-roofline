@@ -449,7 +449,8 @@ def fused_attention_roofline(
     # ckernel_sfpu_exp.h BODY_LEN); the backward per score and kernel is sub (4) + exp (15) +
     # mul (4) + mul (3) = 26 (sdpa_bw_compute_utils.hpp)
     exp_instr, bw_instr_per_kernel = 15, 26
-    chunk = 4 * tile_height  # sdpa_fw walks K/V in chunks of Sk_chunk_t = 4 tiles
+    # sdpa_fw walks K/V in chunks of Sk_chunk_t = 4 tiles; a larger Q block visits whole blocks
+    chunk = max(4 * tile_height, Bt)
     if causal:
         M = S * (S + tile_height) / 2  # causal volume visited per head, tile granularity (backward)
         # forward: the diagonal is rounded up to a whole K/V chunk

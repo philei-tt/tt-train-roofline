@@ -48,6 +48,7 @@ from roofline import (
     DataType,
     MathFidelity,
     MockAdamW,
+    MockCrossEntropyLossOp,
     MockVocabParallelCrossEntropyLossOp,
     MockDistributedLlama,
     MockTensor,
@@ -85,6 +86,10 @@ class Options:
     master_dtype: str = "bf16"  # stored weights, m and v (tt-train precision.master_dtype)
     grad_dtype: str = "bf16"  # gradient accumulation across micro-batches
     zero1: bool = False  # optimizer state sharded over the CP x DP replicas (target only)
+    accumulate: bool = True  # more than one micro-batch per step: gradients accumulate across them
+    explicit_mask: bool = False  # today's pipeline trainer passes an S x S mask (full-square attention)
+    plain_loss: bool = False  # tt-train's cross_entropy_loss (TP1, or today's pipeline trainer)
+    clip: bool = True  # gradient-norm clipping
 
 
 @dataclass
@@ -104,9 +109,9 @@ class StageCost:
     sync_ms: float  # gradient sync over CP and DP, once per step (per-op roofline)
     sync_fabric_ms: float
     gather_ms: float  # ZeRO-1 parameter all-gather after the optimizer (per-op roofline)
-    sync_dram_ms: float  # DRAM time of the gradient sync (competes with the backward it overlaps)
+    sync_dram_ms: float  # DRAM time of the layers' gradient sync (competes with the backward it overlaps)
     tail_sync_ms: float  # sync of gradients final only at the very end (embedding table)
-    grad_bytes: int  # this stage's gradients
+    grad_bytes: int  # one block's gradients
     activation_bytes: int  # held from forward to backward by the blocks, one micro-batch (excl. LM head)
     state_bytes: int  # parameters + gradients + optimizer state
     peak_bytes: int  # peak of the whole one-micro-batch run (incl. backward transients)
@@ -133,7 +138,7 @@ def run_stage(
 def _context(hw, opts: Options, group_topology, link_share) -> RooflineContext:
     return RooflineContext(hw, attn_block=opts.attn_block, cp_mode=opts.cp_mode,
                            selective_recompute=opts.recompute == "selective",
-                           lean_captures=opts.cp_mode == "target",
+                           lean_captures=opts.cp_mode == "target", explicit_mask=opts.explicit_mask,
                            group_topology=dict(group_topology), group_link_share=dict(link_share))
 
 
@@ -152,12 +157,15 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
                           num_shards=math.prod(n for _, n in replica_groups) if opts.zero1 else 1)
     local_seq = seq_len // cp
     # Steady state: every micro-batch after the first finds all gradients already allocated, adds
-    # into them out of place (tt-train's Tensor::add_grad) and holds them next to its activations
+    # into them out of place (tt-train's Tensor::add_grad) and holds them next to its activations.
+    # With one micro-batch per step there is nothing to add into (zero_grad frees the gradients).
     grad_dtype = DTYPES[opts.grad_dtype]
     for p in params.values():
-        if p.requires_grad:
+        if p.requires_grad and opts.accumulate:
             p.add_grad(create_grad_tensor(p.shape, grad_dtype if p.dtype == DataType.BFLOAT16 else p.dtype,
                                           p.layout, name="accumulated_grad", num_shards=p.num_shards))
+    mask = (MockTensor((1, 1, seq_len, seq_len), dtype=DataType.BFLOAT16, requires_grad=False,
+                       label=TensorLabel.ACTIVATION, name="attention_mask") if opts.explicit_mask else None)
     mem_before, _ = ctx.memory_tracker.current_memory()
 
     if stage.is_first:
@@ -168,13 +176,22 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
         x = MockTensor((1, 1, rows, config.embedding_dim), dtype=DataType.BFLOAT16, requires_grad=True,
                        label=TensorLabel.ACTIVATION, name="received_activation")
     out = stage.forward_blocks(ctx, x)
+    if ctx.lean_captures:
+        # Target: a tensor no backward reads is freed once its last reader is done; only an op's
+        # inputs list (the autograd edges) still points at it. The stage output is freed after the
+        # send (its gradient comes back from the next stage).
+        gc.collect()
+        for t in gc.get_objects():
+            if (isinstance(t, MockTensor) and t._tracked and t.label == TensorLabel.ACTIVATION
+                    and id(t) not in ctx.saved_ids and t is not x and not (t is out and stage.is_last)):
+                t.untrack()
     # The micro-batches held at once by the schedule hold only the blocks' activations: the LM head
     # and loss run and free theirs within one micro-batch (they are in peak_bytes)
     mem_after_blocks, _ = ctx.memory_tracker.current_memory()
     logits = stage.forward_head(ctx, out)
     roots: List[MockTensor] = []
     if logits is not None:
-        roots.append(_loss(ctx, logits, local_seq, tp))
+        roots.append(_loss(ctx, logits, local_seq, tp, opts.plain_loss))
     if not stage.is_last:
         roots.append(out)  # the gradient arrives from the next stage
     output_bytes = out.bytes()
@@ -182,18 +199,23 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
     for root in roots:
         root.backward(ctx, retain_graph=False)
     del root
-    grad_bytes = sum(p.get_grad().bytes() for p in params.values() if p.is_grad_initialized())
+    # one block's gradient: the in-flight sync buffer when the sync overlaps the last backward
+    grad_bytes = sum(p.get_grad().bytes() for n, p in params.items()
+                     if n.startswith("blocks.") and p.is_grad_initialized()) // max(stage_blocks, 1)
     first_sync = len(ctx.estimates)
     synchronize_replica_gradients(ctx, params, replica_groups, zero1=opts.zero1)
     # The embedding table's gradient is final only after the embedding backward, the stage's last op
     tail = [e for e in ctx.estimates[first_sync:] if "tok_emb" in e.operation]
     tail_sync_ms = sum(max(e.ideal_compute_ns, e.ideal_memory_ns, e.ideal_network_ns) for e in tail) / 1e6
+    tail_dram_ms = sum(e.ideal_memory_ns for e in tail) / 1e6
     optimizer.step(ctx)
-    mock_clip_grad_norm(ctx, params, max_norm=1.0, num_shards=optimizer.num_shards)
+    if opts.clip:
+        mock_clip_grad_norm(ctx, params, max_norm=1.0, num_shards=optimizer.num_shards)
     del x, out, logits, roots  # release the micro-batch's tensors before reading the state
     gc.collect()
     state_bytes, _ = ctx.memory_tracker.current_memory()
     peak_bytes, _ = ctx.memory_tracker.peak_memory()
+    del mask  # resident for the whole step: in the state and the peak
     ctx.disable_memory_tracking()
 
     def op_ms(phases):
@@ -216,7 +238,7 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
         sync_ms=op_ms(SYNC_PHASES),
         sync_fabric_ms=ctx.network_time_ns(SYNC_PHASES + GATHER_PHASES) / 1e6,
         gather_ms=op_ms(GATHER_PHASES),
-        sync_dram_ms=ctx.dram_time_ns(SYNC_PHASES) / 1e6,
+        sync_dram_ms=ctx.dram_time_ns(SYNC_PHASES) / 1e6 - tail_dram_ms,
         tail_sync_ms=tail_sync_ms,
         grad_bytes=grad_bytes,
         activation_bytes=mem_after_blocks - mem_before,
@@ -226,9 +248,14 @@ def _run_stage(hw, preset, seq_len, tp, cp, dp, pp, stage_index, stage_blocks, o
     )
 
 
-def _loss(ctx: RooflineContext, logits: MockTensor, local_seq: int, tp: int) -> MockTensor:
+def _loss(ctx: RooflineContext, logits: MockTensor, local_seq: int, tp: int, plain: bool) -> MockTensor:
+    """tt-train's loss: vocab-parallel cross-entropy over TP (losses.cpp), or its fused
+    cross_entropy_loss on the local logits (TP1, and today's pipeline trainer, which calls it on the
+    vocabulary-sharded logits without any collective)."""
     targets = MockTensor((1, 1, 1, local_seq), dtype=DataType.BFLOAT16, requires_grad=False,
                          label=TensorLabel.ACTIVATION, name="targets")
+    if plain or tp == 1:
+        return MockCrossEntropyLossOp.apply(ctx, logits, targets)
     return MockVocabParallelCrossEntropyLossOp.apply(ctx, logits, targets, tp)
 
 
@@ -249,6 +276,7 @@ def run_parallel_roofline(
     master_dtype: str = "bf16",
     grad_dtype: str = "bf16",
     zero1: bool = False,
+    clip: bool = True,
     cut_links: Optional[int] = None,
     attn_block: Optional[int] = None,
     num_links: Optional[int] = None,
@@ -320,6 +348,8 @@ def run_parallel_roofline(
         (not (current and pp > 1 and schedule != "naive"),
          "tt-train's pipeline runs one micro-batch at a time today: mode current needs --schedule naive"),
         (not (current and pp > 1 and dp > 1), "tt-train has no data parallelism across pipelines today"),
+        (not (current and pp == 1 and sum(n > 1 for n in (dp, cp, tp)) > 2),
+         "tt-train's ParallelismContext takes at most two of DP, CP, TP on a 2D mesh"),
         (not (current and cp > 1 and cp % 2), f"tt-train's ring attention needs an even CP ring, got CP{cp}"),
         (recompute in RECOMPUTE, f"recompute must be one of {', '.join(RECOMPUTE)}"),
         (master_dtype in DTYPES and grad_dtype in DTYPES, f"dtypes must be one of {', '.join(DTYPES)}"),
@@ -343,13 +373,17 @@ def run_parallel_roofline(
     if current and placement.get("tp_on_rows"):
         return {"error": "tt-train puts CP on the first mesh axis (rows) and TP on the second"}
     group_topology = placement["topology"] if topology is None else {g: topology for g in ("tp", "cp", "dp")}
+    if current and topology is None:
+        # tt-train's shipped mesh graph descriptors declare LINE axes (ring only on a TORUS axis)
+        group_topology = {g: "linear" for g in group_topology}
     if cut_links is None:
         # today's hand-off: one socket per chip pair across the cut, on one link (socket_manager.cpp)
         cut_links = placement["cut_links"] // (hw.num_links if current else 1)
     opts = Options(sequence_parallel=sequence_parallel,
                    recompute=recompute, cp_mode=mode,
                    attn_block=attn_block if attn_block is not None else ATTN_BLOCK[mode],
-                   master_dtype=master_dtype, grad_dtype=grad_dtype, zero1=zero1)
+                   master_dtype=master_dtype, grad_dtype=grad_dtype, zero1=zero1, accumulate=m > 1,
+                   explicit_mask=current and pp > 1 and cp == 1, plain_loss=current and pp > 1, clip=clip)
 
     cache = stage_cache if stage_cache is not None else {}
 
@@ -421,9 +455,14 @@ def run_parallel_roofline(
     # transients) plus the other micro-batches the schedule makes it hold at the same time
     # Interleaved: a device's v chunks each keep their own input and output, one more pair per chunk
     # than the whole-stage run holds. With the sync overlapped, one layer's gradient is in flight.
-    per_mb = [c.activation_bytes + (v - 1) * 2 * c.output_bytes for c in costs]
-    in_flight = [c.grad_bytes / max(blocks[d], 1) if overlap else 0 for d, c in enumerate(costs)]
-    device_memory = [c.peak_bytes + (held[d] - 1) * per_mb[d] + in_flight[d] for d, c in enumerate(costs)]
+    # (the extra (v - 1) boundary tensors apply to every micro-batch held, the one in peak_bytes too).
+    # The in-flight sync buffer exists only during the last micro-batch, when the device holds one.
+    # Today's sockets keep an 80 MB receive FIFO per neighbour (socket_manager.cpp).
+    chunks = [(v - 1) * c.output_bytes for c in costs]
+    fifos = 2 * 80e6 if current and pp > 1 else 0
+    device_memory = [max(c.peak_bytes + (held[d] - 1) * c.activation_bytes + held[d] * chunks[d],
+                         c.peak_bytes + chunks[d] + (c.grad_bytes if overlap and c.sync_ms > 0 else 0)) + fifos
+                     for d, c in enumerate(costs)]
     worst = max(range(pp), key=lambda d: device_memory[d])
     memory = device_memory[worst]
 
@@ -631,6 +670,7 @@ def main():
     parser.add_argument("--grad-dtype", default="bf16", choices=list(DTYPES),
                         help="Gradient accumulation across micro-batches (default bf16)")
     parser.add_argument("--zero1", action="store_true", help="Shard optimizer state over CP x DP (target only)")
+    parser.add_argument("--no-clip", action="store_true", help="No gradient-norm clipping (tt-train's use_clip_grad_norm: false)")
     parser.add_argument("--cut-links", type=int, default=None,
                         help="Links across a stage boundary (default: from the stage layout)")
     parser.add_argument("--attn-block", type=int, default=None,
@@ -657,6 +697,7 @@ def main():
     common = dict(model_name=args.model, seq_len=args.seq, num_microbatches=args.microbatches,
                   hardware=args.hardware, sequence_parallel=args.sp,
                   master_dtype=args.master_dtype, grad_dtype=args.grad_dtype, zero1=args.zero1, mode=args.mode,
+                  clip=not args.no_clip,
                   cut_links=args.cut_links, attn_block=args.attn_block, num_links=args.links, topology=args.topology)
     if args.sweep:
         target_only = [TARGET_ONLY[k] for k, on in (("zero1", args.zero1), ("sequence_parallel", args.sp),
@@ -689,8 +730,8 @@ def main():
             for key, value, on in (("zero1", False, cfg["zero1"]), ("sequence_parallel", False, cfg["sequence_parallel"]),
                                    ("grad_dtype", "bf16", cfg["grad_dtype"] == "fp32"),
                                    ("recompute", "full", cfg["recompute"] == "selective")):
-                overrides[key] = value
                 if on:
+                    overrides[key] = value
                     dropped.append({"grad_dtype": "fp32 gradient accumulation", "recompute": "selective recompute (full)",
                                     "zero1": "ZeRO-1", "sequence_parallel": "sequence parallelism"}[key])
             if cfg["pp"] > 1 and cfg["schedule"] != "naive":
@@ -728,8 +769,10 @@ def _print(out: Dict[str, Any], args) -> None:
     print(f"  bubble {out['bubble']:.2%} (fill and drain {out['bubble_fill']:.2%}, "
           f"stage imbalance {out['bubble'] - out['bubble_fill']:.2%})")
     se = out["step_end"]
+    overlapped = cfg["mode"] == "target"
     print(f"  after the pipeline: gradient sync {se['grad_sync_ms']:.1f} ms, {se['grad_sync_exposed_ms']:.1f} ms "
-          f"exposed (per-layer syncs start during the last backward), optimizer {se['optimizer_ms']:.1f} ms"
+          f"exposed{' (per-layer syncs start during the last backward)' if overlapped else ''}, "
+          f"optimizer {se['optimizer_ms']:.1f} ms"
           + (f", ZeRO-1 parameter all-gather {se['param_gather_ms']:.1f} ms" if se['param_gather_ms'] else ""))
     pk = out["peak"]
     print(f"  roofline (sum of per-op max): {o['tokens_per_second']:,.0f} tokens/s, step {o['step_ms']/1e3:.2f} s")

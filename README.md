@@ -203,7 +203,8 @@ python3 -m roofline.examples.matmuls
 | ring attention (CP) | contiguous split: the last device runs half a block then cp - 1 full ones; each step resets and slices the statistics, merges with 12 fp32 ops on them, a cast and 3 fp32 passes over the output; backward zeroes, casts and adds three step buffers; shifts are socket transfers on one link in one direction, in two phases (`ttnn_fixed::distributed::ring_shift`); every ttnn call is its own op | load-balanced split, merge fused into the kernel, shifts in both ring directions overlapped with attention (one op) |
 | pipeline schedule | `naive` only: one micro-batch at a time through the stages (tt-train's pipeline trainer) | any |
 | layouts | as tt-train's ParallelismContext: a stage mesh holds TP and CP, CP on the rows and TP on the columns; CP even (`ring_shift`); no DP across pipelines | any placeable |
-| stage hand-off | one socket per chip pair across the cut, one link (`socket_manager`) | every link across the cut |
+| stage hand-off | one socket per chip, as many links as the mesh graph descriptor's inter-mesh channels (one per chip pair across the cut; 4 for the shipped PP16 x TP8); 80 MB receive FIFO per neighbour | every link across the cut |
+| collective topology | line (the shipped descriptors declare LINE axes) | ring where a group fills a wrapped axis |
 | gradient sync | after the last backward | each layer's sync starts once its last backward is done |
 | sequence parallelism, fp32 gradient accumulation, ZeRO-1, selective recompute | not available (error) | allowed |
 
@@ -212,9 +213,16 @@ A group may fold over a stage of several rows as a line, as tt-train's mesh grap
 tt-train's shipped run as a reference point (llama70b.yaml: memory-efficient runner, 2048 tokens; training_shakespeare_llama70b_pp16_fabric_galaxy.yaml):
 
 ```bash
-python3 -m roofline.examples.parallel_training --model llama-70b -s 2048 -m 64 \
-    --pp 16 --tp 8 --recompute full --schedule naive --mode current
+python3 -m roofline.examples.parallel_training --model llama-70b -s 2048 -m 1 \
+    --pp 16 --tp 8 --recompute full --schedule naive --no-clip --mode current
 ```
+
+The shipped config runs one sequence per step (batch_size 1, no gradient accumulation), without
+clipping, and trains a character tokenizer (vocabulary 256); the command keeps Llama's 128256
+vocabulary. Today's pipeline trainer also passes an explicit causal mask, so attention runs the full
+square and reads the mask, and it computes the loss with cross_entropy_loss on the vocabulary-sharded
+logits (no collective); current mode models both. Its hand-off sends each chip's activation from one
+core; whether one core sustains the link rate is not measured (hand-offs are about 4% of that step).
 
 ```bash
 # One configuration: Llama 70B, 8K sequences, 2048 sequences per step, on a quad galaxy (128 chips)
@@ -283,11 +291,12 @@ Supporting changes:
 | `sequence_parallel` on the parallel linears, attention, MLP, block and `MockDistributedLlamaConfig` | All-gather / reduce-scatter along the sequence instead of broadcast / all-reduce; norms and residual adds hold `S / tp` tokens |
 | `num_stages`, `stage_index`, `stage_num_blocks` on `MockDistributedLlamaConfig`; `training/pipeline.py` | The model as one pipeline stage (`forward_stage`); schedule classes (`NaiveSchedule`, `GPipeSchedule`, `OneFOneBSchedule`, `InterleavedOneFOneBSchedule`) and a schedule simulator |
 | `RooflineFunction.recompute`, `RooflineContext.selective_recompute`, `MockTensor.untrack` | Selective recompute: the op's outputs and saved tensors are not held; its forward estimates run again in backward, and the recomputed tensors are live through the op's backward (and through the backward of every op that reads them); in the forward they are not counted while the next op uses them, a transient left out |
+| `lean_captures`, `RooflineContext.saved_ids` | Target: tensors that no backward reads (residual-add and collective inputs, the stage output after the send) are not held between forward and backward |
 | `MockAdamW(master_dtype, num_shards)`, `synchronize_replica_gradients` | fp32 master copy with fp32 m and v, ZeRO-1 sharding; gradient sync over CP and DP; fp32 gradient accumulation keeps the accumulator's dtype |
-| Embedding, LM head, gradients | Embedding untilizes its whole table each forward and returns a dense table gradient (tt-train `embedding_op`); LM head keeps logits sharded over the vocabulary with `MockVocabParallelCrossEntropyLossOp` (tt-train `vocab_parallel_cross_entropy_loss`); each stage run starts with every gradient allocated, as after the first micro-batch, so the out-of-place gradient add and the resident gradients are in the step time and the memory peak; the micro-batches held at once count only the blocks' activations |
+| Embedding, LM head, gradients | Embedding untilizes its whole table each forward and returns a dense table gradient (tt-train `embedding_op`); LM head keeps logits sharded over the vocabulary with `MockVocabParallelCrossEntropyLossOp` (tt-train `vocab_parallel_cross_entropy_loss`) when TP > 1, else tt-train's fused `cross_entropy_loss`; with more than one micro-batch per step each stage run starts with every gradient allocated, as after the first micro-batch, so the out-of-place gradient add and the resident gradients are in the step time and the memory peak; the micro-batches held at once count only the blocks' activations |
 | `BLACKHOLE_GALAXY`, `BLACKHOLE_QUAD`, `HARDWARE_PRESETS` | Galaxy chips: 130 compute cores (13 x 10), 25 GB/s per Ethernet link per direction (galaxy links run at half their rated speed, tt-metal `tech_reports/CCLs/CCL_bandwidth.md`), 2 links per neighbouring chip pair; galaxy 8 x 4 torus, quad 4 galaxies as a 32 x 4 torus (`HardwareSpec.mesh_shape`, `mesh_wrap`); one name-to-spec map used by both examples (`--hardware bh_quad`) |
 
-Limitations: TP must divide the number of KV heads (as in tt-train). With `--sp` the attention and MLP gather the norm output once and keep the gathered copy for backward (Megatron keeps the shard and re-gathers), so memory is higher than Megatron's. Pipelines with DP that interleave, and stages that are neither whole rows nor parts of one row (e.g. 2 x 2), are not placed. Links between galaxies are assumed to be the same as inside a galaxy. Overlap between ops is not credited except a matmul with its own collective and, in target mode, each layer's gradient sync with the last backward (charged its own DRAM time against that window; the embedding table's sync is fully exposed; with interleaving the window is taken from the last chunk only, which is pessimistic); the upper bound credits all of it. The CCL per-call latencies are fitted to ttnn's collectives (`ttnn.all_gather`, `ttnn.reduce_scatter`, `ttnn.all_reduce`), not the `*_async` ones tt-train calls; the ring fit is measured up to 8 devices and extrapolated beyond, across galaxy boundaries included. Matmuls run at the ideal split over all cores: ttnn's 13 x 10 grid would leave a small projection such as KV at TP4 about 61% utilized.
+Limitations: TP must divide the number of KV heads (as in tt-train). With `--sp` the attention and MLP gather the norm output once and keep the gathered copy for backward (Megatron keeps the shard and re-gathers), so memory is higher than Megatron's. Pipelines with DP that interleave, and stages that are neither whole rows nor parts of one row (e.g. 2 x 2), are not placed. Links between galaxies are assumed to be the same as inside a galaxy. Overlap between ops is not credited except a matmul with its own collective and, in target mode, each layer's gradient sync with the last backward (charged its own DRAM time against that window; the embedding table's sync is fully exposed; with interleaving the window is taken from the last chunk only, which is pessimistic); the upper bound credits all of it. The CCL per-call latencies are fitted to ttnn's collectives (`ttnn.all_gather`, `ttnn.reduce_scatter`, `ttnn.all_reduce`), not the `*_async` ones tt-train calls; the ring fit is measured up to 8 devices and extrapolated beyond, across galaxy boundaries included. "Fits" compares against 32 GB per chip; the allocator sees 34.2 GB (8 banks), the difference is left as margin for reserved regions and fragmentation. Not modelled: the end-of-step embedding all-reduce buffers (below the stage peak) and the uneven activations of interleaved chunks (the embedding and LM-head chunks hold a little more). Matmuls run at the ideal split over all cores: ttnn's 13 x 10 grid would leave a small projection such as KV at TP4 about 61% utilized.
 
 ## Dependencies
 

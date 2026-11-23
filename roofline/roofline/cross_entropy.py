@@ -64,7 +64,8 @@ def cross_entropy_roofline(
     if phase == "forward":
         # Read logits, compute softmax, gather, log, reduce
         # Softmax dominates for large vocab
-        total_bytes = int(num_logits * bytes_per_elem + batch_seq * bytes_per_elem)
+        # tt-train cross_entropy_fw reads each logit row twice (max, then sum of exponentials)
+        total_bytes = int(2 * num_logits * bytes_per_elem + batch_seq * bytes_per_elem)
 
         # FLOPs:
         # - Softmax: ~8 ops per element (max, exp, sum, div)

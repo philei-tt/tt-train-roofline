@@ -249,6 +249,8 @@ class RooflineFunction:
                 for t in ctx._saved_tensors
             ]
 
+        roofline_ctx.saved_ids.update(id(t) for t in ctx._saved_tensors if isinstance(t, MockTensor))
+
         # Selective recompute: the op's outputs and the tensors it saved are not held until
         # backward; its forward runs again at the start of its backward
         recompute: list = []
