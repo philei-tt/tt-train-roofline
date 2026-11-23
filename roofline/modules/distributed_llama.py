@@ -22,7 +22,7 @@ from ..hardware import DataType
 from .module import MockModule, MockModuleList
 from .embedding import MockEmbedding
 from .rmsnorm import MockRMSNormLayer
-from .distributed_linear import MockColumnParallelLinear, SEQ_DIM
+from .distributed_linear import MockColumnParallelLinear
 from .distributed_llama_block import MockDistributedLlamaBlock
 from .grouped_query_attention import RoPEParams
 
