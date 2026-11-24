@@ -140,6 +140,7 @@ def _context(hw, opts: Options, group_topology, link_share) -> RooflineContext:
                            selective_recompute=opts.recompute == "selective",
                            lean_captures=opts.cp_mode == "target", explicit_mask=opts.explicit_mask,
                            fuse_collectives=opts.cp_mode == "target",
+                           single_kernel_attention_bw=opts.cp_mode == "target",
                            group_topology=dict(group_topology), group_link_share=dict(link_share))
 
 
@@ -382,8 +383,9 @@ def run_parallel_roofline(
     if current and placement.get("tp_on_rows"):
         return {"error": "tt-train puts CP on the first mesh axis (rows) and TP on the second"}
     group_topology = placement["topology"] if topology is None else {g: topology for g in ("tp", "cp", "dp")}
-    if current and topology is None:
-        # tt-train's shipped mesh graph descriptors declare LINE axes (ring only on a TORUS axis)
+    if current and pp > 1 and topology is None:
+        # tt-train's multi-host pipeline descriptors declare LINE axes (ring only on a TORUS axis);
+        # single-galaxy descriptors include torus ones, so with PP1 the placement's topology holds
         group_topology = {g: "linear" for g in group_topology}
     if cut_links is None:
         # today's hand-off: one socket per chip pair across the cut, on one link (socket_manager.cpp)
@@ -617,10 +619,25 @@ def place_stages(hw, pp: int, tp: int, cp: int, dp: int = 1, interleaved: bool =
             "cut_links": pairs * hw.num_links, "stage_mesh": block}
 
 
-def even_split(num_blocks: int, pp: int) -> List[int]:
-    """Blocks per pipeline device: as even as possible, the remainder on the first devices."""
+def even_split(num_blocks: int, pp: int, lighten_ends: int = 0) -> List[int]:
+    """Blocks per pipeline device: as even as possible, the remainder on the middle devices (the first
+    holds the embedding, the last the LM head). lighten_ends > 0 moves that many more blocks off the
+    first and the last device each, onto the middle ones."""
     base, extra = divmod(num_blocks, pp)
-    return [base + (1 if d < extra else 0) for d in range(pp)]
+    blocks = [base] * pp
+    ends = [0, pp - 1] if pp > 1 else []
+    for _ in range(lighten_ends):
+        for d in ends:
+            if blocks[d] > 1:
+                blocks[d] -= 1
+                extra += 1
+    middle = list(range(1, pp - 1)) or list(range(pp))
+    i = 0
+    while extra > 0:
+        blocks[middle[i % len(middle)]] += 1
+        extra -= 1
+        i += 1
+    return blocks
 
 
 SWEEP_SCHEDULES = (("1f1b", 1), ("interleaved", 2), ("interleaved", 4), ("interleaved", 5), ("interleaved", 10))
@@ -628,9 +645,11 @@ DEGREES = (1, 2, 4, 8, 16, 32)
 
 
 def sweep(chips: int, schedules=SWEEP_SCHEDULES, **kwargs) -> List[Dict[str, Any]]:
-    """Every split of `chips` into dp * pp * tp * cp, schedule and recompute level that is valid."""
+    """Every split of `chips` into dp * pp * tp * cp, schedule and recompute level that is valid; for
+    each, the even layer split and the one with a block moved off the first and the last device."""
     cache: Dict[Any, StageCost] = {}
     results = []
+    num_blocks = MODEL_PRESETS[kwargs.get("model_name", "llama-70b")]["num_blocks"]
     for tp, cp, dp in itertools.product(DEGREES, DEGREES, DEGREES):
         if chips % (tp * cp * dp):
             continue
@@ -640,10 +659,15 @@ def sweep(chips: int, schedules=SWEEP_SCHEDULES, **kwargs) -> List[Dict[str, Any
         for (schedule, v), recompute in itertools.product((("naive", 1),) if current else schedules, levels):
             if pp == 1 and schedule not in ("1f1b", "naive"):
                 continue
-            r = run_parallel_roofline(pp=pp, tp=tp, cp=cp, dp=dp, schedule=schedule, interleave=v,
-                                      recompute=recompute, stage_cache=cache, **kwargs)
-            if "error" not in r:
-                results.append(r)
+            splits = [even_split(num_blocks, pp)]
+            lighter = even_split(num_blocks, pp, lighten_ends=1)
+            if pp > 2 and lighter != splits[0]:
+                splits.append(lighter)
+            for blocks in splits:
+                r = run_parallel_roofline(pp=pp, tp=tp, cp=cp, dp=dp, schedule=schedule, interleave=v,
+                                          recompute=recompute, blocks_per_stage=blocks, stage_cache=cache, **kwargs)
+                if "error" not in r:
+                    results.append(r)
     return results
 
 
@@ -652,7 +676,9 @@ def _describe(r: Dict[str, Any]) -> str:
     sched = "" if c["pp"] == 1 else f", {c['schedule']}"
     dp = f"DP{c['dp']} x " if c["dp"] > 1 else ""
     rc = "" if c["recompute"] == "none" else f", {c['recompute']} recompute"
-    return f"{dp}PP{c['pp']} x TP{c['tp']} x CP{c['cp']}{sched}{rc}"
+    b = c["blocks_per_stage"]
+    split = f", blocks {b[0]}/{b[1] if len(b) > 2 else ''}../{b[-1]}" if len(set(b)) > 1 else ""
+    return f"{dp}PP{c['pp']} x TP{c['tp']} x CP{c['cp']}{sched}{rc}{split}"
 
 
 def main():

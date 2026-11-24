@@ -551,6 +551,7 @@ class MockScaledDotProductAttentionFusedOp(RooflineFunction):
             phase="forward",
             block=roofline_ctx.attn_block,
             causal=not roofline_ctx.explicit_mask,
+            single_kernel_bw=roofline_ctx.single_kernel_attention_bw,
         )
         roofline_ctx.add_perf_result(_with_mask_reads(roofline_ctx, estimate, batch_size, num_q_heads, seq_len))
 
@@ -598,6 +599,7 @@ class MockScaledDotProductAttentionFusedOp(RooflineFunction):
             phase="backward",
             block=roofline_ctx.attn_block,
             causal=not roofline_ctx.explicit_mask,
+            single_kernel_bw=roofline_ctx.single_kernel_attention_bw,
         )
         roofline_ctx.add_perf_result(_with_mask_reads(roofline_ctx, estimate, batch_size, num_q_heads, seq_len))
 
@@ -739,6 +741,7 @@ def _ring_attention_parts(roofline_ctx, query, key, cp_size, phase, accumulator_
         roofline_ctx.hw, batch_size, num_q_heads, key.shape[1], local_seq * cp_size, head_dim,
         dtype=query.dtype, operation="RingAttention", phase=phase,
         block=roofline_ctx.attn_block,
+        single_kernel_bw=roofline_ctx.single_kernel_attention_bw,
     )
     roofline_ctx.add_perf_result(dataclasses.replace(
         full,

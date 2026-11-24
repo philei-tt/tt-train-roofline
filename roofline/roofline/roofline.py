@@ -193,6 +193,9 @@ class RooflineContext:
     # reads the mask (tt-train trainer.py, scaled_dot_product_attention.cpp AttentionMaskType::Arbitrary)
     explicit_mask: bool = False
 
+    # Attention backward as one FlashAttention-2-style kernel (target) instead of today's two kernels
+    single_kernel_attention_bw: bool = False
+
     # A matmul and its collective as one op (max of their times). False: separate ops, one after the
     # other, as tt-train runs them today (no fused collective-matmul kernels)
     fuse_collectives: bool = True

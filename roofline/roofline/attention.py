@@ -374,6 +374,7 @@ def fused_attention_roofline(
     tile_width: int = 32,
     block: Optional[int] = None,
     causal: bool = True,
+    single_kernel_bw: bool = False,
 ) -> "RooflineEstimate":
     """
     Performance model for fused scaled dot-product attention (Flash Attention style), following
@@ -423,6 +424,10 @@ def fused_attention_roofline(
         block: tokens kept on chip per block (forward and Q-kernel Q block, KV-kernel K/V block).
             None (default) = one tile (tile_height tokens), today's kernels.
         causal: False for a full S x S block (ring attention: a K/V shard from earlier tokens)
+        single_kernel_bw: backward as one FlashAttention-2-style kernel (the target): K/V-block outer,
+            10 * B * Hq * M * d matmul FLOPs, the softmax recomputed once; Q, dO and the statistics
+            re-read per K/V block, dQ accumulated in fp32 in DRAM (read + write per K/V block), after a
+            pass computing u = rowsum(dO * O). False: tt-train's two kernels today (below)
 
     Returns:
         Single RooflineEstimate for the fused operation
@@ -475,6 +480,15 @@ def fused_attention_roofline(
         reads = B * Hq * S * row + 2 * B * Hq * rows_reread_fw * row  # Q once; K and V per Q block
         writes = B * Hq * S * row + B * Hq * S * stat_bytes_per_row  # O, log-sum-exp
         total_bytes = int(reads + writes)
+
+    elif single_kernel_bw:
+        matmul_flops = 10 * B * Hq * M * d
+        sfpu_flops = B * Hq * (M * bw_instr_per_kernel + S * (2 * d - 1))
+        u_pass = B * Hq * S * (2 * row + stat_bytes_per_row)  # read dO and O, write u
+        kv_reads = 2 * B * Hkv * S * row + B * Hq * rows_reread * (2 * row + 2 * stat_bytes_per_row)
+        dq_rmw = B * Hq * rows_reread * 2 * d * 4  # fp32 dQ read and written per K/V block
+        kv_writes = 2 * B * Hkv * S * row  # dK, dV
+        total_bytes = int(u_pass + kv_reads + dq_rmw + kv_writes)
 
     else:  # backward
         matmul_flops = 14 * B * Hq * M * d
