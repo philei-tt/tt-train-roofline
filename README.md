@@ -223,7 +223,7 @@ clipping, and trains a character tokenizer (vocabulary 256); the command keeps L
 vocabulary. Today's pipeline trainer also passes an explicit causal mask, so attention runs the full
 square and reads the mask, and it computes the loss with cross_entropy_loss on the vocabulary-sharded
 logits (no collective); current mode models both. Its hand-off sends each chip's activation from one
-core; whether one core sustains the link rate is not measured (hand-offs are about 4% of that step).
+core; whether one core sustains the link rate is not measured (hand-offs are about 3% of that step).
 
 ```bash
 # One configuration: Llama 70B, 8K sequences, 2048 sequences per step, on a quad galaxy (128 chips)
@@ -271,7 +271,7 @@ MFU     = ideal time / T_step,  ideal time = model FLOPs / (chips * peak)
 | `1f1b` (Narayanan et al., 2021) | m + P - 1 | (P - 1) / (m + P - 1) | P |
 | `interleaved`, v chunks per device (same paper) | m + (P - 1) / v | (P - 1) / (v m + P - 1) | simulated |
 
-`simulate_schedule` plays any schedule out op by op on a common clock; with equal devices every closed form above matches it. With uneven devices only the simulation gives the step length. A single run splits the bubble into fill and drain (the same schedule with every device at the average time) and stage imbalance (the rest: at PP16 with an even split the last stage, which holds the LM head, is about 15% slower than a middle one). The held counts set each device's memory; with interleaving each chunk keeps its own boundary input and output. Sockets are assumed to buffer one transfer per stream: plain 1F1B never blocks on that, interleaved can, so interleaved results are slightly optimistic.
+`simulate_schedule` plays any schedule out op by op on a common clock; with equal devices every closed form above matches it. With uneven devices only the simulation gives the step length. A single run splits the bubble into fill and drain (the same schedule with every device at the average time) and stage imbalance (the rest: at PP16 with an even split the last stage, which holds the LM head, is about 18% slower than a middle one). The held counts set each device's memory; Sockets are assumed to buffer one transfer per stream: plain 1F1B never blocks on that, interleaved can, so interleaved results are slightly optimistic.
 
 Vocabulary parallelism across pipeline stages (Yeung et al., 2024, the LM head split over every stage) is not modelled: tt-train does not have it, and the head stays on the last stage.
 
