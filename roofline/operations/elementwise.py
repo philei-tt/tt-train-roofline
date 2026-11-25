@@ -34,6 +34,8 @@ class MockAddOp(RooflineFunction):
         - grad_b = grad_output
     """
 
+    reads_saved_in_backward = False  # only shapes
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -87,22 +89,7 @@ class MockAddOp(RooflineFunction):
             (grad_a, grad_b) tuple
         """
         a, b = ctx.saved_tensors
-
-        num_elements = a.logical_volume()
-
-        # grad_a and grad_b are just copies of grad_output
-        # This is essentially 2 memory copy operations
-        estimate = elementwise_roofline(
-            roofline_ctx.hw,
-            num_elements * 2,  # Two outputs
-            num_inputs=1,
-            sfpu_ops_per_element=0.0,
-            fpu_ops_per_element=0.0,
-            dtype=a.dtype,
-            operation="Add.backward",
-            phase="backward",
-        )
-        roofline_ctx.add_perf_result(estimate)
+        # tt-train's operator+ backward hands the same gradient to both inputs (add_grad), no ttnn op
 
         grad_a = create_grad_tensor(a.shape, a.dtype, a.layout, name="grad_a")
         grad_b = create_grad_tensor(b.shape, b.dtype, b.layout, name="grad_b")
@@ -118,6 +105,8 @@ class MockMulOp(RooflineFunction):
         - grad_a = grad_output * b
         - grad_b = grad_output * a
     """
+
+    recompute = True
 
     @staticmethod
     def forward(

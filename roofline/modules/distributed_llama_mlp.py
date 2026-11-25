@@ -37,6 +37,7 @@ class MockDistributedLlamaMLP(MockModule):
         intermediate_dim: Optional[int] = None,
         tp_size: int = 1,
         dtype: DataType = DataType.BFLOAT16,
+        sequence_parallel: bool = False,
     ):
         super().__init__()
 
@@ -59,6 +60,7 @@ class MockDistributedLlamaMLP(MockModule):
             gather_output=False,
             tp_size=tp_size,
             dtype=dtype,
+            sequence_parallel=sequence_parallel,
         )
         self.w3 = MockColumnParallelLinear(
             embedding_size,
@@ -67,6 +69,7 @@ class MockDistributedLlamaMLP(MockModule):
             gather_output=False,
             tp_size=tp_size,
             dtype=dtype,
+            sequence_parallel=sequence_parallel,
         )
         self.w2 = MockRowParallelLinear(
             hidden_size,
@@ -75,11 +78,20 @@ class MockDistributedLlamaMLP(MockModule):
             input_is_parallel=True,
             tp_size=tp_size,
             dtype=dtype,
+            sequence_parallel=sequence_parallel,
         )
 
     def forward(self, ctx: "RooflineContext", x: MockTensor) -> MockTensor:
-        swished = MockSiLUOp.apply(ctx, self.w1(ctx, x))
-        gate = self.w3(ctx, x)
+        if self.w1.sequence_parallel:
+            # Sequence parallelism: gather the norm output once for both projections (Megatron)
+            with ctx.fused(ctx.new_fusion("SPGatherW1W3")):
+                x = self.w1.gather_input(ctx, x)
+                h1 = self.w1(ctx, x, input_gathered=True)
+                gate = self.w3(ctx, x, input_gathered=True)
+            swished = MockSiLUOp.apply(ctx, h1)
+        else:
+            swished = MockSiLUOp.apply(ctx, self.w1(ctx, x))
+            gate = self.w3(ctx, x)
         gated = MockMulOp.apply(ctx, swished, gate)
         out = self.w2(ctx, gated)
         if self.dropout_prob > 0:

@@ -40,6 +40,8 @@ class MockAllReduceOp(RooflineFunction):
     Mirrors ttml::ops::distributed::all_reduce.
     """
 
+    reads_saved_in_backward = False  # only shapes
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -54,7 +56,7 @@ class MockAllReduceOp(RooflineFunction):
 
         if num_devices > 1:
             estimate = all_reduce_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 tensor.bytes(),
                 num_devices,
                 operation="AllReduce.forward",
@@ -78,7 +80,7 @@ class MockAllReduceOp(RooflineFunction):
 
         if not ctx._noop_backward and num_devices > 1:
             estimate = all_reduce_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 grad_output.bytes(),
                 num_devices,
                 operation="AllReduce.backward",
@@ -102,6 +104,8 @@ class MockReduceScatterOp(RooflineFunction):
     Mirrors ttml::ops::distributed::reduce_scatter.
     """
 
+    reads_saved_in_backward = False  # only shapes
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -119,7 +123,7 @@ class MockReduceScatterOp(RooflineFunction):
                 f"ReduceScatter: shape[{dim}]={tensor.shape[dim]} not divisible by {num_devices}"
             )
             estimate = reduce_scatter_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 tensor.bytes(),
                 num_devices,
                 operation="ReduceScatter.forward",
@@ -153,7 +157,7 @@ class MockReduceScatterOp(RooflineFunction):
 
         if num_devices > 1:
             estimate = all_gather_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 grad_output.bytes(),
                 num_devices,
                 operation="ReduceScatter.backward(AllGather)",
@@ -177,6 +181,8 @@ class MockAllGatherOp(RooflineFunction):
     Mirrors ttml::ops::distributed::all_gather.
     """
 
+    reads_saved_in_backward = False  # only shapes
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -191,7 +197,7 @@ class MockAllGatherOp(RooflineFunction):
 
         if num_devices > 1:
             estimate = all_gather_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 tensor.bytes(),
                 num_devices,
                 operation="AllGather.forward",
@@ -225,7 +231,7 @@ class MockAllGatherOp(RooflineFunction):
 
         if num_devices > 1:
             estimate = reduce_scatter_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 grad_output.bytes(),
                 num_devices,
                 operation="AllGather.backward(ReduceScatter)",
@@ -250,6 +256,8 @@ class MockBroadcastOp(RooflineFunction):
     Mirrors ttml::ops::distributed::broadcast.
     """
 
+    reads_saved_in_backward = False  # only shapes
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -260,10 +268,15 @@ class MockBroadcastOp(RooflineFunction):
         ctx.save_for_backward(tensor)
         ctx._num_devices = num_devices
 
-        return create_activation_tensor(
+        # The output aliases the input (ttml's broadcast returns it): no new memory. A view of a
+        # selectively recomputed tensor is recomputed with it.
+        view = create_activation_tensor(
             tensor.shape, tensor.dtype, tensor.layout,
-            num_shards=tensor.num_shards,
+            num_shards=tensor.num_shards, track=False,
         )
+        view.recomputed = tensor.recomputed
+        view.base = tensor.base or tensor
+        return view
 
     @staticmethod
     def backward(
@@ -276,7 +289,7 @@ class MockBroadcastOp(RooflineFunction):
 
         if num_devices > 1:
             estimate = all_reduce_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 grad_output.bytes(),
                 num_devices,
                 operation="Broadcast.backward(AllReduce)",
@@ -301,6 +314,8 @@ class MockScatterOp(RooflineFunction):
     Mirrors ttml::ops::distributed::scatter.
     """
 
+    reads_saved_in_backward = False  # only shapes
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,
@@ -308,19 +323,25 @@ class MockScatterOp(RooflineFunction):
         tensor: MockTensor,
         dim: int,
         num_devices: int = 1,
+        local: bool = False,
     ) -> MockTensor:
         ctx.save_for_backward(tensor)
         ctx._dim = dim
         ctx._num_devices = num_devices
 
-        if num_devices > 1:
+        if num_devices > 1 and local:
+            # The input is the same on every device: each keeps its slice (read and write it)
+            roofline_ctx.add_perf_result(elementwise_roofline(
+                roofline_ctx.hw, tensor.logical_volume() // num_devices, num_inputs=1, sfpu_ops_per_element=0.0,
+                dtype=tensor.dtype, operation="Scatter.forward(LocalSlice)", phase="forward"))
+        elif num_devices > 1:
             assert tensor.shape[dim] % num_devices == 0, (
                 f"Scatter: shape[{dim}]={tensor.shape[dim]} not divisible by {num_devices}"
             )
 
             # reduce-scatter cost
             estimate = reduce_scatter_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 tensor.bytes(),
                 num_devices,
                 operation="Scatter.forward(ReduceScatter)",
@@ -331,7 +352,7 @@ class MockScatterOp(RooflineFunction):
             # divide by N (elementwise scale, negligible but modeled)
             out_elements = tensor.logical_volume() // num_devices
             estimate = elementwise_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 out_elements,
                 num_inputs=1,
                 sfpu_ops_per_element=0.0,
@@ -368,7 +389,7 @@ class MockScatterOp(RooflineFunction):
 
         if num_devices > 1:
             estimate = all_gather_roofline(
-                roofline_ctx.hw,
+                roofline_ctx.hw_for("tp"),
                 grad_output.bytes(),
                 num_devices,
                 operation="Scatter.backward(AllGather)",

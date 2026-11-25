@@ -33,6 +33,8 @@ class MockSiLUOp(RooflineFunction):
     Backward: grad_input = grad_output * silu_bw(input)
     """
 
+    recompute = True
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,

@@ -33,6 +33,8 @@ class MockRMSNormOp(RooflineFunction):
     Unlike LayerNorm, RMSNorm does not subtract mean or add beta.
     """
 
+    recompute = True
+
     @staticmethod
     def forward(
         ctx: RooflineFunctionContext,

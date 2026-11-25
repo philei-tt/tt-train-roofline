@@ -28,6 +28,7 @@ def elementwise_roofline(
     num_cores: Optional[int] = None,
     operation: str = "Elementwise",
     phase: str = "forward",
+    out_dtype: Optional[DataType] = None,
 ) -> "RooflineEstimate":
     """
     Performance model for elementwise operations (add, mul, gelu, etc).
@@ -46,6 +47,7 @@ def elementwise_roofline(
         num_cores: Number of cores to use (default: all)
         operation: Name for the operation
         phase: "forward" or "backward"
+        out_dtype: dtype of the output when it differs from the inputs' (e.g. a typecast)
 
     Returns:
         RooflineEstimate with performance metrics
@@ -59,7 +61,8 @@ def elementwise_roofline(
     bytes_per_elem = dtype.value
 
     # Memory: read inputs + write output
-    total_bytes = int((num_inputs + 1) * num_elements * bytes_per_elem)
+    out_bytes = (out_dtype or dtype).value
+    total_bytes = int(num_elements * (num_inputs * bytes_per_elem + out_bytes))
 
     # FLOPs
     total_flops = int(num_elements)

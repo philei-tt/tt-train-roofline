@@ -9,6 +9,7 @@ for roofline estimation.
 """
 
 from __future__ import annotations
+import dataclasses
 from typing import Dict, TYPE_CHECKING
 import math
 
@@ -23,6 +24,7 @@ def mock_clip_grad_norm(
     ctx: "RooflineContext",
     parameters: Dict[str, MockTensor],
     max_norm: float = 1.0,
+    num_shards: int = 1,
 ) -> None:
     """Estimate cost of gradient norm clipping.
 
@@ -34,54 +36,26 @@ def mock_clip_grad_norm(
         ctx: Roofline context for estimates
         parameters: Dictionary of parameter names to MockTensors
         max_norm: Maximum gradient norm
+        num_shards: ZeRO-1: each replica clips its 1/num_shards of every gradient (the partial norms'
+            scalar all-reduce is not modelled)
     """
-    # Calculate total gradient elements
-    total_elements = sum(p.logical_volume() for p in parameters.values())
+    # Gradient elements per dtype (gradients may be accumulated in fp32)
+    elements: Dict = {}
+    for p in parameters.values():
+        dtype = p.get_grad().dtype if p.is_grad_initialized() else p.dtype
+        elements[dtype] = elements.get(dtype, 0) + p.logical_volume() // num_shards
 
-    # Use first parameter's dtype (assume all same)
-    dtype = next(iter(parameters.values())).dtype
-
-    # Phase 1: Compute gradient norm
-    # For each parameter: compute sum of squares
-    # Then sum across all parameters and sqrt
-
-    # Sum of squares per parameter (elementwise square + reduction)
-    estimate = elementwise_roofline(
-        ctx.hw,
-        total_elements,
-        num_inputs=1,  # Read gradient
-        sfpu_ops_per_element=1.0,  # Square
-        fpu_ops_per_element=0.0,
-        dtype=dtype,
-        operation="GradNorm.square",
-        phase="grad_clip",
-    )
-    ctx.add_perf_result(estimate)
-
-    # Reduction to compute sum
-    estimate = reduction_roofline(
-        ctx.hw,
-        total_elements,
-        total_elements,  # Reduce all to single value
-        dtype=dtype,
-        operation="GradNorm.reduce",
-        phase="grad_clip",
-    )
-    ctx.add_perf_result(estimate)
-
-    # Phase 2: Scale gradients (conditional, but we model worst case)
-    # Read gradients, multiply by scale, write back
-    estimate = elementwise_roofline(
-        ctx.hw,
-        total_elements,
-        num_inputs=1,  # Read gradient
-        sfpu_ops_per_element=0.0,
-        fpu_ops_per_element=1.0,  # Multiply by scale
-        dtype=dtype,
-        operation="GradNorm.scale",
-        phase="grad_clip",
-    )
-    ctx.add_perf_result(estimate)
+    # tt-train ttnn::moreh_clip_grad_norm: one read of every gradient for the norm, then an in-place
+    # scale (read + write)
+    for dtype, total_elements in elements.items():
+        norm = elementwise_roofline(
+            ctx.hw, total_elements, num_inputs=1, sfpu_ops_per_element=2.0, fpu_ops_per_element=0.0,
+            dtype=dtype, operation="GradNorm.norm", phase="grad_clip")
+        nbytes = total_elements * dtype.value
+        ctx.add_perf_result(dataclasses.replace(norm, total_bytes=nbytes, ideal_memory_ns=nbytes / ctx.hw.dram_bw_gb_s))
+        ctx.add_perf_result(elementwise_roofline(
+            ctx.hw, total_elements, num_inputs=1, sfpu_ops_per_element=0.0, fpu_ops_per_element=1.0,
+            dtype=dtype, operation="GradNorm.scale", phase="grad_clip"))
 
 
 def mock_zero_grad(

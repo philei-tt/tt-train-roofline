@@ -83,12 +83,10 @@ def rope_roofline(
     )
 
     # === Compute ===
-    # FPU: rotated_input = input @ trans_mat
-    #   M = B*H*S, K = D, N = D -> 2*M*K*N FLOPs
+    # FPU: rotated_input = input @ trans_mat, trans_mat one 32 x 32 tile applied to each 32-wide
+    # tile of the head (tt-train rope_op): 2 * M * D * 32 FLOPs, M = B*H*S
     M = batch_size * num_heads * seq_len
-    K = head_dim
-    N = head_dim
-    fpu_flops = 2 * M * K * N
+    fpu_flops = 2 * M * head_dim * 32
 
     # SFPU: 3 elementwise ops (cos_mul, sin_mul, add) -> 3 * num_elements
     sfpu_flops = 3 * num_elements
